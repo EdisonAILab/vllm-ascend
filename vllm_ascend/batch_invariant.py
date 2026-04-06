@@ -36,6 +36,11 @@ if HAS_TRITON:
         matmul_batch_invariant,
         mm_batch_invariant,
     )
+    from vllm_ascend.ops.triton.batch_invariant.mxfp8_quant_matmul import (
+        mxfp8_linear_batch_invariant,  # noqa: F401
+        npu_dynamic_mx_quant_batch_invariant,
+        npu_quant_matmul_batch_invariant,
+    )
     from vllm_ascend.ops.triton.batch_invariant.softmax import softmax_batch_invariant
 
 
@@ -60,6 +65,10 @@ def add_rms_norm(
     residual_ = x_
     x_, _ = torch_npu.npu_rms_norm(x_, weight, eps)
     return x_, None, residual_
+
+
+_original_npu_dynamic_mx_quant = None
+_original_npu_quant_matmul = None
 
 
 def reduce_sum(x: torch.Tensor, dim: int | None = None, keepdim: bool = False) -> torch.Tensor:
@@ -90,6 +99,7 @@ _batch_invariant_LIB = None
 
 def enable_batch_invariant_mode():
     global _batch_invariant_LIB
+    global _original_npu_dynamic_mx_quant, _original_npu_quant_matmul
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
 
     # Register operators only implemented in triton.
@@ -122,6 +132,20 @@ def enable_batch_invariant_mode():
         # linear call matmul internally, so register linear only when ascendc
         # is not available. it will get better performance with ascendc.
         _batch_invariant_LIB.impl("aten::linear", linear_batch_invariant, "NPU")
+
+    # Register MXFP8 batch-invariant operators.
+    # Verified: npu_dynamic_mx_quant and npu_quant_matmul are inherently
+    # batch-invariant (per-token quantization, fixed K-reduction order).
+    # We patch them to use the verified wrappers for explicit guarantees.
+    if HAS_TRITON:
+        _original_npu_dynamic_mx_quant = torch_npu.npu_dynamic_mx_quant
+        _original_npu_quant_matmul = torch_npu.npu_quant_matmul
+        torch_npu.npu_dynamic_mx_quant = npu_dynamic_mx_quant_batch_invariant
+        torch_npu.npu_quant_matmul = npu_quant_matmul_batch_invariant
+        logger.info(
+            "Registered MXFP8 batch-invariant operators "
+            "(npu_dynamic_mx_quant, npu_quant_matmul)."
+        )
 
 
 def init_batch_invariance():

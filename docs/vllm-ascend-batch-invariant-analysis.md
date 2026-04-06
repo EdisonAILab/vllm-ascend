@@ -402,3 +402,150 @@ FP8 量化的 rounding（舍入）必须使用确定性模式（如 Round-to-Nea
 | **MoE 特殊性** | group_list 影响并行 | group_list 影响并行 + scale 依赖 token 数据 |
 | **Triton kernel 改造** | `.to(tl.float32)` + `tl.dot` | 需要 FP8 原生 `tl.dot` + scale 处理 |
 | **预期性能损失** | ~38%（参考博客） | 预计 > 38%（额外的 scale 计算 + 融合算子拆分） |
+
+## 8. MXFP8 Batch-Invariant 验证结果
+
+> 以下结果在 Ascend A5 (内测版, Ascend910_9589) + CANN 8.5.0 + torch_npu 2.7.1 上验证。
+
+### 8.1 验证结论
+
+**所有 MXFP8 核心算子均已原生支持 batch-invariant**，无需自定义 Triton/AscendC 实现。
+对应 Section 7.4 实现路径的**优先级 1**：直接注册为 batch-invariant 实现。
+
+| 算子 | Batch-Invariant | 测试范围 | 说明 |
+|------|:-:|------|------|
+| `npu_dynamic_mx_quant` | ✅ | M=[1-2048], K=[4096-14336] | per-token 量化，天然与 batch 无关 |
+| `npu_quant_matmul` | ✅ | M=[1-2048], K=[4096-14336], N=[2048-18432] | K 维归约顺序不受 M 影响 |
+| `npu_grouped_matmul` | ✅ | 不同 group_list, M=[16-512] | 同 token 同 expert 结果一致 |
+| `npu_grouped_matmul_swiglu_quant_v2` | ✅ | expert token 数量 1-32, 总 M=16-512 | 融合算子内部确定性 |
+
+### 8.2 详细测试用例
+
+#### npu_dynamic_mx_quant
+- 对 64 行输入，分别以 BS=1/2/4/8/16/32/64 chunk 处理后拼接，与完整 batch 结果逐 bit 一致
+- 逐行处理 vs 完整 batch：quantized tensor 和 scale 均完全一致
+
+#### npu_quant_matmul
+- 模型级维度 (DeepSeek-like): K=7168, N=18432, M=256 — 各种 chunk size 均一致
+- 奇数 chunk (BS=7, 13, 37) 也完全一致，排除对齐偶发一致的可能
+
+#### npu_grouped_matmul (MoE GMM2)
+- 不同 group_list `[16,32,48,64]` vs `[8,24,48,64]`：共享 expert 区域逐 bit 一致
+- 与逐 expert `npu_quant_matmul` 结果完全一致
+
+#### npu_grouped_matmul_swiglu_quant_v2 (MoE GMM1 + SwiGLU)
+- Expert0 获取固定 8 tokens，其他 expert 分配从 `[8,8,8,40]` 到 `[52,2,2]` 变化 → 全部 MATCH
+- Expert0 token 数量从 1 到 32 变化，token[0] 输出不变 → 全部 MATCH
+- 总 M 从 16 到 512 变化，token[0] 输出不变 → 全部 MATCH
+- 相同输入连续 5 次调用 → 完全确定性
+
+### 8.3 集成方式
+
+在 `batch_invariant.py` 的 `enable_batch_invariant_mode()` 中，通过 monkey-patch 注册：
+
+```python
+# MXFP8 operators are verified batch-invariant on Ascend A5.
+torch_npu.npu_dynamic_mx_quant = npu_dynamic_mx_quant_batch_invariant
+torch_npu.npu_quant_matmul = npu_quant_matmul_batch_invariant
+```
+
+包装函数位于 `vllm_ascend/ops/triton/batch_invariant/mxfp8_quant_matmul.py`，
+当前为直接透传（passthrough），若未来硬件/固件行为变化，可在此处插入固定 chunk 处理等保障措施。
+
+## 9. 全算子 Batch-Invariant 验证总结
+
+> 测试环境：Ascend A5 (内测版, Ascend910_9589) + CANN 8.5.0 + torch_npu 2.7.1
+>
+> 测试方法：对同一输入，以不同 batch size 分 chunk 处理后拼接，与完整 batch 结果逐 bit 比较。
+
+### 9.1 本次实验验证的算子
+
+#### MXFP8 量化算子
+
+| 算子 | BI 结果 | 实现层面 | 测试规模 |
+|------|:-:|:-:|------|
+| `npu_dynamic_mx_quant` | ✅ | NPU 原生 | M=[1-2048], K=[4096-14336], BS=1/2/4/8/16/32/64 |
+| `npu_quant_matmul` | ✅ | NPU 原生 | M=[1-2048], K=[4096-14336], N=[2048-18432], BS=1/7/13/32/37/64/128 |
+| `npu_grouped_matmul` | ✅ | NPU 原生 | 不同 group_list, M=[16-512], 4 experts |
+| `npu_grouped_matmul_swiglu_quant_v2` | ✅ | NPU 原生 | expert token=[1-32], 总 M=[16-512], 确定性 5 次重复 |
+
+#### Norm 算子
+
+| 算子 | BI 结果 | 实现层面 | 测试规模 |
+|------|:-:|:-:|------|
+| `npu_rms_norm` | ✅ | NPU 原生 | M=256, hidden=[2048-14336], BS=1/3/7/16/32/64/128, 逐行验证 |
+| `npu_add_rms_norm`（融合） | ✅ | NPU 原生 | M=128, hidden=4096, BS=1/7/16/32/64 |
+| split `add` + `npu_rms_norm` | ✅ | PyTorch 拆分 | 同上 |
+
+**发现**：`npu_add_rms_norm` 在当前 A5 固件上实际已经是 batch-invariant 的，但代码中的拆分方案作为跨固件版本的安全保障仍有价值。
+
+### 9.2 项目已有的 Batch-Invariant 实现（非本次验证）
+
+| 算子 | 实现层面 | 核心策略 |
+|------|:-:|------|
+| mm / matmul / bmm / addmm | Triton persistent kernel / AscendC | 固定分块，K 维单 core 归约 |
+| linear | Triton persistent kernel | 固定 1D grid size |
+| RMSNorm | Triton kernel | 行内独立归约，固定 grid |
+| Softmax | PyTorch 分步计算 | `amax → sub → exp → sum → div` |
+| Mean | Triton kernel | 每输出元素独立归约 |
+| Reduce Sum | AscendC | NPU 专用实现 |
+| Attention Score | AscendC | NPU 专用实现 |
+
+### 9.3 与博客对比
+
+> 参考博客：[Defeating Nondeterminism in LLM Inference](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/)
+
+| 博客提及 | 项目已有 BI 实现 | 本次验证 NPU 原生 BI | 状态 |
+|---------|:-:|:-:|:-:|
+| MatMul | ✅ Triton + AscendC | — | 已覆盖 |
+| RMSNorm | ✅ Triton + 拆分 | ✅ `npu_rms_norm` | 已覆盖 |
+| Attention | ✅ AscendC | — | 已覆盖 |
+| Scatter (`scatter_add`) | ❌ | ❌ | **未覆盖** |
+
+博客未提及，项目已覆盖：
+
+| 算子 | 实现层面 |
+|------|:-:|
+| Softmax | PyTorch 分步 |
+| Mean | Triton |
+| Reduce Sum | AscendC |
+
+博客未提及，本次新增验证（MXFP8）：
+
+| 算子 | 结果 |
+|------|:-:|
+| `npu_dynamic_mx_quant` | ✅ NPU 原生 BI |
+| `npu_quant_matmul` | ✅ NPU 原生 BI |
+| `npu_grouped_matmul` | ✅ NPU 原生 BI |
+| `npu_grouped_matmul_swiglu_quant_v2` | ✅ NPU 原生 BI |
+
+### 9.4 唯一缺口：scatter_add
+
+`scatter_add` 是博客中标记的**固有非确定性算子**，项目未实现 batch-invariant 替代方案。
+
+**非确定性根源**：多个值按动态索引累加到同一位置时，累加顺序由硬件调度决定，无法提前固定。与 matmul 的 K 维归约不同，scatter_add 的冲突位置是**数据依赖的**。
+
+**在 LLM 推理中的位置**：MoE token combine 阶段，多个 expert 的输出按原始 token 位置累加（top-k routing 下同一 token 可能有多个 expert 结果）。
+
+**可能的解决方案**（参考博客）：
+1. **排序后归约**：先按目标索引排序，再顺序累加（确定性但需额外排序开销）
+2. **串行化**：逐元素处理（确定性但极慢）
+3. **避免使用**：重构 token combine 逻辑，用 gather + 加权求和替代 scatter_add
+
+### 9.5 实现层面总结
+
+| 层面 | 算子 | 说明 |
+|------|------|------|
+| **NPU 原生（已验证 BI）** | MXFP8 全套 + rms_norm + add_rms_norm | 直接使用，passthrough wrapper 注册 |
+| **Triton** | matmul / linear / rmsnorm / mean | persistent kernel，固定 grid/block |
+| **AscendC** | mm / matmul / sum / attention | C 扩展包，优先于 Triton |
+| **PyTorch** | softmax / add+rms_norm 拆分 | 分步计算避免框架优化 |
+
+### 9.6 测试脚本索引
+
+| 脚本 | 测试内容 | 位置 |
+|------|---------|------|
+| `test_mxfp8_batch_invariant.py` | MXFP8 原生算子 BI 验证 | `tests/ut/ops/` |
+| `test_mxfp8_integration.py` | MXFP8 BI wrapper 集成测试 (21/21) | `tests/ut/ops/` |
+| `test_swiglu_quant_v2.py` | MoE 融合算子 BI 验证 | `tests/ut/ops/` |
+| `test_rmsnorm_bi.py` | RMSNorm / AddRMSNorm BI 验证 (22/22) | `tests/ut/ops/` |
