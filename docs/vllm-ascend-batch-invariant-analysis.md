@@ -541,7 +541,70 @@ torch_npu.npu_quant_matmul = npu_quant_matmul_batch_invariant
 | **AscendC** | mm / matmul / sum / attention | C 扩展包，优先于 Triton |
 | **PyTorch** | softmax / add+rms_norm 拆分 | 分步计算避免框架优化 |
 
-### 9.6 测试脚本索引
+### 9.6 极端维度 Batch-Invariant 验证
+
+为排除硬件在大矩阵下因 split-K tiling 或并行策略变化导致的非确定性，对所有算子进行了极端维度压力测试。
+
+#### npu_dynamic_mx_quant (39/39 PASS)
+
+| 测试类别 | 维度范围 | 结果 |
+|---------|---------|:---:|
+| 超大 K | K=16384, 32768, **65536** | ✅ |
+| 超大 M | M=1024, 4096, **8192** | ✅ |
+| 非对齐 | K=4128(129×32), M=63(奇数) | ✅ |
+| DeepSeek V3 | K=7168, K=18432 | ✅ |
+
+#### npu_quant_matmul (64/64 PASS)
+
+| 测试类别 | 维度范围 | 结果 |
+|---------|---------|:---:|
+| 超大 K | K=16384, 32768, **65536** (2048 个 group) | ✅ |
+| 超大 M | M=1024, 4096, **8192** | ✅ |
+| 非对齐 | K=4128, K=4064, N=2049, N=1023, M=63, M=1 | ✅ |
+| 极端比例 | M=4096/K=128(tall), K=4096/N=32768(wide) | ✅ |
+| DeepSeek V3 | gate_up(K=7168,N=18432), down(K=9216,N=7168), qkv(K=7168,N=1536) | ✅ |
+
+#### npu_grouped_matmul (15/15 PASS)
+
+| 测试类别 | 维度范围 | 结果 |
+|---------|---------|:---:|
+| 大维度 | K=7168/N=2048, K=16384/N=4096 | ✅ |
+| 多 expert | 8 experts, M=1024 | ✅ |
+| 大 batch | M=2048 | ✅ |
+| DeepSeek V3 | down_proj K=9216/N=7168 | ✅ |
+
+#### npu_grouped_matmul_swiglu_quant_v2 (全部 PASS)
+
+| 测试类别 | 维度范围 | 结果 |
+|---------|---------|:---:|
+| group_list 变化 | uniform / skewed / extreme(expert0=1 token) | ✅ |
+| 总 M 变化 | M=64 vs M=128，共享 token 逐 bit 一致 | ✅ |
+| 大维度 | K=7168/GU=18432(DSv3), K=14336/GU=8192 | ✅ |
+| 多 expert | 8 experts, M=256 | ✅ |
+
+#### npu_rms_norm (31/31 PASS)
+
+| 测试类别 | 维度范围 | 结果 |
+|---------|---------|:---:|
+| 超大 hidden | hidden=16384, 32768, **65536** | ✅ |
+| 超大 M | M=4096, **8192** | ✅ |
+| 非对齐 | hidden=4097(奇数), M=63 | ✅ |
+| DeepSeek V3 | hidden=7168 | ✅ |
+
+#### npu_add_rms_norm (23/23 PASS)
+
+| 测试类别 | 维度范围 | 结果 |
+|---------|---------|:---:|
+| 超大 hidden | hidden=16384, 32768 | ✅ |
+| 超大 M | M=4096, **8192** | ✅ |
+| DeepSeek V3 | hidden=7168 | ✅ |
+| 非对齐 | M=63 | ✅ |
+
+#### 结论
+
+即使在 K=65536（2048 个 microscaling group，对 split-K tiling 压力极大）和 M=8192（大 batch）下，所有算子的结果仍然**逐 bit 一致**。这强烈支持 NPU 的 MXFP8 matmul 实现采用了**固定归约路径**（K 维不做跨 core 拆分，或拆分方式不依赖 M 维），因此天然保证 batch-invariance。
+
+### 9.7 测试脚本索引
 
 | 脚本 | 测试内容 | 位置 |
 |------|---------|------|
@@ -549,3 +612,5 @@ torch_npu.npu_quant_matmul = npu_quant_matmul_batch_invariant
 | `test_mxfp8_integration.py` | MXFP8 BI wrapper 集成测试 (21/21) | `tests/ut/ops/` |
 | `test_swiglu_quant_v2.py` | MoE 融合算子 BI 验证 | `tests/ut/ops/` |
 | `test_rmsnorm_bi.py` | RMSNorm / AddRMSNorm BI 验证 (22/22) | `tests/ut/ops/` |
+| `test_extreme.py` | npu_quant_matmul 极端维度 (64/64) | `tests/ut/ops/` |
+| `test_extreme_all.py` | 全算子极端维度压力测试 | `tests/ut/ops/` |
