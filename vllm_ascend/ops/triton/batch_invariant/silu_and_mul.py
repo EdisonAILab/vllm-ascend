@@ -21,12 +21,12 @@ from vllm.triton_utils import tl, triton
 
 @triton.jit
 def _silu_and_mul_kernel(
-    input_ptr,
+    gate_ptr,      # [n_rows, H]  (first half of input, pre-split)
+    up_ptr,        # [n_rows, H]  (second half of input, pre-split)
     output_ptr,
-    input_row_stride,
-    output_row_stride,
+    row_stride,    # stride of all 3 tensors (all are [n_rows, H] contiguous)
     n_rows,
-    H,  # half of input's last dim (= output's last dim)
+    H,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Each program handles multiple rows; within each row processes BLOCK_SIZE
@@ -39,22 +39,23 @@ def _silu_and_mul_kernel(
     end_row = tl.minimum(start_row + rows_per_program, n_rows)
 
     for row_idx in range(start_row, end_row):
-        in_row_ptr = input_ptr + row_idx * input_row_stride
-        out_row_ptr = output_ptr + row_idx * output_row_stride
+        gate_row = gate_ptr + row_idx * row_stride
+        up_row = up_ptr + row_idx * row_stride
+        out_row = output_ptr + row_idx * row_stride
 
         for col_offset in range(0, H, BLOCK_SIZE):
             col_idx = col_offset + tl.arange(0, BLOCK_SIZE)
             mask = col_idx < H
 
-            # Gate: SiLU(x[:H]); Up: x[H:]
-            gate = tl.load(in_row_ptr + col_idx, mask=mask, other=0.0).to(tl.float32)
-            up = tl.load(in_row_ptr + H + col_idx, mask=mask, other=0.0).to(tl.float32)
+            gate = tl.load(gate_row + col_idx, mask=mask, other=0.0).to(tl.float32)
+            up = tl.load(up_row + col_idx, mask=mask, other=0.0).to(tl.float32)
 
-            # SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
-            silu_gate = gate / (1.0 + tl.exp(-gate))
-            result = silu_gate * up
+            # SiLU(x) = x * sigmoid(x)
+            sigmoid_gate = tl.sigmoid(gate)
+            result = gate * sigmoid_gate * up
 
-            tl.store(out_row_ptr + col_idx, result, mask=mask)
+            tl.store(out_row + col_idx,
+                     result.to(gate_ptr.dtype.element_ty), mask=mask)
 
 
 def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
@@ -72,6 +73,9 @@ def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     x_2d = x.reshape(-1, x.shape[-1]).contiguous()
     n_rows = x_2d.shape[0]
 
+    # Split into gate and up halves (both contiguous [n_rows, H])
+    gate = x_2d[:, :H].contiguous()
+    up = x_2d[:, H:].contiguous()
     output = torch.empty(n_rows, H, dtype=x.dtype, device=x.device)
 
     BLOCK_SIZE = 1024
@@ -81,10 +85,10 @@ def silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     grid = (min(n_rows, max_grid),)
 
     _silu_and_mul_kernel[grid](
-        x_2d,
+        gate,
+        up,
         output,
-        x_2d.stride(0),
-        output.stride(0),
+        gate.stride(0),  # row_stride from tensor (handles element vs byte stride)
         n_rows,
         H,
         BLOCK_SIZE=BLOCK_SIZE,

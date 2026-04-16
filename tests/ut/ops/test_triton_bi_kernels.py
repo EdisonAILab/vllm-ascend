@@ -98,8 +98,9 @@ def make_silu(M):
 
 test_bi("silu_and_mul", silu_and_mul_batch_invariant, make_silu,
         M_total=256, batch_sizes=[1, 7, 32, 64, 128])
-out_bi = silu_and_mul_batch_invariant(*make_silu(256))
-out_ref = silu_native(*make_silu(256))
+_silu_args = make_silu(256)
+out_bi = silu_and_mul_batch_invariant(*_silu_args)
+out_ref = silu_native(*_silu_args)
 max_d = (out_bi.float() - out_ref.float()).abs().max().item()
 check("silu_and_mul correctness vs PyTorch (max_diff={:.2e})".format(max_d), max_d < 5e-2)
 for M in [16, 256, 4096]:
@@ -258,9 +259,9 @@ def rotary_bi_wrapper(q, k, cos, sin, head_dim):
 test_bi("rotary_embedding", rotary_bi_wrapper, make_rotary,
         M_total=256, batch_sizes=[1, 7, 32, 64, 128])
 
-args = make_rotary(256)
-q_bi, k_bi = rotary_bi_wrapper(*args)
-q_ref, k_ref = rotary_ref(*args)
+_rotary_args = make_rotary(256)
+q_bi, k_bi = rotary_bi_wrapper(*_rotary_args)
+q_ref, k_ref = rotary_ref(*_rotary_args)
 max_dq = (q_bi.float() - q_ref.float()).abs().max().item()
 max_dk = (k_bi.float() - k_ref.float()).abs().max().item()
 check("rotary correctness (q={:.2e}, k={:.2e})".format(max_dq, max_dk),
