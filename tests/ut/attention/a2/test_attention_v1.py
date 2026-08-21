@@ -250,6 +250,38 @@ class TestAscendAttentionBackendImpl(TestBase):
         mock_npu_fused_infer_attention_score.assert_called_once()
         assert output.shape == (10, 8, 64)
 
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch("torch_npu.npu_fused_infer_attention_score")
+    def test_fused_infer_attention_materializes_strided_kv(self, mock_fia, mock_get_forward_context):
+        """FIA must receive contiguous K/V for fused-QKV GQA views."""
+        num_tokens = 10
+        query = torch.randn(num_tokens, 8, 64)
+        key = torch.randn(num_tokens, 8, 128)[..., :64]
+        value = torch.randn(num_tokens, 8, 128)[..., :64]
+        self.assertFalse(key.is_contiguous())
+        self.assertFalse(value.is_contiguous())
+
+        metadata = MagicMock()
+        metadata.attn_state = AscendAttentionState.PrefillNoCache
+        metadata.actual_seq_lengths_q = [num_tokens]
+        metadata.causal = True
+        metadata.attn_mask = None
+        output = torch.empty_like(query)
+        mock_fia.return_value = (torch.ones_like(query), None)
+        mock_get_forward_context.return_value = MagicMock(capturing=False)
+
+        self.impl.forward_fused_infer_attention(
+            query,
+            key,
+            value,
+            metadata,
+            output,
+        )
+
+        call_kwargs = mock_fia.call_args.kwargs
+        self.assertTrue(call_kwargs["key"].is_contiguous())
+        self.assertTrue(call_kwargs["value"].is_contiguous())
+
     @patch("vllm_ascend.attention.attention_v1.using_paged_attention")
     @patch("torch_npu._npu_paged_attention")
     @patch("torch_npu._npu_reshape_and_cache")

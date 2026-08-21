@@ -1082,6 +1082,12 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             key = key[:num_tokens]
             value = value[:num_tokens]
+
+        # FIA does not support non-contiguous K/V strides. Qwen3 GQA keeps V
+        # as a split view of the fused QKV projection, so materialize K/V at
+        # the operator boundary before invoking FIA.
+        key = key.contiguous()
+        value = value.contiguous()
         # Get workspace from cache or calculate it if not present.
         if self.sinks is not None:
             actual_seq_qlen = attn_metadata.actual_seq_lengths_q
