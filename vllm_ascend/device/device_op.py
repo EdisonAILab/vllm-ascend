@@ -15,6 +15,8 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import os
+
 import torch
 import torch_npu
 
@@ -27,6 +29,30 @@ from vllm_ascend.ops.triton.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt
 from vllm_ascend.ops.triton.fla.solve_tril import solve_tril_16x16_kernel
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+
+_TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
+
+
+def _training_parity_moe_gating_top_k(
+    x: torch.Tensor,
+    *,
+    k: int,
+    k_group: int,
+    group_count: int,
+    norm_type: int,
+    routed_scaling_factor: float,
+    bias_opt: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if norm_type != 0 or group_count != 1 or k_group != 1 or bias_opt is not None:
+        raise ValueError(
+            "training parity only supports ungrouped softmax routing without bias"
+        )
+    topk_logits, topk_ids = torch.topk(x, k=k, dim=-1)
+    topk_weights = torch.softmax(topk_logits, dim=-1, dtype=torch.float32).to(x.dtype)
+    topk_weights = topk_weights * routed_scaling_factor
+    out = torch.empty(0, dtype=x.dtype, device=x.device)
+    return topk_weights, topk_ids.to(torch.int32), out
 
 
 class BaseDeviceAdaptor:
@@ -80,6 +106,16 @@ class BaseDeviceAdaptor:
         eps: float = 1e-20,
         bias_opt: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _TRAINING_PARITY:
+            return _training_parity_moe_gating_top_k(
+                x,
+                k=k,
+                k_group=k_group,
+                group_count=group_count,
+                norm_type=norm_type,
+                routed_scaling_factor=routed_scaling_factor,
+                bias_opt=bias_opt,
+            )
         topk_weights, topk_ids, out = torch.ops._C_ascend.moe_gating_top_k(
             x,
             k=k,
@@ -432,6 +468,16 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         eps: float = 1e-20,
         bias_opt: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _TRAINING_PARITY:
+            return _training_parity_moe_gating_top_k(
+                x,
+                k=k,
+                k_group=k_group,
+                group_count=group_count,
+                norm_type=norm_type,
+                routed_scaling_factor=routed_scaling_factor,
+                bias_opt=bias_opt,
+            )
         topk_weights, topk_ids, out = torch_npu.npu_moe_gating_top_k(
             x,
             k=k,

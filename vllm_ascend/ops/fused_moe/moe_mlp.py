@@ -14,9 +14,11 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
+import os
 
 import torch
 import torch_npu
+from torch.nn import functional as F
 from torch.nn.functional import pad
 from vllm.triton_utils import HAS_TRITON
 
@@ -33,6 +35,9 @@ from vllm_ascend.utils import (
     enable_custom_op,
     get_weight_prefetch_method,
 )
+
+
+_TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
 
 
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb):
@@ -379,7 +384,11 @@ def unquant_apply_mlp(
         num_experts, _, hidden_size = w1.shape
         gate_up_out = AscendSwigluOAIAndMul.swiglu_oai_forward(gate_up_out.view(-1, hidden_size))
     else:
-        gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+        if _TRAINING_PARITY:
+            gate, up = torch.chunk(gate_up_out, 2, dim=-1)
+            gate_up_out = F.silu(gate) * up
+        else:
+            gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
     if topk_scales is not None:
         gate_up_out *= topk_scales

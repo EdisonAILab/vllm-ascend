@@ -34,6 +34,8 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.platform import NPUPlatform
 from vllm_ascend.utils import has_rope, is_vl_model
 
+_TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
+
 if HAS_TRITON:
     from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
 
@@ -245,6 +247,29 @@ class AscendRotaryEmbedding(RotaryEmbedding):
         flash_comm_v1_enabled = _EXTRA_CTX.flash_comm_v1_enabled
         if is_draft_model and self.use_mtp and flash_comm_v1_enabled:
             positions = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(positions.contiguous(), True)
+        if _TRAINING_PARITY:
+            if offsets is not None:
+                raise ValueError("training parity RoPE does not support offsets")
+            if not is_neox_style:
+                raise ValueError("training parity RoPE only supports NeoX layout")
+            positions = positions.flatten()
+            token_count = positions.shape[0]
+            cache = self.cos_sin_cache.index_select(0, positions).to(query.dtype)
+            cos_half, sin_half = cache.chunk(2, dim=-1)
+            cos = cos_half.repeat(1, 2).unsqueeze(1)
+            sin = sin_half.repeat(1, 2).unsqueeze(1)
+
+            def apply(value):
+                original_shape = value.shape
+                value = value.view(token_count, -1, self.head_size)
+                rotary = value[..., : self.rotary_dim]
+                passthrough = value[..., self.rotary_dim :]
+                first, second = torch.chunk(rotary, 2, dim=-1)
+                rotated = torch.cat((-second, first), dim=-1)
+                rotary = rotary * cos + rotated * sin
+                return torch.cat((rotary, passthrough), dim=-1).reshape(original_shape)
+
+            return apply(query), apply(key)
         return torch.ops.vllm.npu_rotary_embedding(
             positions, query, key, self.cos_sin_cache, self.head_size, self.rotary_dim, is_neox_style
         )
