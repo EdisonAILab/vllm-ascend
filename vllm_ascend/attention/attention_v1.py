@@ -63,6 +63,7 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
+from vllm_ascend.training_parity import set_training_parity_sequence_length
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
@@ -400,6 +401,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self.sinks = sinks
         self.layerIndex = 0
         self.enable_hamming_sparse = is_enable_hamming_sparse()
+        self._training_parity_dense_key: torch.Tensor | None = None
+        self._training_parity_dense_value: torch.Tensor | None = None
 
     @staticmethod
     def update_graph_params(
@@ -1046,58 +1049,95 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         return key, value, block_size, block_table, actual_seq_lengths_kv
 
-    def _use_training_parity_decode_fa(
+    def _use_training_parity_dense_kv(
         self,
-        query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        block_size: int,
-        block_table: torch.Tensor | None,
-        actual_seq_lengths_kv: list[int],
         attn_metadata: AscendMetadata,
     ) -> bool:
-        """Limit the correctness path to the investigated single-NPU Qwen3 case."""
+        """Limit dense shadow KV to the investigated single-NPU Qwen3 case."""
         return (
             _TRAINING_PARITY
-            and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
             and attn_metadata.causal
             and self.attn_type != AttentionType.ENCODER_DECODER
             and self.sliding_window is None
             and self.sinks is None
             and not self.enable_hamming_sparse
             and get_tensor_model_parallel_world_size() == 1
-            and query.dtype == torch.bfloat16
             and key.dtype == torch.bfloat16
             and value.dtype == torch.bfloat16
             and self.num_heads == 32
             and self.num_kv_heads == 4
             and self.head_size == 128
+            and len(attn_metadata.seq_lens_list) == 1
+        )
+
+    def _update_training_parity_dense_kv(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+    ) -> None:
+        """Maintain an append-only dense KV shadow independent of paged-cache layout."""
+        flat_key = key.reshape(-1, self.num_kv_heads, self.head_size)
+        flat_value = value.reshape(-1, self.num_kv_heads, self.head_size)
+        set_training_parity_sequence_length(int(attn_metadata.seq_lens_list[0]))
+        if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+            capacity = int(self.vllm_config.model_config.max_model_len)
+            if flat_key.shape[0] > capacity:
+                raise RuntimeError("training-parity prefill exceeds model capacity")
+            self._training_parity_dense_key = flat_key.new_zeros((capacity, self.num_kv_heads, self.head_size))
+            self._training_parity_dense_value = flat_value.new_zeros((capacity, self.num_kv_heads, self.head_size))
+            self._training_parity_dense_key[: flat_key.shape[0]].copy_(flat_key)
+            self._training_parity_dense_value[: flat_value.shape[0]].copy_(flat_value)
+            return
+
+        if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+            return
+        if self._training_parity_dense_key is None or self._training_parity_dense_value is None:
+            raise RuntimeError("training-parity dense KV was not initialized by prefill")
+        sequence_length = attn_metadata.seq_lens_list[0]
+        start = sequence_length - flat_key.shape[0]
+        if start < 0 or sequence_length > self._training_parity_dense_key.shape[0]:
+            raise RuntimeError("training-parity dense KV write is out of bounds")
+        self._training_parity_dense_key[start:sequence_length].copy_(flat_key)
+        self._training_parity_dense_value[start:sequence_length].copy_(flat_value)
+
+    def _use_training_parity_decode_fa(
+        self,
+        query: torch.Tensor,
+        block_size: int,
+        block_table: torch.Tensor | None,
+        actual_seq_lengths_kv: list[int],
+        attn_metadata: AscendMetadata,
+    ) -> bool:
+        """Select training FA after dense shadow KV has been initialized."""
+        return (
+            attn_metadata.attn_state == AscendAttentionState.DecodeOnly
             and query.shape[0] == 1
-            and key.ndim == 3
-            and value.ndim == 3
             and block_table is not None
             and attn_metadata.attn_mask is not None
             and len(actual_seq_lengths_kv) == 1
             and actual_seq_lengths_kv[0] > block_size
+            and self._training_parity_dense_key is not None
+            and self._training_parity_dense_value is not None
         )
 
     def _training_parity_decode_fa(
         self,
         query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        block_size: int,
-        block_table: torch.Tensor,
         sequence_length: int,
         atten_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Gather one paged sequence and use the training FA reduction order."""
+        """Use dense shadow KV and the training FA reduction order."""
         global _TRAINING_PARITY_BOOL_ATTN_MASK
 
-        block_count = cdiv(sequence_length, block_size)
-        block_ids = block_table[0, :block_count]
-        dense_key = key[block_ids].reshape(-1, self.num_kv_heads, self.head_size)[:sequence_length].contiguous()
-        dense_value = value[block_ids].reshape(-1, self.num_kv_heads, self.head_size)[:sequence_length].contiguous()
+        dense_key_buffer = self._training_parity_dense_key
+        dense_value_buffer = self._training_parity_dense_value
+        if dense_key_buffer is None or dense_value_buffer is None:
+            raise RuntimeError("training-parity dense KV is unavailable")
+        dense_key = dense_key_buffer[:sequence_length]
+        dense_value = dense_value_buffer[:sequence_length]
         padded_query = torch.zeros(
             (sequence_length, self.num_heads, self.head_size),
             dtype=query.dtype,
@@ -1151,6 +1191,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
         passed_key = key
+        passed_value = value
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache
         )
@@ -1162,6 +1203,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
             )
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
+        if self._use_training_parity_dense_kv(passed_key, passed_value, attn_metadata):
+            self._update_training_parity_dense_kv(passed_key, passed_value, attn_metadata)
         if (
             attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
             and self.attn_type != AttentionType.ENCODER_DECODER
@@ -1176,8 +1219,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         value = value.contiguous()
         if self._use_training_parity_decode_fa(
             query,
-            key,
-            value,
             block_size,
             block_table,
             actual_seq_lengths_kv,
@@ -1185,10 +1226,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         ):
             attn_output = self._training_parity_decode_fa(
                 query,
-                key,
-                value,
-                block_size,
-                block_table,
                 actual_seq_lengths_kv[0],
                 attn_metadata.attn_mask,
             )
