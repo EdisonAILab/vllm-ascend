@@ -1281,20 +1281,26 @@ class AscendAttentionBackendImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AscendMetadata,
     ) -> bool:
-        """Limit dense shadow KV to the investigated single-NPU Qwen3 case."""
-        return (
+        """Limit dense shadow KV to the validated Qwen3 TP configurations."""
+        if not (
             _TRAINING_PARITY
             and attn_metadata.causal
             and self.attn_type != AttentionType.ENCODER_DECODER
             and self.sliding_window is None
             and self.sinks is None
-            and get_tensor_model_parallel_world_size() == 1
             and key.dtype == torch.bfloat16
             and value.dtype == torch.bfloat16
-            and self.num_heads == 32
-            and self.num_kv_heads == 4
+            and self.num_heads in (16, 32)
+            and self.num_kv_heads in (2, 4)
             and self.head_size == 128
             and len(attn_metadata.seq_lens_list) == 1
+        ):
+            return False
+        tp_world_size = get_tensor_model_parallel_world_size()
+        return (
+            tp_world_size <= 2
+            and self.num_heads * tp_world_size == 32
+            and self.num_kv_heads * tp_world_size == 4
         )
 
     def _update_training_parity_dense_kv(
@@ -1361,14 +1367,18 @@ class AscendAttentionBackendImpl(AttentionImpl):
         dense_value_buffer = self._training_parity_dense_value
         if dense_key_buffer is None or dense_value_buffer is None:
             raise RuntimeError("training-parity dense KV is unavailable")
-        dense_key = dense_key_buffer[:sequence_length]
-        dense_value = dense_value_buffer[:sequence_length]
+        tp_world_size = get_tensor_model_parallel_world_size()
+        padded_length = cdiv(sequence_length, tp_world_size) * tp_world_size
+        dense_key_buffer[sequence_length:padded_length].zero_()
+        dense_value_buffer[sequence_length:padded_length].zero_()
+        dense_key = dense_key_buffer[:padded_length]
+        dense_value = dense_value_buffer[:padded_length]
         padded_query = torch.zeros(
-            (sequence_length, self.num_heads, self.head_size),
+            (padded_length, self.num_heads, self.head_size),
             dtype=query.dtype,
             device=query.device,
         )
-        padded_query[-1:].copy_(query)
+        padded_query[sequence_length - 1 : sequence_length].copy_(query)
         if (
             _TRAINING_PARITY_BOOL_ATTN_MASK is None
             or _TRAINING_PARITY_BOOL_ATTN_MASK.device != atten_mask.device
@@ -1390,9 +1400,9 @@ class AscendAttentionBackendImpl(AttentionImpl):
             keep_prob=1.0,
             inner_precise=0,
             sparse_mode=2,
-            actual_seq_qlen=[0, sequence_length],
-            actual_seq_kvlen=[0, sequence_length],
-        )[0][-1:]
+            actual_seq_qlen=[0, padded_length],
+            actual_seq_kvlen=[0, padded_length],
+        )[0][sequence_length - 1 : sequence_length]
 
     def forward_fused_infer_attention(
         self,
