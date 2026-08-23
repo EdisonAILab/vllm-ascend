@@ -27,7 +27,7 @@ from typing import Generic
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
-from vllm.distributed.parallel_state import get_ep_group
+from vllm.distributed.parallel_state import get_ep_group, get_tp_group
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.device_op import DeviceOperator
@@ -378,9 +378,12 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
 
         num_tokens = hidden_states.shape[:-1].numel()
         if _TRAINING_PARITY:
-            if self.ep_size != 1 or expert_map is not None:
+            # vLLM's EP group also spans TP ranks for MoE models when expert
+            # parallelism is disabled.  expert_map, rather than ep_size,
+            # distinguishes genuinely sharded experts from TP-local shards.
+            if expert_map is not None:
                 raise ValueError(
-                    "training parity AllGather MoE currently supports single-NPU routing only"
+                    "training parity AllGather MoE does not support expert-sharded routing"
                 )
             flat_experts = topk_ids.reshape(-1)
             assignment_order = torch.argsort(flat_experts, stable=True)
@@ -448,6 +451,16 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
 
     def token_combine(self, hidden_states, combine_metadata, bias=None):
         if _TRAINING_PARITY:
+            tp_group = get_tp_group()
+            if tp_group.world_size > 2:
+                raise ValueError(
+                    "training parity MoE assignment reduction is validated up to TP=2"
+                )
+            if tp_group.world_size > 1:
+                # Megatron expert TP reduces each expert assignment before
+                # unpermuting top-k assignments back to tokens.  vLLM's normal
+                # path does the same sums in the opposite order.
+                hidden_states = tp_group.all_reduce(hidden_states)
             if bias is not None:
                 raise ValueError("training parity MoE combine does not support bias")
             sorted_token_indices = self._training_parity_sorted_token_indices
@@ -465,6 +478,12 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
                 )
             finally:
                 torch.use_deterministic_algorithms(was_enabled)
+            if tp_group.world_size > 1:
+                # MoERunner still performs its standard late TP all-reduce.
+                # Every rank now has the already-reduced result, so scale by
+                # TP here; the later sum of identical power-of-two-scaled BF16
+                # values restores the result exactly.
+                final_hidden_states.mul_(1.0 / tp_group.world_size)
             if len(combine_metadata.restore_shape) == 3:
                 final_hidden_states = final_hidden_states.view(
                     combine_metadata.restore_shape

@@ -28,22 +28,14 @@ from vllm_ascend.device.mxfp_compat import (
 from vllm_ascend.ops.triton.fla.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd_kernel
 from vllm_ascend.ops.triton.fla.solve_tril import solve_tril_16x16_kernel
 from vllm_ascend.quantization.quant_type import QuantType
-from vllm_ascend.training_parity import get_training_parity_sequence_length
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 _TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
 
-
-def _training_parity_softmax_input(topk_logits: torch.Tensor) -> torch.Tensor:
-    """Match the full-prefix router-softmax shape used by the training oracle."""
-    if topk_logits.shape[0] != 1:
-        return topk_logits
-    sequence_length = get_training_parity_sequence_length()
-    if sequence_length is None:
-        return topk_logits
-    if sequence_length <= 1:
-        return topk_logits
-    return topk_logits.expand(sequence_length, -1).contiguous()
+if _TRAINING_PARITY:
+    from batch_invariant_ops import npu_softmax_batch_invariant
+else:
+    npu_softmax_batch_invariant = None
 
 
 def _training_parity_moe_gating_top_k(
@@ -59,9 +51,11 @@ def _training_parity_moe_gating_top_k(
     if norm_type != 0 or group_count != 1 or k_group != 1 or bias_opt is not None:
         raise ValueError("training parity only supports ungrouped softmax routing without bias")
     topk_logits, topk_ids = torch.topk(x, k=k, dim=-1)
-    softmax_input = _training_parity_softmax_input(topk_logits)
-    topk_weights = torch.softmax(softmax_input, dim=-1, dtype=torch.float32).to(x.dtype)
-    topk_weights = topk_weights[-topk_logits.shape[0] :]
+    if npu_softmax_batch_invariant is None:
+        raise RuntimeError("training-parity BI router softmax is unavailable")
+    topk_weights = npu_softmax_batch_invariant(
+        topk_logits.float(), -1
+    ).to(x.dtype)
     topk_weights = topk_weights * routed_scaling_factor
     out = torch.empty(0, dtype=x.dtype, device=x.device)
     return topk_weights, topk_ids.to(torch.int32), out
