@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -67,6 +68,8 @@ from vllm_ascend.utils import is_950, weak_ref_tensors
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
 _ATTN_KEYS_BUFFER = None
+_TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
+_TRAINING_PARITY_BOOL_ATTN_MASK = None
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -1269,6 +1272,89 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         return key, value, block_size, block_table, actual_seq_lengths_kv
 
+    def _use_training_parity_decode_fa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        block_size: int,
+        block_table: torch.Tensor | None,
+        actual_seq_lengths_kv: list[int],
+        attn_metadata: AscendMetadata,
+    ) -> bool:
+        """Limit the correctness path to the investigated single-NPU Qwen3 case."""
+        return (
+            _TRAINING_PARITY
+            and attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+            and attn_metadata.causal
+            and self.attn_type != AttentionType.ENCODER_DECODER
+            and self.sliding_window is None
+            and self.sinks is None
+            and not self.enable_hamming_sparse
+            and get_tensor_model_parallel_world_size() == 1
+            and query.dtype == torch.bfloat16
+            and key.dtype == torch.bfloat16
+            and value.dtype == torch.bfloat16
+            and self.num_heads == 32
+            and self.num_kv_heads == 4
+            and self.head_size == 128
+            and query.shape[0] == 1
+            and key.ndim == 3
+            and value.ndim == 3
+            and block_table is not None
+            and attn_metadata.attn_mask is not None
+            and len(actual_seq_lengths_kv) == 1
+            and actual_seq_lengths_kv[0] > block_size
+        )
+
+    def _training_parity_decode_fa(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        block_size: int,
+        block_table: torch.Tensor,
+        sequence_length: int,
+        atten_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather one paged sequence and use the training FA reduction order."""
+        global _TRAINING_PARITY_BOOL_ATTN_MASK
+
+        block_count = cdiv(sequence_length, block_size)
+        block_ids = block_table[0, :block_count]
+        dense_key = key[block_ids].reshape(-1, self.num_kv_heads, self.head_size)[:sequence_length].contiguous()
+        dense_value = value[block_ids].reshape(-1, self.num_kv_heads, self.head_size)[:sequence_length].contiguous()
+        padded_query = torch.zeros(
+            (sequence_length, self.num_heads, self.head_size),
+            dtype=query.dtype,
+            device=query.device,
+        )
+        padded_query[-1:].copy_(query)
+        if (
+            _TRAINING_PARITY_BOOL_ATTN_MASK is None
+            or _TRAINING_PARITY_BOOL_ATTN_MASK.device != atten_mask.device
+            or _TRAINING_PARITY_BOOL_ATTN_MASK.shape != atten_mask.shape
+        ):
+            _TRAINING_PARITY_BOOL_ATTN_MASK = atten_mask.bool()
+        return torch_npu.npu_fusion_attention(
+            padded_query,
+            dense_key,
+            dense_value,
+            self.num_heads,
+            "TND",
+            pse=None,
+            padding_mask=None,
+            atten_mask=_TRAINING_PARITY_BOOL_ATTN_MASK,
+            scale=self.scale,
+            pre_tockens=65536,
+            next_tockens=0,
+            keep_prob=1.0,
+            inner_precise=0,
+            sparse_mode=2,
+            actual_seq_qlen=[0, sequence_length],
+            actual_seq_kvlen=[0, sequence_length],
+        )[0][-1:]
+
     def forward_fused_infer_attention(
         self,
         query: torch.Tensor,
@@ -1308,6 +1394,26 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # the operator boundary before invoking FIA.
         key = key.contiguous()
         value = value.contiguous()
+        if self._use_training_parity_decode_fa(
+            query,
+            key,
+            value,
+            block_size,
+            block_table,
+            actual_seq_lengths_kv,
+            attn_metadata,
+        ):
+            attn_output = self._training_parity_decode_fa(
+                query,
+                key,
+                value,
+                block_size,
+                block_table,
+                actual_seq_lengths_kv[0],
+                attn_metadata.attn_mask,
+            )
+            output[:num_tokens] = attn_output.view(num_tokens, self.num_heads, self.head_size)
+            return output
         # Get workspace from cache or calculate it if not present.
         if self.sinks is not None:
             actual_seq_qlen = attn_metadata.actual_seq_lengths_q
