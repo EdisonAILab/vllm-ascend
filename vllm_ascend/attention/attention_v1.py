@@ -63,7 +63,6 @@ from vllm_ascend.compilation.acl_graph import (
 )
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.flashcomm2_oshard_manager import flashcomm2_oshard_manager
-from vllm_ascend.training_parity import set_training_parity_sequence_length
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.kvcomp_utils import KVCompMetaData
 
@@ -1087,7 +1086,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         """Maintain an append-only dense KV shadow independent of paged-cache layout."""
         flat_key = key.reshape(-1, self.num_kv_heads, self.head_size)
         flat_value = value.reshape(-1, self.num_kv_heads, self.head_size)
-        set_training_parity_sequence_length(int(attn_metadata.seq_lens_list[0]))
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
             capacity = int(self.vllm_config.model_config.max_model_len)
             if flat_key.shape[0] > capacity:
