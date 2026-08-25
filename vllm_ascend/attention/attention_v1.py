@@ -71,6 +71,9 @@ SWA_INT_MAX = 2147483647
 _ATTN_KEYS_BUFFER = None
 _TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
 _TRAINING_PARITY_BOOL_ATTN_MASK = None
+_TRAINING_PARITY_FIA_DISPATCH_COUNT = 0
+_TRAINING_PARITY_FIA_MIN_KV = None
+_TRAINING_PARITY_FIA_MAX_KV = None
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -1107,7 +1110,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         self._training_parity_dense_key[start:sequence_length].copy_(flat_key)
         self._training_parity_dense_value[start:sequence_length].copy_(flat_value)
 
-    def _use_training_parity_decode_fa(
+    def _use_training_parity_decode_fia(
         self,
         query: torch.Tensor,
         block_size: int,
@@ -1115,7 +1118,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         actual_seq_lengths_kv: list[int],
         attn_metadata: AscendMetadata,
     ) -> bool:
-        """Select training FA after dense shadow KV has been initialized."""
+        """Select the private FIA after dense shadow KV has been initialized."""
         return (
             attn_metadata.attn_state == AscendAttentionState.DecodeOnly
             and query.shape[0] == 1
@@ -1127,14 +1130,17 @@ class AscendAttentionBackendImpl(AttentionImpl):
             and self._training_parity_dense_value is not None
         )
 
-    def _training_parity_decode_fa(
+    def _training_parity_decode_fia(
         self,
         query: torch.Tensor,
         sequence_length: int,
         atten_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Use dense shadow KV and the training FA reduction order."""
+        """Use dense shadow KV with the length-generic batch-invariant FIA."""
         global _TRAINING_PARITY_BOOL_ATTN_MASK
+        global _TRAINING_PARITY_FIA_DISPATCH_COUNT
+        global _TRAINING_PARITY_FIA_MIN_KV
+        global _TRAINING_PARITY_FIA_MAX_KV
 
         dense_key_buffer = self._training_parity_dense_key
         dense_value_buffer = self._training_parity_dense_value
@@ -1144,8 +1150,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         padded_length = cdiv(sequence_length, tp_world_size) * tp_world_size
         dense_key_buffer[sequence_length:padded_length].zero_()
         dense_value_buffer[sequence_length:padded_length].zero_()
-        dense_key = dense_key_buffer[:padded_length]
-        dense_value = dense_value_buffer[:padded_length]
+        dense_key = dense_key_buffer[:padded_length].contiguous()
+        dense_value = dense_value_buffer[:padded_length].contiguous()
         padded_query = torch.zeros(
             (padded_length, self.num_heads, self.head_size),
             dtype=query.dtype,
@@ -1158,24 +1164,45 @@ class AscendAttentionBackendImpl(AttentionImpl):
             or _TRAINING_PARITY_BOOL_ATTN_MASK.shape != atten_mask.shape
         ):
             _TRAINING_PARITY_BOOL_ATTN_MASK = atten_mask.bool()
-        return torch_npu.npu_fusion_attention(
+
+        # Importing the extension registers the private operator namespace. A
+        # missing or incompatible vendor must fail here rather than silently
+        # falling back to stock FIA or training FA.
+        import batch_invariant_ops  # type: ignore[import-not-found] # noqa: F401
+
+        fia = (
+            torch.ops.batch_invariant_ops
+            .npu_fused_infer_attention_score_batch_invariant
+        )
+        output, _ = fia(
             padded_query,
             dense_key,
             dense_value,
-            self.num_heads,
-            "TND",
-            pse=None,
-            padding_mask=None,
             atten_mask=_TRAINING_PARITY_BOOL_ATTN_MASK,
+            block_table=None,
+            input_layout="TND",
+            actual_seq_lengths=[padded_length],
+            actual_seq_lengths_kv=[padded_length],
+            num_key_value_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
             scale=self.scale,
-            pre_tockens=65536,
-            next_tockens=0,
-            keep_prob=1.0,
-            inner_precise=0,
+            pre_tokens=65536,
+            next_tokens=0,
             sparse_mode=2,
-            actual_seq_qlen=[0, padded_length],
-            actual_seq_kvlen=[0, padded_length],
-        )[0][sequence_length - 1 : sequence_length]
+            softmax_lse_flag=False,
+        )
+        _TRAINING_PARITY_FIA_DISPATCH_COUNT += 1
+        _TRAINING_PARITY_FIA_MIN_KV = (
+            sequence_length
+            if _TRAINING_PARITY_FIA_MIN_KV is None
+            else min(_TRAINING_PARITY_FIA_MIN_KV, sequence_length)
+        )
+        _TRAINING_PARITY_FIA_MAX_KV = (
+            sequence_length
+            if _TRAINING_PARITY_FIA_MAX_KV is None
+            else max(_TRAINING_PARITY_FIA_MAX_KV, sequence_length)
+        )
+        return output[sequence_length - 1 : sequence_length]
 
     def forward_fused_infer_attention(
         self,
@@ -1225,14 +1252,14 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # the operator boundary before invoking FIA.
         key = key.contiguous()
         value = value.contiguous()
-        if self._use_training_parity_decode_fa(
+        if self._use_training_parity_decode_fia(
             query,
             block_size,
             block_table,
             actual_seq_lengths_kv,
             attn_metadata,
         ):
-            attn_output = self._training_parity_decode_fa(
+            attn_output = self._training_parity_decode_fia(
                 query,
                 actual_seq_lengths_kv[0],
                 attn_metadata.attn_mask,
