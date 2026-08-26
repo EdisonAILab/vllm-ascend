@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -9,6 +10,7 @@ from tests.ut.quantization.conftest_quantization import (
     create_mock_vllm_config,
     create_mxfp_moe_layer,
 )
+from vllm_ascend.quantization.methods import w8a8_mxfp8
 from vllm_ascend.quantization.methods.w8a8_mxfp8 import (
     AscendW8A8MXFP8DynamicFusedMoEMethod,
     AscendW8A8MXFP8DynamicLinearMethod,
@@ -122,6 +124,42 @@ class TestAscendW8A8MXFP8LinearMethod(TestBase):
         self.assertEqual(call_kwargs["scale_dtype"], FLOAT8_E8M0FNU_DTYPE)
         self.assertEqual(call_kwargs["output_dtype"], torch.float16)
 
+    @patch("vllm_ascend.quantization.methods.w8a8_mxfp8.torch_npu")
+    def test_apply_uses_batch_invariant_decomposition_when_enabled(self, mock_torch_npu):
+        dynamic_scale = torch.randint(0, 255, (4, 2), dtype=torch.uint8)
+        quantized = torch.randint(0, 255, (4, 64), dtype=torch.uint8)
+        expected = torch.randn(4, 32, dtype=torch.bfloat16)
+        mock_torch_npu.npu_dynamic_mx_quant.return_value = (
+            quantized,
+            dynamic_scale,
+        )
+        layer = nn.Module()
+        layer.weight = nn.Parameter(
+            torch.randn(64, 32).to(torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        layer.weight_scale = nn.Parameter(
+            torch.randint(0, 255, (2, 32, 2), dtype=torch.uint8),
+            requires_grad=False,
+        )
+
+        with (
+            patch.object(w8a8_mxfp8, "_DENSE_BI_DECOMPOSE", True),
+            patch.object(
+                w8a8_mxfp8,
+                "_dense_bi_matmul",
+                return_value=expected,
+            ) as dense_bi_matmul,
+        ):
+            output = self.scheme.apply(
+                layer,
+                torch.randn(4, 64, dtype=torch.bfloat16),
+            )
+
+        assert output is expected
+        dense_bi_matmul.assert_called_once()
+        mock_torch_npu.npu_quant_matmul.assert_not_called()
+
 
 class TestAscendW8A8MXFP8MoEMethod(TestBase):
     num_experts = 8
@@ -204,3 +242,57 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
         )
         mock_select.assert_called_once()
         mock_comm.fused_experts.assert_called_once()
+
+
+class TestMXFP8BatchInvariantHelpers(TestBase):
+    def test_e8m0_scale_decode(self):
+        scale = torch.tensor([126, 127, 128], dtype=torch.uint8)
+        torch.testing.assert_close(
+            w8a8_mxfp8._e8m0_to_f32(scale),
+            torch.tensor([0.5, 1.0, 2.0], dtype=torch.float32),
+        )
+
+    def test_group_offsets_accept_counts_and_cumulative_offsets(self):
+        expected = [0, 2, 5, 6]
+        self.assertEqual(
+            w8a8_mxfp8._group_offsets(torch.tensor([2, 3, 1]), 0, 6),
+            expected,
+        )
+        self.assertEqual(
+            w8a8_mxfp8._group_offsets(torch.tensor([2, 5, 6]), 0, 6),
+            expected,
+        )
+
+    def test_grouped_scale_transform_and_restore_are_lossless(self):
+        method = object.__new__(AscendW8A8MXFP8DynamicFusedMoEMethod)
+        for scale_groups in (3, 4):
+            layer = SimpleNamespace(
+                w13_weight=SimpleNamespace(data=torch.arange(24).reshape(2, 4, 3)),
+                w2_weight=SimpleNamespace(data=torch.arange(24).reshape(2, 4, 3)),
+                w13_weight_scale=SimpleNamespace(
+                    data=torch.arange(8 * scale_groups).reshape(
+                        2, 4, scale_groups
+                    )
+                ),
+                w2_weight_scale=SimpleNamespace(
+                    data=torch.arange(8 * scale_groups).reshape(
+                        2, 4, scale_groups
+                    )
+                ),
+            )
+            original = {
+                name: getattr(layer, name).data.clone()
+                for name in (
+                    "w13_weight",
+                    "w2_weight",
+                    "w13_weight_scale",
+                    "w2_weight_scale",
+                )
+            }
+
+            with patch.object(w8a8_mxfp8, "_GROUPED_BI_DECOMPOSE", True):
+                method.process_weights_after_loading(layer)
+                method.restore_weights_for_rl_loading(layer)
+
+            for name, value in original.items():
+                self.assertTrue(torch.equal(getattr(layer, name).data, value))

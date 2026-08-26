@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -37,6 +38,214 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
+
+
+_DENSE_BI_DECOMPOSE = os.environ.get("VLLM_MXFP8_DENSE_BI_DECOMPOSE") == "1"
+_GROUPED_BI_DECOMPOSE = os.environ.get("VLLM_MXFP8_GROUPED_BI_DECOMPOSE") == "1"
+_DENSE_BI_NOTICE_PRINTED = False
+_GROUPED_BI_NOTICE_PRINTED = False
+_GROUPED_WEIGHT_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
+
+
+def _e8m0_to_f32(scale: torch.Tensor) -> torch.Tensor:
+    """Decode E8M0 scales without introducing another reduction."""
+    raw = scale if scale.dtype == torch.uint8 else scale.contiguous().view(torch.uint8)
+    return torch.exp2(raw.to(torch.float32) - 127.0)
+
+
+def _dequant_activation(
+    value: torch.Tensor, packed_scale: torch.Tensor, group_size: int
+) -> torch.Tensor:
+    rows, width = value.shape
+    scale = _e8m0_to_f32(packed_scale).reshape(rows, -1)
+    scale = scale.repeat_interleave(group_size, dim=1)[:, :width]
+    return value.to(torch.bfloat16).to(torch.float32) * scale
+
+
+def _dequant_weight(
+    weight: torch.Tensor, packed_scale: torch.Tensor, group_size: int
+) -> torch.Tensor:
+    width, columns = weight.shape
+    scale = _e8m0_to_f32(packed_scale)
+    if scale.ndim == 2:
+        scale = scale.reshape(-1, columns)
+    elif scale.ndim == 3:
+        scale = scale.permute(0, 2, 1).reshape(-1, columns)
+    else:
+        raise RuntimeError(
+            f"unsupported MXFP8 weight-scale rank {scale.ndim}; expected 2 or 3"
+        )
+    scale = scale.repeat_interleave(group_size, dim=0)[:width]
+    return weight.to(torch.bfloat16).to(torch.float32) * scale
+
+
+def _dense_bi_matmul(
+    layer: torch.nn.Module,
+    quantized_x: torch.Tensor,
+    pertoken_scale: torch.Tensor,
+    group_size: int,
+    output_dtype: torch.dtype,
+    bias: torch.Tensor | None,
+) -> torch.Tensor:
+    global _DENSE_BI_NOTICE_PRINTED
+    if not _DENSE_BI_NOTICE_PRINTED:
+        print(
+            "[BI_MXFP8_DENSE] dequantize + bf16 fixed-order matmul enabled",
+            flush=True,
+        )
+        _DENSE_BI_NOTICE_PRINTED = True
+
+    cached = getattr(layer, "_bi_dense_bf16_weight", None)
+    if cached is None:
+        cached = _dequant_weight(layer.weight, layer.weight_scale, group_size).to(
+            torch.bfloat16
+        )
+        layer._bi_dense_bf16_weight = cached
+
+    x_bf16 = _dequant_activation(quantized_x, pertoken_scale, group_size).to(
+        torch.bfloat16
+    )
+    import batch_invariant_ops  # noqa: F401
+
+    output = torch.ops.batch_invariant_ops.npu_mm_batch_invariant(
+        x_bf16.contiguous(), cached.contiguous()
+    )
+    if bias is not None:
+        output = output + bias.to(output.dtype)
+    return output.to(output_dtype)
+
+
+def _group_offsets(
+    group_list: torch.Tensor, group_list_type: int | None, total: int
+) -> list[int]:
+    del group_list_type
+    groups = group_list.to(torch.int64)
+    cumulative = bool((groups[1:] >= groups[:-1]).all().item()) and int(
+        groups[-1].item()
+    ) == total
+    if not cumulative:
+        groups = groups.cumsum(0)
+    offsets = torch.empty(
+        groups.numel() + 1, dtype=torch.int64, device=groups.device
+    )
+    offsets[0] = 0
+    offsets[1:] = groups
+    return offsets.tolist()
+
+
+def _grouped_weight_bf16(
+    weight: torch.Tensor,
+    packed_scale: torch.Tensor,
+    expert: int,
+    group_size: int,
+    tag: str,
+) -> torch.Tensor:
+    key = (weight.untyped_storage().data_ptr(), expert, tag)
+    cached = _GROUPED_WEIGHT_CACHE.get(key)
+    if cached is None:
+        cached = _dequant_weight(weight[expert], packed_scale[expert], group_size).to(
+            torch.bfloat16
+        )
+        _GROUPED_WEIGHT_CACHE[key] = cached
+    return cached
+
+
+def _grouped_gmm2_bi(
+    *,
+    x,
+    weight,
+    scale=None,
+    bias=None,
+    per_token_scale=None,
+    group_list=None,
+    group_list_type=None,
+    output_dtype=None,
+    **kwargs,
+):
+    del kwargs
+    values = x[0] if isinstance(x, (list, tuple)) else x
+    weights = weight[0] if isinstance(weight, (list, tuple)) else weight
+    scales = scale[0] if isinstance(scale, (list, tuple)) else scale
+    token_scale = (
+        per_token_scale[0]
+        if isinstance(per_token_scale, (list, tuple))
+        else per_token_scale
+    )
+    experts, _, columns = weights.shape
+    offsets = _group_offsets(group_list, group_list_type, values.shape[0])
+    values_bf16 = _dequant_activation(values, token_scale, group_size=32).to(
+        torch.bfloat16
+    )
+    result_dtype = output_dtype or torch.bfloat16
+    output = torch.zeros(
+        values.shape[0], columns, dtype=result_dtype, device=values.device
+    )
+    for expert in range(experts):
+        start, end = offsets[expert], offsets[expert + 1]
+        if end <= start:
+            continue
+        expert_weight = _grouped_weight_bf16(
+            weights, scales, expert, 32, "gmm2"
+        )
+        part = torch.ops.batch_invariant_ops.npu_mm_batch_invariant(
+            values_bf16[start:end].contiguous(), expert_weight.contiguous()
+        )
+        if bias is not None:
+            part = part + bias[expert].to(part.dtype)
+        output[start:end] = part.to(result_dtype)
+    return [output]
+
+
+def _grouped_gmm1_bi(
+    *, x, weight, group_list=None, weight_scale=None, x_scale=None, **kwargs
+):
+    del kwargs
+    weights = weight[0] if isinstance(weight, (list, tuple)) else weight
+    scales = (
+        weight_scale[0]
+        if isinstance(weight_scale, (list, tuple))
+        else weight_scale
+    )
+    experts, _, columns = weights.shape
+    offsets = _group_offsets(group_list, 0, x.shape[0])
+    values_bf16 = _dequant_activation(x, x_scale, group_size=32).to(
+        torch.bfloat16
+    )
+    hidden = torch.zeros(
+        x.shape[0], columns, dtype=torch.bfloat16, device=x.device
+    )
+    for expert in range(experts):
+        start, end = offsets[expert], offsets[expert + 1]
+        if end <= start:
+            continue
+        expert_weight = _grouped_weight_bf16(
+            weights, scales, expert, 32, "gmm1"
+        )
+        hidden[start:end] = torch.ops.batch_invariant_ops.npu_mm_batch_invariant(
+            values_bf16[start:end].contiguous(), expert_weight.contiguous()
+        )
+    activated = torch_npu.npu_swiglu(hidden)
+    return torch_npu.npu_dynamic_mx_quant(
+        activated, dst_type=torch.float8_e4m3fn
+    )
+
+
+def _install_grouped_bi_decompose() -> None:
+    global _GROUPED_BI_NOTICE_PRINTED
+    import batch_invariant_ops  # noqa: F401
+
+    torch_npu.npu_grouped_matmul = _grouped_gmm2_bi
+    torch_npu.npu_grouped_matmul_swiglu_quant_v2 = _grouped_gmm1_bi
+    if not _GROUPED_BI_NOTICE_PRINTED:
+        print(
+            "[BI_MXFP8_GROUPED] per-expert bf16 fixed-order matmul enabled",
+            flush=True,
+        )
+        _GROUPED_BI_NOTICE_PRINTED = True
+
+
+if _GROUPED_BI_DECOMPOSE:
+    _install_grouped_bi_decompose()
 
 
 @register_scheme("W8A8_MXFP8", "linear")
@@ -88,17 +297,27 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         if bias is not None and bias.dtype != torch.float32:
             bias = bias.to(torch.float32)
 
-        output = torch_npu.npu_quant_matmul(
-            quantized_x,
-            layer.weight,
-            layer.weight_scale,
-            scale_dtype=FLOAT8_E8M0FNU_DTYPE,
-            pertoken_scale=pertoken_scale,
-            pertoken_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
-            bias=bias,
-            output_dtype=output_dtype,
-            group_sizes=[1, 1, self.group_size],
-        )
+        if _DENSE_BI_DECOMPOSE:
+            output = _dense_bi_matmul(
+                layer,
+                quantized_x,
+                pertoken_scale,
+                self.group_size,
+                output_dtype,
+                bias,
+            )
+        else:
+            output = torch_npu.npu_quant_matmul(
+                quantized_x,
+                layer.weight,
+                layer.weight_scale,
+                scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+                pertoken_scale=pertoken_scale,
+                pertoken_scale_dtype=FLOAT8_E8M0FNU_DTYPE,
+                bias=bias,
+                output_dtype=output_dtype,
+                group_sizes=[1, 1, self.group_size],
+            )
         # reshape output for Qwen VL models
         if len(original_shape) > 2:
             output = output.view(*original_shape[:-1], -1)
@@ -374,14 +593,22 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
                 "w2_weight_scale": tuple(layer.w2_weight_scale.data.shape),
             }
 
-        g_num, n_size, k_size = layer.w13_weight_scale.shape
-        layer.w13_weight_scale.data = layer.w13_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
-        g_num, n_size, k_size = layer.w2_weight_scale.shape
-        layer.w2_weight_scale.data = layer.w2_weight_scale.data.reshape(g_num, n_size, k_size // 2, 2)
+        def _transform_scale(scale: torch.Tensor) -> torch.Tensor:
+            g_num, n_size, k_size = scale.shape
+            if k_size % 2:
+                if not _GROUPED_BI_DECOMPOSE:
+                    raise RuntimeError(
+                        "MXFP8 grouped scale packing requires an even group count; "
+                        "enable VLLM_MXFP8_GROUPED_BI_DECOMPOSE for the "
+                        "deterministic unpacked path"
+                    )
+                return scale.transpose(1, 2)
+            return scale.reshape(g_num, n_size, k_size // 2, 2).transpose(1, 2)
+
+        layer.w13_weight_scale.data = _transform_scale(layer.w13_weight_scale.data)
+        layer.w2_weight_scale.data = _transform_scale(layer.w2_weight_scale.data)
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2)
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2)
-        layer.w13_weight_scale.data = layer.w13_weight_scale.data.transpose(1, 2)
-        layer.w2_weight_scale.data = layer.w2_weight_scale.data.transpose(1, 2)
 
         # Mark as transformed
         layer._mxfp8_transformed = True
