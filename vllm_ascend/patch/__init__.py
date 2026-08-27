@@ -991,6 +991,25 @@
 #    Future Plan:
 #       Remove this patch when vLLM aligns with the latest main.
 #
+# ** 10a. File: worker/patch_layerwise_reload.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.model_executor.model_loader.reload.layerwise`
+#      `vllm.model_executor.model_loader.reload.utils.get_layer_size`
+#    Why:
+#       Ascend models can register non-persistent kernel buffers and callable
+#       weight loaders without a `__name__`. vLLM v0.26.0 counts those buffers
+#       as reloadable state and assumes every loader is a function, which can
+#       stall layer completion or raise during model reload.
+#    How:
+#       Exclude non-persistent buffers from reload accounting, restore their
+#       metadata after moving a layer to `meta`, and unwrap loaders using a
+#       defensive name lookup.
+#    Related PR (if no, explain why):
+#       No, this adapts vLLM's generic layerwise loader to Ascend kernel state.
+#    Future Plan:
+#       Remove this patch once upstream reload accounting supports these buffers
+#       and arbitrary callable weight loaders.
+#
 # ** 11. File: worker/patch_mamba_utils.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.worker.mamba_utils.batch_memcpy_kernel = batch_memcpy_kernel`

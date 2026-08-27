@@ -19,12 +19,14 @@
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
+from functools import partial
 from typing import Annotated, Any, Literal, cast
 
 import numpy as np
 import torch
 import torch_npu
 from torch import nn
+from torch.nn import functional as F
 from transformers import BatchFeature
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -132,6 +134,27 @@ def _routed_latent_quant_config(
     if quant_config is not None and quant_config.get_name() == "ascend":
         return quant_config
     return None
+
+
+def _kimi_hf_sigmoid_topk(
+    *,
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+    e_score_correction_bias: torch.Tensor,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match the training-side Kimi K3 router arithmetic exactly."""
+    del hidden_states
+    scores = gating_output.float().sigmoid()
+    scores_for_choice = scores + e_score_correction_bias.float().unsqueeze(0)
+    topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=False).indices
+    topk_weights = scores.gather(1, topk_ids)
+    if renormalize:
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+    topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.float(), topk_ids
 
 
 def _resolve_packed_expert_weight_name(
@@ -603,29 +626,13 @@ class AscendKimiK3ForConditionalGeneration(
         return AscendKimiK3ForCausalLM.get_mamba_state_copy_func()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # ModelSlim checkpoints may include an explicit projector rotation.
-        # Build the optional layer before loading so streaming checkpoint
-        # iterators can populate it, then release it when the weight is absent.
         rot_proj = getattr(self.mm_projector, "rot_proj", None)
         skip_prefixes = [] if rot_proj is not None else ["mm_projector.rot_proj."]
         loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
-        rot_proj_weight_names = (
-            {name for name, _ in rot_proj.named_parameters(prefix="mm_projector.rot_proj")}
-            if rot_proj is not None
-            else set()
-        )
-        loaded_weights = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
-        if rot_proj is not None and rot_proj_weight_names.isdisjoint(loaded_weights):
-            # StageMissingLayer.__getattr__ delegates to the wrapped module, so
-            # rot_proj above is the real one, but del must act on the module
-            # that actually holds the registration. Unwrap the placeholder
-            # (language-model-only / zero mm limit deployments) before deleting.
-            # cast: the runtime value is the projector or its StageMissingLayer
-            # wrapper, both nn.Module; the getattr default form confuses mypy.
-            target = cast(nn.Module, getattr(self.mm_projector, "module", self.mm_projector))
-            if "rot_proj" in target._modules:
-                del target.rot_proj
-        return loaded_weights
+        # Verl updates rollout weights in multiple buckets. Projector
+        # structure is config-driven below and must not be inferred from the
+        # keys present in any individual bucket.
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
 
 class KimiK3MLP(nn.Module):
@@ -704,6 +711,13 @@ class KimiK3MoE(nn.Module):
             raise ValueError("Kimi K3 routed experts require the SiTU activation")
         if config.routed_expert_hidden_size is None:
             raise ValueError("Kimi K3 requires routed_expert_hidden_size")
+        if config.moe_router_activation_func != "sigmoid":
+            raise ValueError("Kimi K3 router parity requires sigmoid scoring")
+        if config.num_expert_group != 1 or config.topk_group != 1:
+            raise ValueError(
+                "Kimi K3 router parity currently supports the released "
+                "single expert-group configuration only"
+            )
 
         self.config = config
         self.hidden_size = config.hidden_size
@@ -763,13 +777,21 @@ class KimiK3MoE(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             renormalize=config.moe_renormalize,
             quant_config=quant_config,
-            use_grouped_topk=config.use_grouped_topk,
-            num_expert_group=config.num_expert_group,
-            topk_group=config.topk_group,
+            # One-group grouped top-k is ordinary top-k. Use a custom router
+            # to reproduce the training implementation's FP32 selection.
+            use_grouped_topk=False,
+            num_expert_group=None,
+            topk_group=None,
             prefix=f"{prefix}.experts",
             scoring_func=config.moe_router_activation_func,
             e_score_correction_bias=self.gate.e_score_correction_bias,
-            routed_scaling_factor=config.routed_scaling_factor,
+            custom_routing_function=partial(
+                _kimi_hf_sigmoid_topk,
+                e_score_correction_bias=self.gate.e_score_correction_bias,
+                routed_scaling_factor=config.routed_scaling_factor,
+            ),
+            # The custom router applies this factor itself.
+            routed_scaling_factor=1.0,
             n_shared_experts=self.num_shared_experts,
             routed_input_transform=self.routed_expert_down_proj,
             routed_output_transform=routed_output_transform,
@@ -782,7 +804,9 @@ class KimiK3MoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        router_logits, _ = self.gate(hidden_states)
+        # ReplicatedLinear follows the model dtype. Training computes this
+        # projection in FP32, which matters at close top-k boundaries.
+        router_logits = F.linear(hidden_states.float(), self.gate.weight.float(), bias=None)
         output = self.experts(hidden_states=hidden_states, router_logits=router_logits)
         return output.view(num_tokens, hidden_size)
 
@@ -1691,13 +1715,15 @@ class KimiK3MultiModalProjector(nn.Module):
         # ModelSlim rotates K3's FP4 activations before INT4 inference. Text
         # embeddings fold this matrix into their input projection, but the
         # vision path ends in RMSNorm, so the rotation must remain explicit.
-        self.rot_proj: ReplicatedLinear | None = ReplicatedLinear(
-            config.text_hidden_size,
-            config.text_hidden_size,
-            bias=False,
-            quant_config=None,
-            prefix=f"{prefix}.rot_proj",
-        )
+        self.rot_proj: ReplicatedLinear | None = None
+        if getattr(config, "use_rot_proj", False):
+            self.rot_proj = ReplicatedLinear(
+                config.text_hidden_size,
+                config.text_hidden_size,
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.rot_proj",
+            )
 
     def forward(self, image_features: torch.Tensor) -> torch.Tensor:
         hidden_states = image_features.reshape(-1, self.input_size)
