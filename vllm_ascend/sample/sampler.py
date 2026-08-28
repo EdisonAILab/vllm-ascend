@@ -6,6 +6,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.topk_topp_sampler import TopKTopPSampler
 from vllm.v1.sample.sampler import Sampler
 
+from vllm_ascend import envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.sample.penalties import apply_all_penalties
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, global_stream, npu_stream_switch
@@ -13,6 +14,27 @@ from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, global_s
 DEFAULT_LOGPROBS_MODE = "raw_logprobs"
 
 _SAMPLING_EPS = 1e-5
+_TRAINING_PARITY_LOGPROBS_CHUNK_SIZE = 1
+
+
+def _compute_training_parity_logprobs(logits: torch.Tensor) -> torch.Tensor:
+    """Compute logprobs using the cross-engine parity contract.
+
+    The CPU transfer and rowwise reduction are intentional. NPU softmax/reduction
+    kernels can differ by execution context even when their input logits are
+    bitwise identical. Processing one row at a time also makes the CPU
+    reduction independent of request batch size. This slow path is enabled
+    only by training-parity mode.
+    """
+    output_device = logits.device
+    cpu_logits = logits.detach().to(device="cpu").contiguous()
+    chunks: list[torch.Tensor] = []
+    with torch.inference_mode():
+        for logits_chunk in cpu_logits.split(_TRAINING_PARITY_LOGPROBS_CHUNK_SIZE, dim=0):
+            fp32_logits = logits_chunk.float()
+            chunks.append(fp32_logits - torch.logsumexp(fp32_logits, dim=-1, keepdim=True))
+    cpu_logprobs = torch.cat(chunks, dim=0) if chunks else cpu_logits.float()
+    return cpu_logprobs.to(device=output_device)
 
 
 def random_sample(
@@ -42,6 +64,12 @@ def random_sample(
 
 
 class AscendSampler(Sampler):
+    @staticmethod
+    def compute_logprobs(logits: torch.Tensor) -> torch.Tensor:
+        if envs_ascend.VLLM_ASCEND_TRAINING_PARITY:
+            return _compute_training_parity_logprobs(logits)
+        return Sampler.compute_logprobs(logits)
+
     @staticmethod
     def apply_penalties(
         logits: torch.Tensor,
