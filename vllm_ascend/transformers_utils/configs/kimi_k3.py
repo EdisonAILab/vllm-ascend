@@ -61,6 +61,11 @@ class KimiK3TextConfig(KimiLinearConfig):
         self.routed_expert_hidden_size = routed_expert_hidden_size
         self.topk_method = topk_method
 
+    @property
+    def num_experts_per_tok(self) -> int:
+        """Expose Kimi's top-k under vLLM's routed-experts field name."""
+        return self.num_experts_per_token
+
 
 class K3DSparkConfig(PretrainedConfig):
     """Configuration contract for Kimi K3 MLA DSpark checkpoints."""

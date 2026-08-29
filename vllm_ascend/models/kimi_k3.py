@@ -17,7 +17,7 @@
 """Native multimodal Kimi K3 model for vLLM-Ascend."""
 
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from copy import deepcopy
 from functools import partial
 from typing import Annotated, Any, Literal, cast
@@ -70,7 +70,6 @@ from vllm.model_executor.models.interfaces import (
 )
 from vllm.model_executor.models.kimi_k25_vit import (
     Learnable2DInterpPosEmbDivided_fixed,
-    Rope2DPosEmbRepeated,
     apply_rope,
     tpool_patch_merger,
 )
@@ -103,7 +102,6 @@ from vllm.multimodal.processing import (
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processor import cached_get_image_processor
-from vllm.triton_utils import HAS_TRITON
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -113,19 +111,6 @@ from vllm_ascend.ops.kimi_kda_state import kimi_kda_state_shape
 from vllm_ascend.transformers_utils.configs.kimi_k3 import KimiK3Config, KimiK3TextConfig, KimiK3VisionConfig
 from vllm_ascend.transformers_utils.processors.kimi_k3 import KimiK3Processor
 from vllm_ascend.utils import vllm_version_is
-
-apply_attn_res: (
-    Callable[
-        [torch.Tensor, torch.Tensor, nn.Module, nn.Module],
-        torch.Tensor,
-    ]
-    | None
-) = None
-if HAS_TRITON:
-    from vllm_ascend.ops.triton.kimi_k3.attention_residual import apply_attn_res as triton_apply_attn_res
-
-    apply_attn_res = triton_apply_attn_res
-
 
 def _routed_latent_quant_config(
     quant_config: QuantizationConfig | None,
@@ -154,7 +139,7 @@ def _kimi_hf_sigmoid_topk(
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
     topk_weights = topk_weights * routed_scaling_factor
-    return topk_weights.float(), topk_ids
+    return topk_weights, topk_ids
 
 
 def _resolve_packed_expert_weight_name(
@@ -182,6 +167,73 @@ def _is_vit_use_data_parallel(num_heads: int) -> bool:
         )
         return True
     return is_vit_use_data_parallel()
+
+
+def _canonical_nd(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type != "npu":
+        return tensor
+    return torch_npu.npu_format_cast(tensor, 2)
+
+
+def _linear_output(module: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
+    output = module(inputs)
+    return output[0] if isinstance(output, tuple) else output
+
+
+class KimiK3VisionRotaryEmbedding(nn.Module):
+    """Build K3 vision frequencies on CPU, matching the training model."""
+
+    def __init__(self, dim: int, max_size: int = 512, theta: float = 10000.0) -> None:
+        super().__init__()
+        if dim % 4:
+            raise ValueError("Kimi K3 vision head dimension must be divisible by four")
+        cpu = torch.device("cpu")
+        axis_dim = torch.arange(0, dim, 4, dtype=torch.float32, device=cpu)[: dim // 4]
+        inv_freq = 1.0 / (theta ** (axis_dim / dim))
+        positions = torch.arange(max_size, dtype=torch.float32, device=cpu)
+        # Keep this derived constant outside Module buffers. The vision tower
+        # is moved to BF16 as a whole, while RoPE must remain complex64.
+        self._axis_freqs_cpu = torch.polar(
+            torch.ones(max_size, dim // 4, dtype=torch.float32, device=cpu),
+            positions[:, None] * inv_freq[None, :],
+        )
+        self.max_size = max_size
+
+    def get_freqs_cis(
+        self,
+        grid_thws: list[list[int]],
+        device: torch.device,
+    ) -> torch.Tensor:
+        values = []
+        for t, h, w in grid_thws:
+            if h > self.max_size or w > self.max_size:
+                raise ValueError(
+                    f"Kimi K3 vision grid {(h, w)} exceeds RoPE limit {self.max_size}"
+                )
+            y = self._axis_freqs_cpu[:h, None].expand(h, w, -1)
+            x = self._axis_freqs_cpu[None, :w].expand(h, w, -1)
+            values.append(
+                torch.stack((x, y), dim=-1)
+                .flatten(-2)
+                .reshape(h * w, -1)
+                .repeat(t, 1)
+            )
+        return torch.cat(values).to(device=device)
+
+
+def _npu_rms_norm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Use one reduction shape for actor and rollout residual mixing."""
+    shape = hidden_states.shape
+    normalized, _ = torch_npu.npu_rms_norm(
+        hidden_states.reshape(-1, shape[-1]),
+        weight,
+        eps,
+    )
+    return normalized.reshape(shape)
 
 
 def _move_module_to_device(
@@ -938,19 +990,23 @@ def _apply_attention_residual(
     norm: RMSNorm,
 ) -> torch.Tensor:
     """Apply K3's learned normalized mixture over residual block starts."""
-    if apply_attn_res is not None and prefix_sum.device.type == "npu" and prefix_sum.numel() > 0:
-        mixed = apply_attn_res(prefix_sum, block_residual, projection, norm)
-    else:
-        values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
-        values_fp32 = values.float()
-        normalized, _ = torch_npu.npu_rms_norm(
+    values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
+    values_fp32 = values.float()
+    if values.device.type == "npu":
+        normalized = _npu_rms_norm(
             values_fp32,
             norm.weight.float(),
             norm.variance_epsilon,
         )
         scores = torch.matmul(normalized, projection.weight.t().float()).squeeze(-1)
-        probabilities = scores.softmax(-1).unsqueeze(1)
-        mixed = torch.matmul(probabilities, values_fp32).squeeze(1).to(values.dtype)
+    else:
+        normalized = values_fp32 * torch.rsqrt(
+            values_fp32.square().mean(dim=-1, keepdim=True) + norm.variance_epsilon
+        )
+        score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
+        scores = (normalized * score_weight).sum(dim=-1)
+    probabilities = scores.softmax(-1).unsqueeze(1)
+    mixed = torch.matmul(probabilities, values_fp32).squeeze(1).to(values.dtype)
     if _EXTRA_CTX.flash_comm_v1_enabled:
         # FlashComm changes the first decoder layer from the global token
         # layout to a TP-local layout.  The learned-residual arithmetic above
@@ -1243,9 +1299,13 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
                     continue
                 if ".experts." in name and name not in params_dict:
                     continue
-                name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
+                mapped_name = name.replace(weight_name, param_name)
+                # BF16 KDA retains independent q/k/v modules.  In that case
+                # the fused mapping is inapplicable and the direct loader below
+                # must receive the original checkpoint name.
+                if mapped_name not in params_dict:
                     continue
+                name = mapped_name
                 if is_pp_missing_parameter(name, self):
                     break
                 param = params_dict[name]
@@ -1295,6 +1355,9 @@ class AscendKimiK3ForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfExp
         self.vllm_config = vllm_config
         self.config: KimiK3TextConfig = self.model_config.hf_text_config
         self.quant_config = vllm_config.quant_config
+        self.packed_modules_mapping = dict(type(self).packed_modules_mapping)
+        if self.quant_config is None:
+            self.packed_modules_mapping.pop("fused_qkv")
         self.model = KimiK3TextModel(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -1427,7 +1490,14 @@ class KimiK3VisionPatchEmbed(nn.Module):
         )
 
     def forward(self, pixels: torch.Tensor, grid_thws: torch.Tensor | list[list[int]]) -> torch.Tensor:
-        hidden_states = self.proj(pixels).view(pixels.shape[0], -1)
+        # Match the training-side patch projection independent of the private
+        # NPU format retained by the layerwise weight-reload path.
+        with torch.autocast(device_type=pixels.device.type, enabled=False):
+            flat_pixels = _canonical_nd(pixels.flatten(1).float())
+            flat_weight = _canonical_nd(self.proj.weight.flatten(1).float())
+            bias = None if self.proj.bias is None else _canonical_nd(self.proj.bias.float())
+            hidden_states = F.linear(flat_pixels, flat_weight, bias)
+        hidden_states = hidden_states.to(self.proj.weight.dtype)
         return self.pos_emb(hidden_states, grid_thws)
 
 
@@ -1443,28 +1513,35 @@ class KimiK3VisionMLP(nn.Module):
         bias: bool,
     ) -> None:
         super().__init__()
-        self.fc0 = ColumnParallelLinear(
-            hidden_size,
-            intermediate_size,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.fc0",
-            disable_tp=use_data_parallel,
-        )
-        self.fc1 = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.fc1",
-            disable_tp=use_data_parallel,
-        )
+        self.use_native_linear = use_data_parallel and quant_config is None
+        if self.use_native_linear:
+            # The Megatron vision tower is replicated and uses nn.Linear in
+            # BF16.  Keep the same operator and parameter layout here.
+            self.fc0 = nn.Linear(hidden_size, intermediate_size, bias=bias)
+            self.fc1 = nn.Linear(intermediate_size, hidden_size, bias=bias)
+        else:
+            self.fc0 = ColumnParallelLinear(
+                hidden_size,
+                intermediate_size,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fc0",
+                disable_tp=use_data_parallel,
+            )
+            self.fc1 = RowParallelLinear(
+                intermediate_size,
+                hidden_size,
+                bias=bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.fc1",
+                disable_tp=use_data_parallel,
+            )
         self.activation = activation
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states, _ = self.fc0(hidden_states)
+        hidden_states = _linear_output(self.fc0, hidden_states)
         hidden_states = self.activation(hidden_states)
-        return self.fc1(hidden_states)[0]
+        return _linear_output(self.fc1, hidden_states)
 
 
 class KimiK3VisionEncoderLayer(nn.Module):
@@ -1501,24 +1578,37 @@ class KimiK3VisionEncoderLayer(nn.Module):
             self.use_data_parallel,
             config.linear_bias,
         )
-        self.wqkv = QKVParallelLinear(
-            hidden_size=self.hidden_dim,
-            head_size=self.head_dim,
-            total_num_heads=self.num_heads,
-            total_num_kv_heads=self.num_heads,
-            bias=config.attn_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.wqkv",
-            disable_tp=self.use_data_parallel,
-        )
-        self.wo = RowParallelLinear(
-            self.qkv_hidden_size,
-            self.hidden_dim,
-            bias=config.attn_bias,
-            quant_config=quant_config,
-            prefix=f"{prefix}.wo",
-            disable_tp=self.use_data_parallel,
-        )
+        self.use_native_linear = self.use_data_parallel and quant_config is None
+        if self.use_native_linear:
+            self.wqkv = nn.Linear(
+                self.hidden_dim,
+                3 * self.qkv_hidden_size,
+                bias=config.attn_bias,
+            )
+            self.wo = nn.Linear(
+                self.qkv_hidden_size,
+                self.hidden_dim,
+                bias=config.attn_bias,
+            )
+        else:
+            self.wqkv = QKVParallelLinear(
+                hidden_size=self.hidden_dim,
+                head_size=self.head_dim,
+                total_num_heads=self.num_heads,
+                total_num_kv_heads=self.num_heads,
+                bias=config.attn_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.wqkv",
+                disable_tp=self.use_data_parallel,
+            )
+            self.wo = RowParallelLinear(
+                self.qkv_hidden_size,
+                self.hidden_dim,
+                bias=config.attn_bias,
+                quant_config=quant_config,
+                prefix=f"{prefix}.wo",
+                disable_tp=self.use_data_parallel,
+            )
         self.attn = MMEncoderAttention(
             num_heads=self.num_local_heads,
             head_size=self.head_dim,
@@ -1533,9 +1623,10 @@ class KimiK3VisionEncoderLayer(nn.Module):
         rope_freqs_cis: torch.Tensor,
         max_seqlen: torch.Tensor,
         sequence_lengths: torch.Tensor | None,
+        token_counts: list[int],
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
-        qkv = self.wqkv(hidden_states)[0].view(
+        qkv = _linear_output(self.wqkv, hidden_states).view(
             num_tokens,
             3,
             self.num_local_heads,
@@ -1545,16 +1636,40 @@ class KimiK3VisionEncoderLayer(nn.Module):
         # QKVParallelLinear shards heads, while the shared RoPE table is head
         # independent and therefore needs no TP slicing.
         query, key = apply_rope(query, key, rope_freqs_cis)
-        output = self.attn(
-            query.unsqueeze(0),
-            key.unsqueeze(0),
-            value.unsqueeze(0),
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            sequence_lengths=sequence_lengths,
-        )
+        query = _canonical_nd(query)
+        key = _canonical_nd(key)
+        value = _canonical_nd(value)
+        if self.use_native_linear:
+            if sum(token_counts) != num_tokens:
+                raise ValueError(
+                    "K3 vision sequence lengths do not match the packed input: "
+                    f"tokens={num_tokens}, lengths={token_counts}"
+                )
+            outputs = []
+            offset = 0
+            for count in token_counts:
+                end = offset + count
+                q = query[offset:end].transpose(0, 1).unsqueeze(0)
+                k = key[offset:end].transpose(0, 1).unsqueeze(0)
+                v = value[offset:end].transpose(0, 1).unsqueeze(0)
+                outputs.append(
+                    F.scaled_dot_product_attention(q, k, v)
+                    .squeeze(0)
+                    .transpose(0, 1)
+                )
+                offset = end
+            output = torch.cat(outputs, dim=0)
+        else:
+            output = self.attn(
+                query.unsqueeze(0),
+                key.unsqueeze(0),
+                value.unsqueeze(0),
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                sequence_lengths=sequence_lengths,
+            )
         output = output.reshape(num_tokens, self.num_local_heads * self.head_dim)
-        return self.wo(output)[0]
+        return _linear_output(self.wo, output)
 
     def forward(
         self,
@@ -1563,6 +1678,7 @@ class KimiK3VisionEncoderLayer(nn.Module):
         rope_freqs_cis: torch.Tensor,
         max_seqlen: torch.Tensor,
         sequence_lengths: torch.Tensor | None,
+        token_counts: list[int],
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.norm0(hidden_states)
@@ -1572,6 +1688,7 @@ class KimiK3VisionEncoderLayer(nn.Module):
             rope_freqs_cis,
             max_seqlen,
             sequence_lengths,
+            token_counts,
         )
         residual = hidden_states
         hidden_states = self.norm1(hidden_states)
@@ -1586,10 +1703,8 @@ class KimiK3VisionEncoder(nn.Module):
         prefix: str,
     ) -> None:
         super().__init__()
-        self.rope_2d = Rope2DPosEmbRepeated(
+        self.rope_2d = KimiK3VisionRotaryEmbedding(
             config.qkv_hidden_size // config.num_attention_heads,
-            512,
-            512,
         )
         self.blocks = nn.ModuleList(
             [
@@ -1642,6 +1757,7 @@ class KimiK3VisionEncoder(nn.Module):
         max_seqlen = encoder_metadata["max_seqlen"]
         if rope_freqs_cis is None or cu_seqlens is None or max_seqlen is None:
             raise RuntimeError("Incomplete Kimi K3 vision attention metadata")
+        token_counts = [t * h * w for t, h, w in grid_thw_list]
         for block in self.blocks:
             hidden_states = block(
                 hidden_states,
@@ -1649,6 +1765,7 @@ class KimiK3VisionEncoder(nn.Module):
                 rope_freqs_cis,
                 max_seqlen,
                 encoder_metadata["sequence_lengths"],
+                token_counts,
             )
         return self.final_layernorm(hidden_states)
 
@@ -1696,44 +1813,65 @@ class KimiK3MultiModalProjector(nn.Module):
         self.input_size = config.mm_hidden_size * merge_size
         if config.mm_projector_type != "patchmergerv2":
             raise ValueError(f"Unsupported Kimi K3 projector: {config.mm_projector_type}")
-        self.linear_1 = ReplicatedLinear(
-            self.input_size,
-            self.input_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.linear_1",
-        )
-        self.linear_2 = ReplicatedLinear(
-            self.input_size,
-            config.text_hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.linear_2",
-        )
+        # The projector follows the configured multimodal parallel mode; unlike
+        # vision attention, it has no head-divisibility constraint to inspect.
+        self.use_native_linear = is_vit_use_data_parallel() and quant_config is None
+        if self.use_native_linear:
+            self.linear_1 = nn.Linear(self.input_size, self.input_size, bias=False)
+            self.linear_2 = nn.Linear(
+                self.input_size,
+                config.text_hidden_size,
+                bias=False,
+            )
+        else:
+            self.linear_1 = ReplicatedLinear(
+                self.input_size,
+                self.input_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.linear_1",
+            )
+            self.linear_2 = ReplicatedLinear(
+                self.input_size,
+                config.text_hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.linear_2",
+            )
         self.act = get_act_fn(config.projector_hidden_act)
-        self.post_norm = RMSNorm(config.text_hidden_size, eps=config.projector_ln_eps)
+        self.post_norm = (
+            nn.RMSNorm(config.text_hidden_size, eps=config.projector_ln_eps)
+            if self.use_native_linear
+            else RMSNorm(config.text_hidden_size, eps=config.projector_ln_eps)
+        )
         # ModelSlim rotates K3's FP4 activations before INT4 inference. Text
         # embeddings fold this matrix into their input projection, but the
         # vision path ends in RMSNorm, so the rotation must remain explicit.
-        self.rot_proj: ReplicatedLinear | None = None
+        self.rot_proj: nn.Module | None = None
         if getattr(config, "use_rot_proj", False):
-            self.rot_proj = ReplicatedLinear(
-                config.text_hidden_size,
-                config.text_hidden_size,
-                bias=False,
-                quant_config=None,
-                prefix=f"{prefix}.rot_proj",
-            )
+            if self.use_native_linear:
+                self.rot_proj = nn.Linear(
+                    config.text_hidden_size,
+                    config.text_hidden_size,
+                    bias=False,
+                )
+            else:
+                self.rot_proj = ReplicatedLinear(
+                    config.text_hidden_size,
+                    config.text_hidden_size,
+                    bias=False,
+                    quant_config=None,
+                    prefix=f"{prefix}.rot_proj",
+                )
 
     def forward(self, image_features: torch.Tensor) -> torch.Tensor:
         hidden_states = image_features.reshape(-1, self.input_size)
-        hidden_states = self.linear_1(hidden_states)[0]
+        hidden_states = _linear_output(self.linear_1, hidden_states)
         hidden_states = self.act(hidden_states)
-        hidden_states = self.linear_2(hidden_states)[0]
+        hidden_states = _linear_output(self.linear_2, hidden_states)
         hidden_states = self.post_norm(hidden_states)
-        rot_proj = getattr(self, "rot_proj", None)
-        if rot_proj is not None:
-            hidden_states = rot_proj(hidden_states)[0]
+        if self.rot_proj is not None:
+            hidden_states = _linear_output(self.rot_proj, hidden_states)
         return hidden_states
 
 

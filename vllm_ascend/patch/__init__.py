@@ -993,22 +993,19 @@
 #
 # ** 10a. File: worker/patch_layerwise_reload.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.model_executor.model_loader.reload.layerwise`
-#      `vllm.model_executor.model_loader.reload.utils.get_layer_size`
+#   1. vLLM layerwise callable-loader wrapping and deferred tensor ownership
 #    Why:
-#       Ascend models can register non-persistent kernel buffers and callable
-#       weight loaders without a `__name__`. vLLM v0.26.0 counts those buffers
-#       as reloadable state and assumes every loader is a function, which can
-#       stall layer completion or raise during model reload.
+#       Kimi parameters use `functools.partial` loaders without `__name__`.
+#       Verl weight buckets are views into a reusable IPC buffer, while vLLM
+#       may defer a shard until a later bucket arrives.
 #    How:
-#       Exclude non-persistent buffers from reload accounting, restore their
-#       metadata after moving a layer to `meta`, and unwrap loaders using a
-#       defensive name lookup.
+#       Inspect callable names defensively when wrapping/unwrapping loaders.
+#       Clone only source tensors retained by the upstream deferred loader.
 #    Related PR (if no, explain why):
-#       No, this adapts vLLM's generic layerwise loader to Ascend kernel state.
+#       No, the reusable IPC buffer belongs to Verl's transfer protocol.
 #    Future Plan:
-#       Remove this patch once upstream reload accounting supports these buffers
-#       and arbitrary callable weight loaders.
+#       Remove this patch when the transfer protocol gives deferred consumers
+#       owned storage.
 #
 # ** 11. File: worker/patch_mamba_utils.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

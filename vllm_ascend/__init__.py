@@ -29,9 +29,15 @@ def _ensure_global_patch():
     if _GLOBAL_PATCH_APPLIED:
         return
 
+    from vllm_ascend.patch.kimi_full_r3_schema import (
+        install_kimi_full_r3_schema_patch,
+    )
     from vllm_ascend.utils import adapt_patch
 
     adapt_patch(is_global_patch=True)
+    # EngineCore creates the scheduler-side route buffer without importing
+    # worker patches, so the packed schema must be installed process-wide.
+    install_kimi_full_r3_schema_patch()
     _GLOBAL_PATCH_APPLIED = True
 
 

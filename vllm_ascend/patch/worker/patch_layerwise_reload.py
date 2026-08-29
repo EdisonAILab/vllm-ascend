@@ -15,29 +15,19 @@
 # limitations under the License.
 #
 
-"""Ascend compatibility fixes for vLLM's layerwise reload path."""
+"""Protect deferred layerwise weights from Verl's reusable IPC buffer."""
 
 from collections.abc import Callable
+from functools import wraps
 
 import torch
 
 from vllm.model_executor.model_loader.reload import layerwise as layerwise_reload
-from vllm.model_executor.model_loader.reload import utils as reload_utils
-from vllm.model_executor.model_loader.reload.types import LayerReloadingInfo
-
-
-def _get_layer_size(layer: torch.nn.Module) -> int:
-    """Count only tensors that can be populated by a state-dict loader."""
-    return sum(
-        tensor.numel()
-        for name, tensor in layerwise_reload.get_layer_tensors(layer).items()
-        if name not in layerwise_reload.SKIP_TENSORS
-        and name not in layer._non_persistent_buffers_set
-    )
+_make_online_process_loader = layerwise_reload.make_online_process_loader
 
 
 def _wrap_parameters_weight_loader(layer: torch.nn.Module) -> None:
-    """Wrap loadable tensors while accepting callable loader objects."""
+    """Wrap partial and other callable loaders without assuming __name__."""
     for name, tensor in layerwise_reload.get_layer_tensors(layer).items():
         if name in layerwise_reload.SKIP_TENSORS:
             continue
@@ -47,26 +37,49 @@ def _wrap_parameters_weight_loader(layer: torch.nn.Module) -> None:
 
 
 def _get_original_loader(tensor: torch.Tensor) -> Callable:
-    """Return a loader after removing any layerwise wrappers."""
+    """Remove layerwise wrappers from an arbitrary callable loader."""
     loader = layerwise_reload._get_weight_loader(tensor)
     while getattr(loader, "__name__", None) == "online_process_loader":
         loader = loader.__wrapped__
     return loader
 
 
-_restore_layer_on_meta = layerwise_reload.restore_layer_on_meta
-
-
-def _restore_layer_on_meta_with_buffer_metadata(
+def _make_online_process_loader_with_owned_tensors(
     layer: torch.nn.Module,
-    info: LayerReloadingInfo,
-) -> None:
-    _restore_layer_on_meta(layer, info)
-    layer._non_persistent_buffers_set.update(info.kernel_non_persistent_buffers)
+    param_name: str,
+) -> Callable:
+    """Own source tensors that vLLM defers beyond one reload call.
+
+    Verl receives each weight bucket as views into one reusable IPC buffer.
+    vLLM's layerwise loader may retain a shard until later shards arrive in a
+    subsequent bucket, so keeping the view would let the sender overwrite it.
+    Clone only calls that remain deferred; completed parameters are processed
+    and released by the upstream loader before this wrapper returns.
+    """
+    loader = _make_online_process_loader(layer, param_name)
+
+    @wraps(loader)
+    def online_process_loader(*args, **kwargs):
+        info = layerwise_reload.get_layerwise_info(layer)
+        loaded_before = info.load_numel if info.can_load() else None
+        result = loader(*args, **kwargs)
+        info = layerwise_reload.get_layerwise_info(layer)
+        if not info.can_load() or not info.loaded_weights:
+            return result
+        if loaded_before is None or info.load_numel <= loaded_before:
+            return result
+
+        loaded_name, bound_args = info.loaded_weights[-1]
+        if loaded_name != param_name:
+            return result
+        for name, value in bound_args.arguments.items():
+            if name != "param" and isinstance(value, torch.Tensor) and value.device.type != "meta":
+                bound_args.arguments[name] = value.detach().clone()
+        return result
+
+    return online_process_loader
 
 
-reload_utils.get_layer_size = _get_layer_size
-layerwise_reload.get_layer_size = _get_layer_size
 layerwise_reload._wrap_parameters_weight_loader = _wrap_parameters_weight_loader
 layerwise_reload._get_original_loader = _get_original_loader
-layerwise_reload.restore_layer_on_meta = _restore_layer_on_meta_with_buffer_metadata
+layerwise_reload.make_online_process_loader = _make_online_process_loader_with_owned_tensors

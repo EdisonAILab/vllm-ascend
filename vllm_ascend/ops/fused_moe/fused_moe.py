@@ -215,16 +215,6 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             tid2eid=self.tid2eid,
             input_ids=input_ids,
         )
-        try:
-            _vllm_config = get_current_vllm_config()
-        except AssertionError:
-            _vllm_config = None
-        model_config = None if _vllm_config is None else _vllm_config.model_config
-        if model_config is not None and model_config.enable_return_routed_experts:
-            capturer = getattr(layer, "_ascend_routed_experts_capturer", None)
-            if capturer is not None:
-                capturer.capture(layer_id=layer.layer_id, topk_ids=topk_ids)
-
         if zero_expert_num > 0 and zero_expert_type is not None:
             topk_ids, topk_weights, zero_expert_result = zero_experts_compute(
                 expert_indices=topk_ids,
@@ -241,6 +231,21 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         if enable_force_load_balance:
             random_matrix = torch.rand(topk_ids.size(0), num_logical_experts, device=topk_ids.device)
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
+
+        # Capture the pair that FusedMoE actually executes: after every route
+        # mutation and after the exact hidden-state dtype cast.
+        capturer = getattr(layer, "_ascend_routed_experts_capturer", None)
+        if capturer is not None:
+            layer_id = getattr(layer, "_ascend_routed_experts_layer_id", None)
+            if layer_id is None:
+                raise RuntimeError(
+                    "Ascend routed-expert capture is missing its layer ID"
+                )
+            capturer.capture(
+                layer_id=layer_id,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+            )
 
         if getattr(layer, "swigluoai_uninterleave", False):
             activation = "swigluoai_uninterleave"
