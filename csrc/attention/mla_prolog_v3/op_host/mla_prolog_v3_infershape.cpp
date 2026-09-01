@@ -14,14 +14,15 @@ using namespace ge;
 
 namespace ops {
 
+constexpr int64_t kDefaultRopeDimNoRope = 64; // Dr when RoPE disabled (aligned with mla_prolog_v3_torch_adpt.h)
+
 ge::graphStatus GetMlaPrologV3ShapeDim(const gert::InferShapeContext *context, MlaPrologProtoShapeParam &shapeParam)
 {
     auto tokenXShape = context->GetRequiredInputShape(TOKEN_X_INDEX); // (B, S, He) | (T, He)
     OP_CHECK_NULL_WITH_CONTEXT(context, tokenXShape);
     auto weightUkShape = context->GetRequiredInputShape(WEIGHT_UK_INDEX); // (N, D, Hckv)
     OP_CHECK_NULL_WITH_CONTEXT(context, weightUkShape);
-    auto ropeSinShape = context->GetRequiredInputShape(ROPE_SIN_INDEX); // (B, S, Dr) | (T, Dr)
-    OP_CHECK_NULL_WITH_CONTEXT(context, ropeSinShape);
+    auto ropeSinShape = context->GetOptionalInputShape(ROPE_SIN_INDEX); // (B, S, Dr) | (T, Dr); null -> no-RoPE
     auto weightDqShape = context->GetRequiredInputShape(WEIGHT_DQ_INDEX); // (He, Hcq)
     OP_CHECK_NULL_WITH_CONTEXT(context, weightDqShape);
     auto kvCacheShape = context->GetRequiredInputShape(KV_CACHE_INDEX_V3); // (B, Nkv, Skv, Hckv)
@@ -37,10 +38,12 @@ ge::graphStatus GetMlaPrologV3ShapeDim(const gert::InferShapeContext *context, M
                 OP_LOGE_FOR_INVALID_SHAPEDIM(context->GetNodeName(), "weightUk",
                                              std::to_string(weightUkShape->GetDimNum()) + "D", "3D"),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(((ropeSinShape->GetDimNum() != DIM_NUM_2) && (ropeSinShape->GetDimNum() != DIM_NUM_3)),
-                OP_LOGE_FOR_INVALID_SHAPEDIM(context->GetNodeName(), "ropeSin",
-                                             std::to_string(ropeSinShape->GetDimNum()) + "D", "2D or 3D"),
-                return ge::GRAPH_FAILED);
+    if (ropeSinShape != nullptr) {
+        OP_CHECK_IF(((ropeSinShape->GetDimNum() != DIM_NUM_2) && (ropeSinShape->GetDimNum() != DIM_NUM_3)),
+                    OP_LOGE_FOR_INVALID_SHAPEDIM(context->GetNodeName(), "ropeSin",
+                                                 std::to_string(ropeSinShape->GetDimNum()) + "D", "2D or 3D"),
+                    return ge::GRAPH_FAILED);
+    }
     OP_CHECK_IF((weightDqShape->GetDimNum() != DIM_NUM_2),
                 OP_LOGE_FOR_INVALID_SHAPEDIM(context->GetNodeName(), "weightDq",
                                              std::to_string(weightDqShape->GetDimNum()) + "D", "2D"),
@@ -59,12 +62,12 @@ ge::graphStatus GetMlaPrologV3ShapeDim(const gert::InferShapeContext *context, M
         shapeParam.isBsMerge = false;
         shapeParam.B = tokenXShape->GetDim(DIM_INDEX_0);
         shapeParam.S = tokenXShape->GetDim(DIM_INDEX_1);
-        shapeParam.Dr = ropeSinShape->GetDim(DIM_INDEX_2);
+        shapeParam.Dr = (ropeSinShape != nullptr) ? ropeSinShape->GetDim(DIM_INDEX_2) : kDefaultRopeDimNoRope;
         shapeParam.T = shapeParam.B * shapeParam.S;
     } else { // T
         shapeParam.isBsMerge = true;
         shapeParam.T = tokenXShape->GetDim(DIM_INDEX_0);
-        shapeParam.Dr = ropeSinShape->GetDim(DIM_INDEX_1);
+        shapeParam.Dr = (ropeSinShape != nullptr) ? ropeSinShape->GetDim(DIM_INDEX_1) : kDefaultRopeDimNoRope;
     }
 
     shapeParam.N = weightUkShape->GetDim(DIM_INDEX_0);
