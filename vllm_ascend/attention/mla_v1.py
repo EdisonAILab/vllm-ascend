@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NamedTuple, TypeVar
 
@@ -1520,7 +1521,14 @@ class AscendMLAImpl(MLAAttentionImpl):
         }
         record_attention_compute_start()
 
-        if self.head_padding > 0:
+        force_concat_rope = (
+            os.environ.get("VLLM_ASCEND_KIMI_CONCAT_SHORT_MLA_ROPE") == "1" and self.qk_rope_head_dim != 64
+        )
+        if self.head_padding > 0 or force_concat_rope:
+            if force_concat_rope and prefill_meta.chunked_context is not None:
+                raise NotImplementedError("short-RoPE MLA smoke fallback does not support cached-prefix merge")
+            if force_concat_rope:
+                common_kwargs["softmax_lse_flag"] = False
             query = torch.cat((q_nope, q_pe), dim=-1)
             key = torch.cat((k_nope, k_pe), dim=-1)
         else:

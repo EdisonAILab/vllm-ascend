@@ -14,6 +14,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -194,6 +195,80 @@ def test_output_norm_gate_uses_kda_fused_triton_kernel():
         output_gate,
         attention.o_norm.weight,
         attention.o_norm.eps,
+    )
+
+
+def test_causal_conv_can_apply_silu_after_the_production_kernel():
+    mixed_qkv = torch.tensor([[[-2.0, -1.0, 0.5, 2.0]]])
+    conv_weights = torch.ones(2, 4)
+    conv_state = torch.zeros(1, 1, 4)
+    metadata = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        cache_indices=torch.tensor([0], dtype=torch.int32),
+        initial_state_mode=None,
+    )
+    kernel_output = torch.tensor([[[-1.5, -0.5, 1.0, 2.5]]])
+
+    def fake_causal_conv(out, *_args, **_kwargs):
+        out.copy_(kernel_output)
+
+    with (
+        patch.dict(
+            os.environ,
+            {"VLLM_ASCEND_KIMI_UNFUSED_SHORT_CONV_ACTIVATION": "1"},
+        ),
+        patch(
+            "vllm_ascend.ops.kimi_kda.torch.ops._C_ascend.npu_causal_conv1d_custom",
+            side_effect=fake_causal_conv,
+            create=True,
+        ) as causal_conv,
+    ):
+        actual = AscendKimiGatedDeltaNetAttention._run_causal_conv1d(
+            mixed_qkv,
+            conv_weights,
+            conv_state,
+            metadata,
+            run_mode=1,
+        )
+
+    assert causal_conv.call_args.kwargs["activation_mode"] == 0
+    torch.testing.assert_close(actual, torch.nn.functional.silu(kernel_output))
+
+
+def test_reduced_kda_reference_updates_state_with_explicit_fp32_recurrence():
+    attention = AscendKimiGatedDeltaNetAttention.__new__(AscendKimiGatedDeltaNetAttention)
+    nn.Module.__init__(attention)
+    attention.head_dim = 2
+    attention.gate_lower_bound = -5.0
+    attention.A_log = nn.Parameter(torch.zeros(1, 1, 1, 1))
+    attention.dt_bias = nn.Parameter(torch.zeros(1, 2))
+    q = torch.tensor([[[[1.0, 0.0]]]])
+    k = torch.tensor([[[[1.0, 0.0]]]])
+    v = torch.tensor([[[[2.0, 3.0]]]])
+    raw_gate = torch.zeros_like(q)
+    beta = torch.ones(1, 1, 1)
+    recurrent_state = torch.zeros(1, 1, 2, 2)
+
+    with patch.dict(
+        os.environ,
+        {"VLLM_ASCEND_KIMI_NATIVE_STATE_OPS": "1"},
+    ):
+        actual = attention._run_native_kda(
+            q,
+            k,
+            v,
+            raw_gate,
+            beta,
+            recurrent_state,
+            [0, 1],
+            torch.tensor([0]),
+        )
+
+    scale = 2**-0.5
+    torch.testing.assert_close(actual, torch.tensor([[[[2.0 * scale, 3.0 * scale]]]]))
+    torch.testing.assert_close(
+        recurrent_state,
+        torch.tensor([[[[2.0, 0.0], [3.0, 0.0]]]]),
     )
 
 

@@ -30,6 +30,7 @@ context_parallel
 weight_prefetch
 sequence_parallelism
 batch_invariance
+kimi_k3_w4a8_training_parity
 lmcache_ascend_deployment
 dynamic_chunk_pipeline_parallel
 flash_attention

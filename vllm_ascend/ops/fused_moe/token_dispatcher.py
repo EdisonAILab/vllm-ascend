@@ -399,17 +399,13 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             # parallelism is disabled.  expert_map, rather than ep_size,
             # distinguishes genuinely sharded experts from TP-local shards.
             if expert_map is not None:
-                raise ValueError(
-                    "training parity AllGather MoE does not support expert-sharded routing"
-                )
+                raise ValueError("training parity AllGather MoE does not support expert-sharded routing")
             flat_experts = topk_ids.reshape(-1)
             assignment_order = torch.argsort(flat_experts, stable=True)
-            token_indices = torch.arange(
-                num_tokens, device=flat_experts.device, dtype=torch.long
-            ).repeat_interleave(self.top_k)
-            self._training_parity_sorted_token_indices = token_indices.index_select(
-                0, assignment_order
+            token_indices = torch.arange(num_tokens, device=flat_experts.device, dtype=torch.long).repeat_interleave(
+                self.top_k
             )
+            self._training_parity_sorted_token_indices = token_indices.index_select(0, assignment_order)
         apply_router_weight_on_input = token_dispatch_input.routing.apply_router_weight_on_input
         if apply_router_weight_on_input:
             assert topk_weights.dim() == 2, "`topk_weights` should be in shape (num_tokens, topk)"
@@ -426,6 +422,10 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             first_expert_idx = 0
             last_expert_idx = self.num_experts_local
             global_num_experts = self.num_experts_local
+        reference_mxfp8_dispatch = (
+            os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_MXFP8_DISPATCH") == "1" and quant_type == QuantType.W4A8MXFP
+        )
+        routing_quant_mode = -1 if reference_mxfp8_dispatch else quant_mode
         sorted_hidden_states, expanded_row_idx, expert_tokens, dynamic_scale = DeviceOperator.npu_moe_init_routing(
             hidden_states,
             topk_ids,
@@ -435,9 +435,16 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             expert_tokens_num_type=1,
             expert_tokens_num_flag=True,
             active_expert_range=[first_expert_idx, last_expert_idx],
-            quant_mode=quant_mode,
+            quant_mode=routing_quant_mode,
             act_quant_type=act_quant_type,
         )
+        if reference_mxfp8_dispatch:
+            sorted_hidden_states, dynamic_scale = torch_npu.npu_dynamic_mx_quant(
+                sorted_hidden_states,
+                axis=-1,
+                dst_type=act_quant_type,
+            )
+            dynamic_scale = DeviceOperator.maybe_normalize_mxfp_scale_layout(dynamic_scale)
         expert_tokens = expert_tokens.to(torch.int64)
         group_list_type = 1  # `count` mode
 
@@ -448,10 +455,12 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
                 raise ValueError("training parity MoE currently supports BF16 only")
             flat_weights = topk_weights.reshape(-1)
             sorted_weights = torch.empty_like(flat_weights)
-            sorted_weights.scatter_(
-                0, expanded_row_idx.abs().long(), flat_weights
-            )
+            sorted_weights.scatter_(0, expanded_row_idx.abs().long(), flat_weights)
             topk_scales = sorted_weights.unsqueeze(-1)
+            combine_topk_weights = torch.ones_like(topk_weights)
+        elif os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ROUTER_WEIGHT_BEFORE_GMM2") == "1":
+            sorted_indices = torch.argsort(expanded_row_idx)
+            topk_scales = topk_weights.reshape(-1)[sorted_indices].unsqueeze(-1)
             combine_topk_weights = torch.ones_like(topk_weights)
 
         return MoETokenDispatchOutput(
@@ -471,9 +480,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         if _TRAINING_PARITY:
             tp_group = get_tp_group()
             if tp_group.world_size > 2:
-                raise ValueError(
-                    "training parity MoE assignment reduction is validated up to TP=2"
-                )
+                raise ValueError("training parity MoE assignment reduction is validated up to TP=2")
             if tp_group.world_size > 1:
                 # Megatron expert TP reduces each expert assignment before
                 # unpermuting top-k assignments back to tokens.  vLLM's normal
@@ -491,9 +498,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             was_enabled = torch.are_deterministic_algorithms_enabled()
             torch.use_deterministic_algorithms(True)
             try:
-                final_hidden_states.index_add_(
-                    0, sorted_token_indices, hidden_states
-                )
+                final_hidden_states.index_add_(0, sorted_token_indices, hidden_states)
             finally:
                 torch.use_deterministic_algorithms(was_enabled)
             if tp_group.world_size > 1:
@@ -503,9 +508,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
                 # values restores the result exactly.
                 final_hidden_states.mul_(1.0 / tp_group.world_size)
             if len(combine_metadata.restore_shape) == 3:
-                final_hidden_states = final_hidden_states.view(
-                    combine_metadata.restore_shape
-                )
+                final_hidden_states = final_hidden_states.view(combine_metadata.restore_shape)
             return final_hidden_states
         final_hidden_states = DeviceOperator.npu_moe_token_unpermute(
             permuted_tokens=hidden_states,

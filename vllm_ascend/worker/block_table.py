@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 import torch
 from vllm.distributed import get_dcp_group
@@ -164,6 +166,22 @@ class BlockTable:
             )
             self._compute_dcp_slot_mapping(req_indices, positions)
         else:
+            if os.environ.get("VLLM_ASCEND_NATIVE_SLOT_MAPPING") == "1":
+                req_indices = torch.repeat_interleave(
+                    torch.arange(
+                        num_reqs,
+                        dtype=torch.int64,
+                        device=query_start_loc.device,
+                    ),
+                    query_start_loc[1:] - query_start_loc[:-1],
+                    output_size=num_tokens,
+                )
+                block_indices = positions // self.block_size
+                block_numbers = self.block_table.gpu[req_indices, block_indices]
+                slot_ids = block_numbers * self.block_size + positions % self.block_size
+                self.slot_mapping.gpu.fill_(PAD_SLOT_ID)
+                self.slot_mapping.gpu[:num_tokens].copy_(slot_ids.to(torch.int32))
+                return
             TILE_BLOCK_SIZE = 1024
             kernel_kwargs = {
                 "KV_CACHE_BLOCK_SIZE": self.physical_block_size,

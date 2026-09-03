@@ -16,6 +16,7 @@
 #
 
 
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -24,6 +25,7 @@ import torch_npu
 from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.distributed import get_ep_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.device.mxfp_compat import (
@@ -36,12 +38,92 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
 
+_PARITY_MOE_CALL_INDEX = 0
+
+
+def _parity_tap(name: str, tensor: torch.Tensor) -> None:
+    """Persist opt-in MoE routing tensors for the reduced parity run."""
+    output_dir = os.environ.get("KIMI_PARITY_TAP_DIR")
+    if not output_dir:
+        return
+    expected_tokens = int(os.environ.get("KIMI_PARITY_TAP_EXPECTED_TOKENS", "32"))
+    if tensor.ndim == 0 or tensor.shape[0] != expected_tokens:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    torch.save(tensor.detach().cpu().contiguous(), os.path.join(output_dir, f"{name}.pt"))
+
+
+def _megatron_reference_select_experts(
+    router_logits: torch.Tensor,
+    top_k: int,
+    renormalize: bool,
+    scoring_func: str,
+    routed_scaling_factor: float,
+    expert_bias: torch.Tensor | None,
+    use_grouped_topk: bool,
+    num_expert_group: int | None,
+    topk_group: int | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mirror Megatron Core's unfused Kimi top-k routing arithmetic."""
+    if scoring_func == "sigmoid":
+        scores = torch.sigmoid(router_logits.float())
+    elif scoring_func == "softmax":
+        scores = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
+    else:
+        raise NotImplementedError(
+            f"Kimi parity routing only supports sigmoid and softmax scoring, not {scoring_func!r}."
+        )
+    selection_scores = scores + expert_bias.float() if scoring_func == "sigmoid" and expert_bias is not None else scores
+    if use_grouped_topk:
+        if num_expert_group is None or topk_group is None:
+            raise ValueError("Grouped Kimi parity routing requires both group counts.")
+        num_tokens, num_experts = selection_scores.shape
+        group_scores = (
+            selection_scores.view(num_tokens, num_expert_group, -1).topk(top_k // topk_group, dim=-1)[0].sum(dim=-1)
+        )
+        group_ids = torch.topk(
+            group_scores,
+            k=topk_group,
+            dim=-1,
+            sorted=False,
+        )[1]
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_ids, 1)
+        score_mask = (
+            group_mask.unsqueeze(-1)
+            .expand(num_tokens, num_expert_group, num_experts // num_expert_group)
+            .reshape(num_tokens, -1)
+        )
+        masked_scores = selection_scores.masked_fill(~score_mask.bool(), float("-inf"))
+        _, topk_ids = torch.topk(masked_scores, k=top_k, dim=-1)
+        topk_weights = torch.gather(scores, dim=1, index=topk_ids)
+    elif scoring_func == "sigmoid" and expert_bias is not None:
+        _, topk_ids = torch.topk(
+            selection_scores,
+            k=top_k,
+            dim=-1,
+            sorted=torch.is_grad_enabled(),
+        )
+        topk_weights = torch.gather(scores, dim=1, index=topk_ids)
+    else:
+        topk_weights, topk_ids = torch.topk(
+            scores,
+            k=top_k,
+            dim=-1,
+            sorted=torch.is_grad_enabled(),
+        )
+    if renormalize:
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    if routed_scaling_factor:
+        topk_weights = topk_weights * routed_scaling_factor
+    return topk_weights.type_as(router_logits), topk_ids.to(torch.int32)
+
 
 @register_scheme("W4A8_MXFP", "linear")
 class AscendW4A8MXFPDynamicLinearMethod(AscendLinearScheme):
     """Linear method for Ascend W4A8_MXFP (Microscaling) quantization."""
 
-    def __init__(self):
+    def __init__(self, *, use_weight_packed: bool = False):
         ensure_mxfp4_linear_available("W8A8_MXFP8 linear quantization")
         vllm_config = get_current_vllm_config()
         self.group_size = vllm_config.quant_config.quant_description.get("group_size", 32)
@@ -180,6 +262,13 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
         mc2_mask: torch.Tensor | None = None,
         tid2eid: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        global _PARITY_MOE_CALL_INDEX
+        if os.environ.get("VLLM_ASCEND_W4A8_EXECUTION_PROOF") == "1":
+            logger.info(
+                "KIMI_W4A8_EXECUTION_PROOF tokens=%d packed=%s weight=MXFP4_E2M1 activation=MXFP8_E4M3FN scale=E8M0",
+                x.shape[0],
+                self.use_weight_packed,
+            )
         num_shared_experts = getattr(layer, "n_shared_experts", 0)
         if num_shared_experts is None:
             num_shared_experts = 0
@@ -190,21 +279,42 @@ class AscendW4A8MXFPDynamicFusedMoEMethod(AscendMoEScheme):
             num_shared_experts=num_shared_experts,
         )
         assert router_logits.shape[1] == num_logical_experts, "Number of global experts mismatch (excluding redundancy)"
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            top_k=top_k,
-            use_grouped_topk=use_grouped_topk,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            e_score_correction_bias=e_score_correction_bias,
-            routed_scaling_factor=routed_scaling_factor,
-            num_experts=num_logical_experts,
-            tid2eid=tid2eid,
-        )
+        if os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ROUTING") == "1":
+            if custom_routing_function is not None:
+                raise NotImplementedError("Kimi parity routing does not support a custom routing function.")
+            topk_weights, topk_ids = _megatron_reference_select_experts(
+                router_logits=router_logits,
+                top_k=top_k,
+                renormalize=renormalize,
+                scoring_func=scoring_func,
+                routed_scaling_factor=routed_scaling_factor,
+                expert_bias=e_score_correction_bias,
+                use_grouped_topk=use_grouped_topk,
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+            )
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                top_k=top_k,
+                use_grouped_topk=use_grouped_topk,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+                routed_scaling_factor=routed_scaling_factor,
+                num_experts=num_logical_experts,
+                tid2eid=tid2eid,
+            )
+        expected_tokens = int(os.environ.get("KIMI_PARITY_TAP_EXPECTED_TOKENS", "32"))
+        if x.shape[0] == expected_tokens:
+            _PARITY_MOE_CALL_INDEX += 1
+            if _PARITY_MOE_CALL_INDEX == 1:
+                _parity_tap("02_moe_topk_weights", topk_weights)
+                _parity_tap("02_moe_topk_ids", topk_ids)
 
         # this is a naive implementation for experts load balance so as
         # to avoid accumulating too much tokens on a single rank.

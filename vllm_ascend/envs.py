@@ -69,6 +69,60 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Enable the opt-in training/inference parity path. This mode favors
     # deterministic operator contracts over serving performance.
     "VLLM_ASCEND_TRAINING_PARITY": lambda: bool(int(os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0"))),
+    # Kimi K3 W4A8 mismatch-localization switches. All are non-sensitive and
+    # disabled by default, so the production serving path is unchanged.
+    "VLLM_ASCEND_KIMI_REFERENCE_SHORT_CONV": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_SHORT_CONV", "0"))),
+    "VLLM_ASCEND_KIMI_UNFUSED_SHORT_CONV_ACTIVATION": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_UNFUSED_SHORT_CONV_ACTIVATION", "0"))
+    ),
+    "VLLM_ASCEND_KIMI_REFERENCE_KDA_CORE": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_KDA_CORE", "0"))),
+    "VLLM_ASCEND_KIMI_NATIVE_KDA_CORE": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_NATIVE_KDA_CORE", "0"))),
+    "VLLM_ASCEND_KIMI_NATIVE_STATE_OPS": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_NATIVE_STATE_OPS", "0"))),
+    "VLLM_ASCEND_KIMI_KDA_NATIVE_NORM_GATE": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_KDA_NATIVE_NORM_GATE", "0"))),
+    "VLLM_ASCEND_KIMI_GATE_LOWER_BOUND": lambda: os.getenv("VLLM_ASCEND_KIMI_GATE_LOWER_BOUND", None),
+    "VLLM_ASCEND_KIMI_REFERENCE_ATTN_RES": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_ATTN_RES", "0"))),
+    "VLLM_ASCEND_KIMI_VECTORIZED_ATTN_RES": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_VECTORIZED_ATTN_RES", "0"))),
+    "VLLM_ASCEND_KIMI_NATIVE_ATTN_RES": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_NATIVE_ATTN_RES", "0"))),
+    "VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32", "0"))
+    ),
+    "VLLM_ASCEND_KIMI_REFERENCE_ROUTING": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_ROUTING", "0"))),
+    "VLLM_ASCEND_KIMI_REFERENCE_MXFP8_DISPATCH": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_MXFP8_DISPATCH", "0"))
+    ),
+    "VLLM_ASCEND_KIMI_REFERENCE_ROUTER_WEIGHT_BEFORE_GMM2": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_ROUTER_WEIGHT_BEFORE_GMM2", "0"))
+    ),
+    "VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM", "0"))
+    ),
+    "VLLM_ASCEND_KIMI_DECOMPOSED_ROUTED_RMS_NORM": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_DECOMPOSED_ROUTED_RMS_NORM", "0"))
+    ),
+    "VLLM_ASCEND_KIMI_REFERENCE_MLA_RMS_NORM": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_MLA_RMS_NORM", "0"))
+    ),
+    "VLLM_ASCEND_KIMI_DECOMPOSED_MLA_RMS_NORM": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_DECOMPOSED_MLA_RMS_NORM", "0"))
+    ),
+    "VLLM_ASCEND_KIMI_REFERENCE_MLA_DECODE": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_MLA_DECODE", "0"))),
+    "VLLM_ASCEND_KIMI_CONCAT_SHORT_MLA_ROPE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_CONCAT_SHORT_MLA_ROPE", "0"))
+    ),
+    "VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_RMS_NORM": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_RMS_NORM", "0"))
+    ),
+    "VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_SCORE_MATMUL": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_SCORE_MATMUL", "0"))
+    ),
+    "VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_MIX_MATMUL": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_MIX_MATMUL", "0"))
+    ),
+    "VLLM_ASCEND_NATIVE_SLOT_MAPPING": lambda: bool(int(os.getenv("VLLM_ASCEND_NATIVE_SLOT_MAPPING", "0"))),
+    "VLLM_ASCEND_SKIP_UNUSED_PENALTY_WARMUP": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_SKIP_UNUSED_PENALTY_WARMUP", "0"))
+    ),
+    "VLLM_ASCEND_W4A8_EXECUTION_PROOF": lambda: bool(int(os.getenv("VLLM_ASCEND_W4A8_EXECUTION_PROOF", "0"))),
     # Whether to enable FlashComm optimization when tensor parallel is enabled.
     # This feature will get better performance when concurrency is large.
     # DEPRECATED: use additional_config.enable_flashcomm1 instead.

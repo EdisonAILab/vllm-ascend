@@ -17,8 +17,10 @@
 """Native multimodal Kimi K3 model for vLLM-Ascend."""
 
 import math
+import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
+from types import MethodType, SimpleNamespace
 from typing import Annotated, Any, Literal, cast
 
 import numpy as np
@@ -125,11 +127,32 @@ if HAS_TRITON:
     apply_attn_res = triton_apply_attn_res
 
 
+def _parity_tap(name: str, tensor: torch.Tensor) -> None:
+    """Persist opt-in prefill tensors without changing the production path."""
+    output_dir = os.environ.get("KIMI_PARITY_TAP_DIR")
+    if not output_dir:
+        return
+    include = os.environ.get("KIMI_PARITY_TAP_INCLUDE")
+    if include:
+        prefixes = tuple(value.strip() for value in include.split(",") if value.strip())
+        if not prefixes or not name.startswith(prefixes):
+            return
+    expected_tokens = int(os.environ.get("KIMI_PARITY_TAP_EXPECTED_TOKENS", "32"))
+    # vLLM prunes the prefill hidden states to the final sampling row before
+    # compute_logits. Keep that one-row output so it can be compared with the
+    # last row of Megatron's full-sequence logits.
+    expected_rows = (expected_tokens, 1) if name == "11_logits" else (expected_tokens,)
+    if tensor.ndim == 0 or tensor.shape[0] not in expected_rows:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    torch.save(tensor.detach().cpu().contiguous(), os.path.join(output_dir, f"{name}.pt"))
+
+
 def _routed_latent_quant_config(
     quant_config: QuantizationConfig | None,
 ) -> QuantizationConfig | None:
-    """Quantize latent MoE projections only for native ModelSlim weights."""
-    if quant_config is not None and quant_config.get_name() == "ascend":
+    """Quantize latent MoE projections when their checkpoint weights are packed."""
+    if quant_config is not None and quant_config.get_name() in {"ascend", "compressed-tensors"}:
         return quant_config
     return None
 
@@ -639,6 +662,9 @@ class KimiK3MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.parity_tap_prefix = (
+            "02_moe_shared" if "layers.1.block_sparse_moe" in prefix and "shared_experts" in prefix else None
+        )
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size, intermediate_size],
@@ -665,9 +691,17 @@ class KimiK3MLP(nn.Module):
             raise ValueError(f"Unsupported Kimi K3 activation: {config.hidden_act}")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.parity_tap_prefix is not None:
+            _parity_tap(f"{self.parity_tap_prefix}_input", hidden_states)
         gate_up, _ = self.gate_up_proj(hidden_states)
+        if self.parity_tap_prefix is not None:
+            _parity_tap(f"{self.parity_tap_prefix}_gate_up", gate_up)
         hidden_states = self.act_fn(gate_up)
+        if self.parity_tap_prefix is not None:
+            _parity_tap(f"{self.parity_tap_prefix}_activation", hidden_states)
         hidden_states, _ = self.down_proj(hidden_states)
+        if self.parity_tap_prefix is not None:
+            _parity_tap(f"{self.parity_tap_prefix}_output", hidden_states)
         return hidden_states
 
 
@@ -677,19 +711,40 @@ class _KimiRoutedOutputTransform(nn.Module):
     _norm: nn.Module | None
     _up_proj: nn.Module
 
-    def __init__(self, norm: nn.Module | None, up_proj: nn.Module) -> None:
+    def __init__(
+        self,
+        norm: nn.Module | None,
+        up_proj: nn.Module,
+        parity_tap_prefix: str | None = None,
+    ) -> None:
         super().__init__()
         self._norm = norm
         self._up_proj = up_proj
+        self.parity_tap_prefix = parity_tap_prefix
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Dynamo fullgraph can trace normal attribute access, but not an
         # explicit call to object.__getattribute__.
         norm = self._norm
         up_proj = self._up_proj
+        if self.parity_tap_prefix is not None:
+            _parity_tap(f"{self.parity_tap_prefix}_combined", hidden_states)
         if norm is not None:
-            hidden_states = norm(hidden_states)
-        return up_proj(hidden_states)[0]
+            if os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM") == "1":
+                input_dtype = hidden_states.dtype
+                normalized = hidden_states.float()
+                normalized = normalized * torch.rsqrt(
+                    normalized.square().mean(dim=-1, keepdim=True) + norm.variance_epsilon
+                )
+                hidden_states = norm.weight * normalized.to(input_dtype)
+            else:
+                hidden_states = norm(hidden_states)
+        if self.parity_tap_prefix is not None:
+            _parity_tap(f"{self.parity_tap_prefix}_normalized", hidden_states)
+        hidden_states = up_proj(hidden_states)[0]
+        if self.parity_tap_prefix is not None:
+            _parity_tap(f"{self.parity_tap_prefix}_up_output", hidden_states)
+        return hidden_states
 
 
 class KimiK3MoE(nn.Module):
@@ -709,6 +764,7 @@ class KimiK3MoE(nn.Module):
         self.hidden_size = config.hidden_size
         self.moe_hidden_size = config.routed_expert_hidden_size
         self.num_shared_experts = config.num_shared_experts
+        self.parity_tap_prefix = "02_moe" if "layers.1.block_sparse_moe" in prefix else None
         latent_quant_config = _routed_latent_quant_config(quant_config)
         # Routing always uses the original full-width hidden state.
         self.gate = ReplicatedLinear(
@@ -727,9 +783,14 @@ class KimiK3MoE(nn.Module):
             quant_config=latent_quant_config,
             prefix=f"{prefix}.routed_expert_down_proj",
         )
-        self.routed_expert_norm = (
-            RMSNorm(self.moe_hidden_size, eps=config.rms_norm_eps) if config.latent_moe_use_norm else None
+        routed_norm_type = (
+            _KimiDecomposedRMSNorm if os.environ.get("VLLM_ASCEND_KIMI_DECOMPOSED_ROUTED_RMS_NORM") == "1" else RMSNorm
         )
+        self.routed_expert_norm = (
+            routed_norm_type(self.moe_hidden_size, eps=config.rms_norm_eps) if config.latent_moe_use_norm else None
+        )
+        if isinstance(self.routed_expert_norm, _KimiDecomposedRMSNorm):
+            self.routed_expert_norm.kimi_parity_name = f"{prefix}.routed_expert_norm"
         self.routed_expert_up_proj = ReplicatedLinear(
             self.moe_hidden_size,
             self.hidden_size,
@@ -740,7 +801,16 @@ class KimiK3MoE(nn.Module):
         routed_output_transform = _KimiRoutedOutputTransform(
             self.routed_expert_norm,
             self.routed_expert_up_proj,
+            self.parity_tap_prefix,
         )
+
+        if self.parity_tap_prefix is not None and os.environ.get("KIMI_PARITY_TAP_DIR"):
+
+            def routed_down_hook(_module, _args, output) -> None:
+                value = output[0] if isinstance(output, tuple) else output
+                _parity_tap("02_moe_routed_down_output", value)
+
+            self.routed_expert_down_proj.register_forward_hook(routed_down_hook)
 
         self.shared_experts: KimiK3MLP | None
         if self.num_shared_experts:
@@ -782,9 +852,255 @@ class KimiK3MoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
+        if self.parity_tap_prefix is not None:
+            _parity_tap("02_moe_input", hidden_states)
         router_logits, _ = self.gate(hidden_states)
+        if os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32") == "1":
+            router_logits = torch.nn.functional.linear(
+                hidden_states.float(),
+                self.gate.weight.float(),
+            )
+        if self.parity_tap_prefix is not None:
+            _parity_tap("02_moe_router_logits", router_logits)
         output = self.experts(hidden_states=hidden_states, router_logits=router_logits)
+        if self.parity_tap_prefix is not None:
+            _parity_tap("02_moe_output", output)
         return output.view(num_tokens, hidden_size)
+
+
+class _KimiReferenceRMSNorm(nn.Module):
+    """Opt-in Kimi RMSNorm with the Megatron FP32 accumulation contract."""
+
+    def __init__(self, hidden_size: int, eps: float) -> None:
+        super().__init__()
+        self.variance_epsilon = eps
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=torch.get_default_dtype()))
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        normalized = hidden_states.float()
+        normalized = normalized * torch.rsqrt(normalized.square().mean(dim=-1, keepdim=True) + self.variance_epsilon)
+        return self.weight * normalized.to(input_dtype)
+
+
+class _KimiDecomposedRMSNorm(_KimiReferenceRMSNorm):
+    """Native NPU reduction with Kimi's BF16-before-weight contract."""
+
+    def __init__(self, hidden_size: int, eps: float) -> None:
+        super().__init__(hidden_size, eps)
+        self.register_buffer(
+            "unit_weight",
+            torch.ones(hidden_size, dtype=torch.get_default_dtype()),
+            persistent=False,
+        )
+        self.kimi_parity_name = "rms_norm"
+        self.kimi_call_index = 0
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        normalized, _ = torch_npu.npu_rms_norm(
+            hidden_states,
+            self.unit_weight,
+            self.variance_epsilon,
+        )
+        output = self.weight * normalized
+        if os.environ.get("KIMI_RMSNORM_VALIDATE_REFERENCE") == "1":
+            reference = super().forward(hidden_states)
+            if self.kimi_call_index == 0:
+                logger.info(
+                    "KIMI_RMSNORM_FORMAT name=%s input=%s normalized=%s output=%s reference=%s",
+                    self.kimi_parity_name,
+                    torch_npu.get_npu_format(hidden_states),
+                    torch_npu.get_npu_format(normalized),
+                    torch_npu.get_npu_format(output),
+                    torch_npu.get_npu_format(reference),
+                )
+            if not torch.equal(output, reference):
+                output_dir = os.environ.get("KIMI_PARITY_TAP_DIR")
+                if output_dir:
+                    safe_name = self.kimi_parity_name.replace(".", "_")
+                    prefix = f"rmsnorm_mismatch_{safe_name}_{self.kimi_call_index:04d}"
+                    os.makedirs(output_dir, exist_ok=True)
+                    for suffix, value in (
+                        ("input", hidden_states),
+                        ("native", output),
+                        ("reference", reference),
+                    ):
+                        torch.save(
+                            value.detach().cpu().contiguous(),
+                            os.path.join(output_dir, f"{prefix}_{suffix}.pt"),
+                        )
+            self.kimi_call_index += 1
+        return output
+
+
+def _reference_mla_preprocess_decode(
+    impl,
+    q_c: torch.Tensor,
+    kv_no_split: torch.Tensor,
+    kv_cache: tuple[torch.Tensor, ...],
+    attn_metadata,
+):
+    """Use explicit Kimi Q/K/V projections for the reduced decode path."""
+    num_decode_tokens = attn_metadata.num_decode_tokens
+    decode_q_c = q_c[:num_decode_tokens]
+    decode_q = impl.q_proj(decode_q_c)[0].view(
+        -1,
+        impl.num_heads,
+        impl.qk_head_dim,
+    )
+    decode_q_nope, decode_q_pe = decode_q.split(
+        [impl.qk_nope_head_dim, impl.qk_rope_head_dim],
+        dim=-1,
+    )
+    decode_meta = attn_metadata.decode
+    assert decode_meta is not None
+    decode_q_pe = impl.rope_single(
+        decode_q_pe,
+        decode_meta.cos,
+        decode_meta.sin,
+    )
+    decode_slots = attn_metadata.slot_mapping[:num_decode_tokens]
+    decode_kv_no_split = kv_no_split[:num_decode_tokens]
+    decode_k_pe, decode_k_latent = impl.exec_kv_decode(
+        decode_kv_no_split,
+        decode_meta.cos,
+        decode_meta.sin,
+        kv_cache,
+        decode_slots,
+    )
+    return SimpleNamespace(
+        ql_nope=decode_q_nope,
+        q_pe=decode_q_pe,
+        k_nope=decode_k_latent,
+        k_pe=decode_k_pe,
+        dequant_scale_q_nope=None,
+    )
+
+
+def _reference_mla_forward_decode(
+    impl,
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_latent_cache: torch.Tensor,
+    k_pe_cache: torch.Tensor,
+    block_size: int,
+    attn_metadata,
+    dequant_scale_q_nope=None,
+) -> torch.Tensor:
+    """Materialize the reduced paged cache and run explicit FP32 attention."""
+    del dequant_scale_q_nope
+    decode_meta = attn_metadata.decode
+    assert decode_meta is not None
+    k_latent_cache = k_latent_cache.view(
+        -1,
+        impl.num_kv_heads,
+        block_size,
+        impl.kv_lora_rank,
+    )
+    k_pe_cache = k_pe_cache.view(
+        -1,
+        impl.num_kv_heads,
+        block_size,
+        impl.qk_rope_head_dim,
+    )
+    outputs = []
+    for request_index, sequence_length in enumerate(decode_meta.seq_lens_list):
+        positions = torch.arange(
+            int(sequence_length),
+            device=q_nope.device,
+            dtype=torch.long,
+        )
+        logical_blocks = torch.div(positions, block_size, rounding_mode="floor")
+        block_offsets = positions.remainder(block_size)
+        physical_blocks = decode_meta.block_table[request_index].to(torch.long)[logical_blocks]
+        k_latent = k_latent_cache[
+            physical_blocks,
+            0,
+            block_offsets,
+        ]
+        k_pe = k_pe_cache[
+            physical_blocks,
+            0,
+            block_offsets,
+        ]
+        key_value = impl.kv_b_proj(k_latent)[0].view(
+            -1,
+            impl.num_heads,
+            impl.qk_nope_head_dim + impl.v_head_dim,
+        )
+        k_nope, value = key_value.split(
+            [impl.qk_nope_head_dim, impl.v_head_dim],
+            dim=-1,
+        )
+        k_pe = k_pe.unsqueeze(1).expand(-1, impl.num_heads, -1)
+        scores = torch.einsum(
+            "hd,shd->hs",
+            q_nope[request_index].float(),
+            k_nope.float(),
+        )
+        scores.add_(
+            torch.einsum(
+                "hd,shd->hs",
+                q_pe[request_index].float(),
+                k_pe.float(),
+            )
+        )
+        probabilities = torch.softmax(scores * impl.scale, dim=-1)
+        output = torch.einsum(
+            "hs,shd->hd",
+            probabilities,
+            value.float(),
+        ).to(q_nope.dtype)
+        if getattr(impl, "kimi_parity_layer", None) == 4:
+            _parity_tap("04_mla_core_output", output.unsqueeze(0))
+        outputs.append(output)
+    return torch.stack(outputs).reshape(-1, impl.num_heads * impl.v_head_dim)
+
+
+def _reference_mla_forward_prefill(
+    impl,
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    value: torch.Tensor,
+    kv_c_and_k_pe_cache: tuple[torch.Tensor, ...],
+    attn_metadata,
+) -> torch.Tensor:
+    """Evaluate causal prefill one query row at a time like cached decode."""
+    del kv_c_and_k_pe_cache
+    prefill_meta = attn_metadata.prefill
+    assert prefill_meta is not None
+    outputs = []
+    start = 0
+    for end_value in prefill_meta.actual_seq_lengths_q:
+        end = int(end_value)
+        for token_idx in range(start, end):
+            prefix_slice = slice(start, token_idx + 1)
+            scores = torch.einsum(
+                "hd,shd->hs",
+                q_nope[token_idx].float(),
+                k_nope[prefix_slice].float(),
+            )
+            scores.add_(
+                torch.einsum(
+                    "hd,shd->hs",
+                    q_pe[token_idx].float(),
+                    k_pe[prefix_slice].float(),
+                )
+            )
+            probabilities = torch.softmax(scores * impl.scale, dim=-1)
+            outputs.append(
+                torch.einsum(
+                    "hs,shd->hd",
+                    probabilities,
+                    value[prefix_slice].float(),
+                ).to(q_nope.dtype)
+            )
+        start = end
+    if start != q_nope.shape[0]:
+        raise ValueError("Kimi MLA prefill cumulative sequence lengths do not cover all rows")
+    return torch.stack(outputs).reshape(-1, impl.num_heads * impl.v_head_dim)
 
 
 class KimiK3MLAAttention(nn.Module):
@@ -832,7 +1148,15 @@ class KimiK3MLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fused_qkv_a_proj",
         )
-        self.q_a_layernorm = RMSNorm(q_lora_rank, eps=config.rms_norm_eps)
+        if os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_MLA_RMS_NORM") == "1":
+            norm_type = _KimiReferenceRMSNorm
+        elif os.environ.get("VLLM_ASCEND_KIMI_DECOMPOSED_MLA_RMS_NORM") == "1":
+            norm_type = _KimiDecomposedRMSNorm
+        else:
+            norm_type = RMSNorm
+        self.q_a_layernorm = norm_type(q_lora_rank, eps=config.rms_norm_eps)
+        if isinstance(self.q_a_layernorm, _KimiDecomposedRMSNorm):
+            self.q_a_layernorm.kimi_parity_name = f"{prefix}.q_a_layernorm"
         self.q_b_proj = ColumnParallelLinear(
             q_lora_rank,
             num_heads * self.qk_head_dim,
@@ -840,7 +1164,9 @@ class KimiK3MLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.q_b_proj",
         )
-        self.kv_a_layernorm = RMSNorm(kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_a_layernorm = norm_type(kv_lora_rank, eps=config.rms_norm_eps)
+        if isinstance(self.kv_a_layernorm, _KimiDecomposedRMSNorm):
+            self.kv_a_layernorm.kimi_parity_name = f"{prefix}.kv_a_layernorm"
         self.kv_b_proj = ColumnParallelLinear(
             kv_lora_rank,
             num_heads * (qk_nope_head_dim + v_head_dim),
@@ -897,6 +1223,51 @@ class KimiK3MLAAttention(nn.Module):
             quant_config,
             prefix,
         )
+        if os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_MLA_DECODE") == "1":
+            # The A5 fused MLA prolog requires the production 512-wide KV
+            # latent.  Keep the normal paged cache, but route this deliberately
+            # reduced 128-wide fixture through explicit Kimi projections and
+            # attention math.
+            mla_impl = self.mla_attn.mla_attn.impl
+            mla_impl.enable_mlapo = False
+            if "layers.3.self_attn" in prefix:
+                mla_impl.kimi_parity_layer = 4
+            mla_impl.mla_preprocess_decode = MethodType(
+                _reference_mla_preprocess_decode,
+                mla_impl,
+            )
+            mla_impl._forward_prefill = MethodType(
+                _reference_mla_forward_prefill,
+                mla_impl,
+            )
+            mla_impl._forward_decode = MethodType(
+                _reference_mla_forward_decode,
+                mla_impl,
+            )
+
+        tap_layer = next(
+            (layer for layer in (4, 8) if f"layers.{layer - 1}.self_attn" in prefix),
+            None,
+        )
+        if tap_layer is not None and os.environ.get("KIMI_PARITY_TAP_DIR"):
+
+            def capture(name: str):
+                def hook(_module, _args, output) -> None:
+                    value = output[0] if isinstance(output, tuple) else output
+                    _parity_tap(f"{tap_layer:02d}_mla_{name}", value)
+
+                return hook
+
+            for module, name in (
+                (self.fused_qkv_a_proj, "qkv_a_fused"),
+                (self.q_a_layernorm, "q_a_norm"),
+                (self.q_b_proj, "q_b"),
+                (self.kv_a_layernorm, "kv_a_norm"),
+                (self.kv_b_proj, "kv_b"),
+                (self.g_proj, "gate_raw"),
+                (self.o_proj, "o_proj"),
+            ):
+                module.register_forward_hook(capture(name))
 
     def forward(
         self,
@@ -914,7 +1285,58 @@ def _apply_attention_residual(
     norm: RMSNorm,
 ) -> torch.Tensor:
     """Apply K3's learned normalized mixture over residual block starts."""
-    if apply_attn_res is not None and prefix_sum.device.type == "npu" and prefix_sum.numel() > 0:
+    if os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ATTN_RES") == "1":
+        rows = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
+        score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
+        if os.environ.get("VLLM_ASCEND_KIMI_VECTORIZED_ATTN_RES") == "1":
+            rows_float = rows.float()
+            if os.environ.get("VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_RMS_NORM") == "1":
+                normalized, _ = torch_npu.npu_rms_norm(
+                    rows_float,
+                    norm.weight.float(),
+                    norm.variance_epsilon,
+                )
+                score_weight = projection.weight.squeeze(0).float()
+            else:
+                normalized = rows_float * torch.rsqrt(
+                    rows_float.square().mean(dim=-1, keepdim=True) + norm.variance_epsilon
+                )
+            if os.environ.get("VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_SCORE_MATMUL") == "1":
+                scores = torch.matmul(
+                    normalized,
+                    score_weight.unsqueeze(-1),
+                ).squeeze(-1)
+            else:
+                scores = (normalized * score_weight).sum(dim=-1)
+            probabilities = torch.softmax(scores, dim=-1)
+            if os.environ.get("VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_MIX_MATMUL") == "1":
+                return (
+                    torch.matmul(
+                        probabilities.unsqueeze(1),
+                        rows_float,
+                    )
+                    .squeeze(1)
+                    .to(rows.dtype)
+                )
+            return (probabilities.unsqueeze(-1) * rows_float).sum(dim=-2).to(rows.dtype)
+        outputs = []
+        for token_idx in range(rows.shape[0]):
+            rows_float = rows[token_idx : token_idx + 1].float()
+            normalized = rows_float * torch.rsqrt(
+                rows_float.square().mean(dim=-1, keepdim=True) + norm.variance_epsilon
+            )
+            scores = (normalized * score_weight).sum(dim=-1)
+            probabilities = torch.softmax(scores, dim=-1)
+            outputs.append((probabilities.unsqueeze(-1) * rows_float).sum(dim=-2).to(rows.dtype))
+        return torch.cat(outputs, dim=0)
+
+    use_triton_attention_residual = (
+        apply_attn_res is not None
+        and os.environ.get("VLLM_ASCEND_KIMI_NATIVE_ATTN_RES") != "1"
+        and prefix_sum.device.type == "npu"
+        and prefix_sum.numel() > 0
+    )
+    if use_triton_attention_residual:
         mixed = apply_attn_res(prefix_sum, block_residual, projection, norm)
     else:
         values = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
@@ -1021,6 +1443,8 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         block_residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        _parity_tap(f"{self.layer_idx + 1:02d}_layer_input", hidden_states)
+        _parity_tap(f"{self.layer_idx + 1:02d}_block_residual_input", block_residual)
         prefix_sum: torch.Tensor | None = hidden_states
         if block_residual.shape[1] > 0:
             hidden_states = _apply_attention_residual(
@@ -1036,6 +1460,7 @@ class KimiK3DecoderLayer(nn.Module):
             prefix_sum = None
 
         hidden_states = self.input_layernorm(hidden_states)
+        _parity_tap(f"{self.layer_idx + 1:02d}_attention_input", hidden_states)
         if self.is_vl_first_layer and _EXTRA_CTX.flash_comm_v1_enabled:
             tp_size = get_tensor_model_parallel_world_size()
             num_local_tokens = hidden_states.shape[0] // tp_size
@@ -1047,6 +1472,7 @@ class KimiK3DecoderLayer(nn.Module):
         else:
             attention_output = torch.empty_like(hidden_states)
         self.self_attn(positions=positions, hidden_states=hidden_states, output=attention_output)
+        _parity_tap(f"{self.layer_idx + 1:02d}_attention_output", attention_output)
 
         # The multimodal first layer transitions from full inputs_embeds to a
         # FlashComm token shard.  The token axis is dim 0 for both tensors, so
@@ -1066,11 +1492,16 @@ class KimiK3DecoderLayer(nn.Module):
             self.mlp_res_norm,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
+        _parity_tap(f"{self.layer_idx + 1:02d}_mlp_input", hidden_states)
         if hasattr(self, "block_sparse_moe"):
             hidden_states = self.block_sparse_moe(hidden_states)
         else:
             hidden_states = self.mlp(hidden_states)
-        return prefix_sum + hidden_states, block_residual
+        _parity_tap(f"{self.layer_idx + 1:02d}_mlp_output", hidden_states)
+        layer_output = prefix_sum + hidden_states
+        _parity_tap(f"{self.layer_idx + 1:02d}_layer_output", layer_output)
+        _parity_tap(f"{self.layer_idx + 1:02d}_block_residual_output", block_residual)
+        return layer_output, block_residual
 
 
 @support_torch_compile
@@ -1137,6 +1568,7 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
         del kwargs
         if get_pp_group().is_first_rank:
             hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
+            _parity_tap("00_embedding", hidden_states)
             block_residual = hidden_states.new_zeros((hidden_states.shape[0], 0, hidden_states.shape[-1]))
         else:
             if intermediate_tensors is None:
@@ -1177,7 +1609,9 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
             self.output_attn_res_proj,
             self.output_attn_res_norm,
         )
+        _parity_tap("09_final_norm_input", hidden_states)
         hidden_states = self.norm(hidden_states)
+        _parity_tap("10_final_norm_output", hidden_states)
         if aux_hidden_states:
             return hidden_states, aux_hidden_states
         return hidden_states
@@ -1220,6 +1654,10 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
                 if ".experts." in name and name not in params_dict:
                     continue
                 name = name.replace(weight_name, param_name)
+                if name.endswith(".weight_packed") and name not in params_dict:
+                    unpacked_name = name[: -len("_packed")]
+                    if unpacked_name in params_dict:
+                        name = unpacked_name
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 if is_pp_missing_parameter(name, self):
@@ -1250,6 +1688,10 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
                     name = maybe_remap_kv_scale_name(name, params_dict)
                     if name is None or is_pp_missing_parameter(name, self):
                         continue
+                    if name.endswith(".weight_packed") and name not in params_dict:
+                        unpacked_name = name[: -len("_packed")]
+                        if unpacked_name in params_dict:
+                            name = unpacked_name
                     param = params_dict[name]
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, loaded_weight, **loader_kwargs)
@@ -1303,7 +1745,9 @@ class AscendKimiK3ForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfExp
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        _parity_tap("11_logits", logits)
+        return logits
 
     def make_empty_intermediate_tensors(
         self,

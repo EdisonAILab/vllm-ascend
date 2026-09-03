@@ -157,6 +157,7 @@ def _w4a8_situ_apply_mlp(
     group_list: torch.Tensor,
     group_list_type: int,
     dynamic_scale: torch.Tensor | None,
+    topk_scales: torch.Tensor | None,
     w1_scale_bias: torch.Tensor | None,
     w2_scale_bias: torch.Tensor | None,
     activation: SituActivationConfig,
@@ -222,14 +223,34 @@ def _w4a8_situ_apply_mlp(
         group_list_type=group_list_type,
         group_type=0,
         group_list=group_list,
+        scale_dtype=torch_npu.float8_e8m0fnu if use_mxfp_quant else None,
         per_token_scale_dtype=torch_npu.float8_e8m0fnu if use_mxfp_quant else None,
+        x_dtype=torch.float8_e4m3fn if use_mxfp_quant else None,
         weight_dtype=torch_npu.float4_e2m1fn_x2 if use_mxfp_quant else None,
         output_dtype=output_dtype if not use_mxfp_quant else torch.bfloat16,
     )[0]
     if externally_quantized_hidden_states is not None:
         dispose_tensor(externally_quantized_hidden_states)
 
-    if use_mxfp_quant:
+    reference_weighted_situ = (
+        use_mxfp_quant
+        and topk_scales is not None
+        and os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ROUTER_WEIGHT_BEFORE_GMM2") == "1"
+    )
+    if reference_weighted_situ:
+        gate, linear = torch.chunk(gate_up_out.float(), 2, dim=-1)
+        gate = activation.beta * torch.tanh(gate / activation.beta) * torch.sigmoid(gate)
+        linear_beta = activation.linear_beta or 0.0
+        if linear_beta:
+            linear = linear_beta * torch.tanh(linear / linear_beta)
+        weighted_situ = (gate * linear).to(gate_up_out.dtype)
+        weighted_situ = (weighted_situ * topk_scales).to(gate_up_out.dtype)
+        hidden_states, situ_out_scale = torch_npu.npu_dynamic_mx_quant(
+            weighted_situ,
+            axis=-1,
+            dst_type=act_quant_type,
+        )
+    elif use_mxfp_quant:
         hidden_states, situ_out_scale = torch.ops._C_ascend.situ_mx_quant(
             x=gate_up_out,
             beta=activation.beta,
@@ -282,6 +303,7 @@ def quant_apply_mlp(
     group_list: torch.Tensor,
     group_list_type: int = 1,
     dynamic_scale: torch.Tensor = None,
+    topk_scales: torch.Tensor | None = None,
     w1_scale_bias: torch.Tensor = None,
     w2_scale_bias: torch.Tensor = None,
     w1_offset: torch.Tensor | None = None,
@@ -317,6 +339,7 @@ def quant_apply_mlp(
             group_list=group_list,
             group_list_type=group_list_type,
             dynamic_scale=dynamic_scale,
+            topk_scales=topk_scales,
             w1_scale_bias=w1_scale_bias,
             w2_scale_bias=w2_scale_bias,
             activation=situ_activation,
@@ -879,6 +902,7 @@ def unified_apply_mlp(*, mlp_compute_input: MoEMlpComputeInput) -> torch.Tensor:
         w2_scale=w2_scale,
         group_list=group_list,
         dynamic_scale=dynamic_scale,
+        topk_scales=topk_scales,
         group_list_type=group_list_type,
         w1_scale_bias=w1_scale_bias,
         w2_scale_bias=w2_scale_bias,

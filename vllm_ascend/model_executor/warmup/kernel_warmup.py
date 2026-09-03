@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
@@ -42,7 +43,8 @@ def kernel_warmup(worker: NPUWorker) -> None:
     start = time.perf_counter()
 
     _run_warmup("rejection_sampler", rejection_sampler_triton_warmup, worker)
-    _run_warmup("penalties", penalties_triton_warmup, worker)
+    if os.environ.get("VLLM_ASCEND_SKIP_UNUSED_PENALTY_WARMUP") != "1":
+        _run_warmup("penalties", penalties_triton_warmup, worker)
     _run_warmup("rms", triton_rms_warmup, worker)
 
     elapsed = time.perf_counter() - start

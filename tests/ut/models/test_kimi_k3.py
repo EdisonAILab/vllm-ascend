@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -17,6 +18,8 @@ from vllm_ascend.models.kimi_k3 import (
     KimiK3MultiModalProjector,
     KimiK3TextModel,
     KimiK3VisionEncoderLayer,
+    _apply_attention_residual,
+    _KimiReferenceRMSNorm,
     _move_module_to_device,
     _resolve_packed_expert_weight_name,
     _routed_latent_quant_config,
@@ -70,11 +73,11 @@ def test_kimi_k3_loads_qkv_checkpoint_shards_into_fused_linear():
     ("quant_name", "uses_quantized_latent_projections"),
     [
         ("ascend", True),
-        ("compressed-tensors", False),
+        ("compressed-tensors", True),
         ("other", False),
     ],
 )
-def test_kimi_k3_quantizes_latent_projections_only_for_modelslim(
+def test_kimi_k3_quantizes_packed_latent_projections(
     quant_name: str,
     uses_quantized_latent_projections: bool,
 ):
@@ -91,6 +94,62 @@ def test_kimi_k3_quantizes_latent_projections_only_for_modelslim(
 
 def test_kimi_k3_unquantized_model_keeps_latent_projections_unquantized():
     assert _routed_latent_quant_config(None) is None
+
+
+def test_kimi_k3_reference_rms_norm_casts_before_weight():
+    hidden_states = torch.tensor(
+        [[0.75, -1.25, 2.0, -0.5]],
+        dtype=torch.bfloat16,
+    )
+    norm = _KimiReferenceRMSNorm(4, eps=1e-6).to(dtype=torch.bfloat16)
+    norm.weight.data.copy_(torch.tensor([0.5, 1.5, -0.75, 2.0], dtype=torch.bfloat16))
+
+    normalized = hidden_states.float()
+    normalized *= torch.rsqrt(normalized.square().mean(dim=-1, keepdim=True) + 1e-6)
+    expected = norm.weight * normalized.to(torch.bfloat16)
+
+    assert torch.equal(norm(hidden_states), expected)
+
+
+def test_kimi_k3_vectorized_attention_residual_uses_explicit_fp32_reductions():
+    prefix_sum = torch.tensor(
+        [[0.5, -0.25, 1.0, 0.75], [1.25, 0.5, -0.75, 0.25]],
+        dtype=torch.bfloat16,
+    )
+    block_residual = torch.tensor(
+        [
+            [[0.25, 0.5, -0.5, 1.0], [1.0, -0.75, 0.5, 0.25]],
+            [[-0.5, 0.25, 0.75, 1.0], [0.5, 1.0, -0.25, -0.75]],
+        ],
+        dtype=torch.bfloat16,
+    )
+    projection = SimpleNamespace(weight=torch.tensor([[0.75, -0.5, 1.25, 0.25]], dtype=torch.bfloat16))
+    norm = SimpleNamespace(
+        weight=torch.tensor([1.0, 0.5, 1.5, -0.75], dtype=torch.bfloat16),
+        variance_epsilon=1e-6,
+    )
+    rows = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
+    rows_float = rows.float()
+    normalized = rows_float * torch.rsqrt(rows_float.square().mean(dim=-1, keepdim=True) + norm.variance_epsilon)
+    score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
+    probabilities = torch.softmax((normalized * score_weight).sum(dim=-1), dim=-1)
+    expected = (probabilities.unsqueeze(-1) * rows_float).sum(dim=-2).to(rows.dtype)
+
+    with patch.dict(
+        os.environ,
+        {
+            "VLLM_ASCEND_KIMI_REFERENCE_ATTN_RES": "1",
+            "VLLM_ASCEND_KIMI_VECTORIZED_ATTN_RES": "1",
+        },
+    ):
+        actual = _apply_attention_residual(
+            prefix_sum,
+            block_residual,
+            projection,
+            norm,
+        )
+
+    assert torch.equal(actual, expected)
 
 
 def test_kimi_k3_projector_registers_rotation_for_weight_loading(
