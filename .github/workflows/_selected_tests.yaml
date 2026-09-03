@@ -27,6 +27,42 @@ on:
         type: string
         required: true
         description: 'JSON array of test groups from select_tests.py'
+      ref:
+        type: string
+        required: false
+        default: ''
+        description: 'The vllm-ascend ref to test.'
+      base_ref:
+        type: string
+        required: false
+        default: 'main'
+        description: 'The base branch to rebase onto (e.g. main, v0.8.x).'
+      base_sha:
+        type: string
+        required: false
+        default: ''
+        description: 'The fixed base commit to rebase onto.'
+      upload_timing:
+        type: boolean
+        required: false
+        default: false
+        description: 'Upload test_timing_data.json as artifact'
+      continue_on_error:
+        type: boolean
+        required: false
+        default: false
+        description: 'Continue running the job even if tests fail'
+      enable-coverage:
+        type: boolean
+        required: false
+        default: false
+        description: 'Whether to run tests with coverage enabled.'
+    secrets:
+      OBS_ACCESS_KEY_PRECISION:
+        required: false
+      OBS_SECRET_ACCESS_KEY_PRECISION:
+        required: false
+
 
 # Bash shells do not use ~/.profile or ~/.bashrc so these shells need to be explicitly
 # declared as "shell: bash -el {0}" on steps that need to be properly activated.
@@ -38,12 +74,11 @@ defaults:
 permissions:
   contents: read
   pull-requests: write
-  issues: write
-
 
 jobs:
   selected-tests:
-    name: ${{ matrix.group.npu_type }}-${{ matrix.group.num_npus }} card
+    name: ${{ matrix.group.npu_type }}-${{ matrix.group.num_npus }} card-${{ matrix.group.partition && format('(part {0})', matrix.group.partition) || '' }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -57,7 +92,7 @@ jobs:
         HF_HUB_OFFLINE: 1
         MAX_JOBS: 4
         UV_INDEX_URL: http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
-        UV_EXTRA_INDEX_URL: "https://repo.huaweicloud.com/ascend/repos/pypi"
+        UV_EXTRA_INDEX_URL: "https://repo.huaweicloud.com/ascend/repos/pypi http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu/"
         UV_INDEX_STRATEGY: unsafe-best-match
         UV_INSECURE_HOST: cache-service.nginx-pypi-cache.svc.cluster.local
         UV_HTTP_TIMEOUT: 120
@@ -65,13 +100,9 @@ jobs:
         UV_SYSTEM_PYTHON: 1
     steps:
       - name: Check NPU availability
-        id: check_npu
+        if: ${{ matrix.group.npu_type != 'cpu' }}
         run: |
-          if npu-smi info > /dev/null 2>&1; then
-            echo "has_npu=true" >> $GITHUB_OUTPUT
-          else
-            echo "has_npu=false" >> $GITHUB_OUTPUT
-          fi
+          npu-smi info
 
       - name: Install packages
         run: |
@@ -79,12 +110,12 @@ jobs:
           pip config set global.index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
           pip config set global.trusted-host cache-service.nginx-pypi-cache.svc.cluster.local
           apt-get update -y
-          apt-get install -y python3-pip git vim wget net-tools gcc g++ cmake libnuma-dev curl gnupg2
-          git config --global --add safe.directory /__w/vllm-ascend/vllm-ascend
+          apt-get install -y python3-pip git vim wget net-tools gcc g++ cmake libnuma-dev curl gnupg2 zstd
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           pip install uv
 
       - name: Checkout vllm-project/vllm repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: vllm-project/vllm
           ref: ${{ inputs.vllm }}
@@ -93,35 +124,84 @@ jobs:
       - name: Install vllm-project/vllm from source
         working-directory: ./vllm-empty
         run: |
-          VLLM_TARGET_DEVICE=empty uv pip install . ${{ steps.check_npu.outputs.has_npu == 'false' && '--extra-index-url https://download.pytorch.org/whl/cpu' || '' }}
+          VLLM_TARGET_DEVICE=empty uv pip install .
           pip uninstall -y triton
 
       - name: Checkout vllm-project/vllm-ascend repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Rebase on ${{ inputs.base_ref }} snapshot
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+          FIXED_BASE_SHA: ${{ inputs.base_sha }}
+        run: |
+          # Reproduce the snapshot used by the cache coordinator. Falling back
+          # to FETCH_HEAD is only for callers that do not provide a fixed SHA.
+          git config user.name "vllm-ascend-ci"
+          git config user.email "vllm-ascend-ci@users.noreply.github.com"
+          git fetch origin "$BASE_REF"
+          BASE_SHA="$FIXED_BASE_SHA"
+          if [ -z "$BASE_SHA" ]; then
+            BASE_SHA=$(git rev-parse FETCH_HEAD)
+          fi
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git rebase "$BASE_SHA"
+          git submodule sync --recursive
+          git submodule update --init --recursive
 
       - name: Get csrc hash
         id: get_csrc_hash
+        if: ${{ matrix.group.npu_type != 'cpu' }}
         run: |
-          CSRC_HASH=$(find ./csrc ./setup.py ./CMakeLists.txt ./cmake \
-            -type f -not -path '*/.*' | sort | xargs sha256sum | sha256sum | awk '{print $1}')
-          echo "CSRC_HASH=$CSRC_HASH" >> $GITHUB_OUTPUT
+          # Fail closed so a git error cannot be converted into sha256(empty)
+          # and then appear to be a legitimate cache miss.
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          cd "$GITHUB_WORKSPACE"
 
-      - name: Cache vllm-ascend csrc
+          # Match the cache producer's tracked csrc build inputs exactly.
+          CSRC_MANIFEST=$(git ls-files -s -- csrc setup.py CMakeLists.txt cmake)
+          if [ -z "$CSRC_MANIFEST" ]; then
+            echo "::error::No tracked csrc inputs found."
+            exit 1
+          fi
+
+          CSRC_HASH=$(printf '%s\n' "$CSRC_MANIFEST" | sha256sum | awk '{print $1}')
+          echo "CSRC_HASH=$CSRC_HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Get architecture
+        id: get_arch
+        if: ${{ matrix.group.npu_type != 'cpu' }}
+        run: |
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64) echo "arch=X64" >> "$GITHUB_OUTPUT" ;;
+            aarch64) echo "arch=ARM64" >> "$GITHUB_OUTPUT" ;;
+            *) echo "arch=$ARCH" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Restore vllm-ascend csrc cache
         id: cache-csrc
-        if: ${{ steps.check_npu.outputs.has_npu == 'true' }}
-        uses: runs-on/cache@v5
+        if: ${{ matrix.group.npu_type != 'cpu' }}
+        uses: runs-on/cache/restore@v5
         with:
           path: |
             vllm_ascend/_cann_ops_custom
             vllm_ascend/*.so
             vllm_ascend/lib
             vllm_ascend/include
-          key: vllm-ascend-build-v1-${{ runner.os }}-swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:${{ matrix.group.image_tag }}-${{ steps.get_csrc_hash.outputs.CSRC_HASH }}
-          restore-keys: |
-            vllm-ascend-build-v1-${{ runner.os }}-swr.cn-southwest-2.myhuaweicloud.com/base_image/ascend-ci/cann:${{ matrix.group.image_tag }}-${{ steps.get_csrc_hash.outputs.CSRC_HASH }}
+          key: vllm-ascend-build-v2-${{ steps.get_arch.outputs.arch }}-${{ matrix.group.image_tag }}-${{ steps.get_csrc_hash.outputs.CSRC_HASH }}
+          # During the rollout, tolerate misses so CI can fall back to the
+          # existing NPU build while CPU cache production proves stable.
+          # Restore fail-on-cache-miss to true after the transition period.
+          fail-on-cache-miss: false
 
       - name: Install Mooncake wheel
-        if: ${{ steps.check_npu.outputs.has_npu == 'true' }}
+        if: ${{ matrix.group.npu_type != 'cpu' }}
         run: |
           set -euxo pipefail
 
@@ -129,75 +209,252 @@ jobs:
             libibverbs1 \
             ibverbs-providers \
             librdmacm1 \
-            libnuma1 \
-            libcurl4
+            libnuma1
           ldconfig
 
-          MOONCAKE_WHEEL="mooncake_transfer_engine_ascend-0.3.8.post1-cp311-cp311-manylinux_2_17_aarch64.manylinux_2_35_aarch64.whl"
           pip install --no-cache-dir --no-deps \
-            "https://vllm-ascend.obs.cn-north-4.myhuaweicloud.com/vllm-ascend/${MOONCAKE_WHEEL}"
+            -i https://mirrors.aliyun.com/pypi/simple/ \
+            mooncake-transfer-engine-npu==0.3.11.post1
 
-          pip show mooncake-transfer-engine-ascend || true
+          pip show mooncake-transfer-engine-npu || true
 
       - name: Install vllm-project/vllm-ascend with device
-        if: ${{ steps.check_npu.outputs.has_npu == 'true' }}
+        if: ${{ matrix.group.npu_type != 'cpu' }}
+        env:
+          CSRC_CACHE_HIT: ${{ steps.cache-csrc.outputs.cache-hit }}
         run: |
           export MAX_JOBS=$(( ${{ matrix.group.num_npus }} * 23 ))
-
           pip install uc-manager
           uv pip install -r requirements-dev.txt
-          uv pip install --force-reinstall --no-deps triton-ascend==3.2.1
-          if find vllm_ascend -maxdepth 1 -name '*.so' -type f 2>/dev/null | grep -q .; then
+          uv pip install --force-reinstall --no-deps triton-ascend==3.2.2
+          # Preserve CI availability during the transition by compiling on the
+          # NPU only when the new CPU-produced cache is unavailable.
+          if [ "$CSRC_CACHE_HIT" = "true" ]; then
+            echo "csrc cache hit: skip kernel compilation"
             COMPILE_CUSTOM_KERNELS=0 uv pip install -e .
           else
-            uv pip install -e .
+            echo "csrc cache miss: compile kernels on the NPU runner"
+            uv pip install -e . --no-build-isolation
           fi
 
+      - name: Verify required AscendC custom ops are registered (310p)
+        if: ${{ matrix.group.npu_type == '310p' }}
+        run: |
+          python - <<'PY'
+          import sys, torch
+          import vllm_ascend.vllm_ascend_C  # noqa: F401
+          ops = torch.ops._C_ascend
+          missing = [n for n in ("chunk_gated_delta_rule_fwd_h", "chunk_fwd_o") if not hasattr(ops, n)]
+          if missing:
+              print(f"::error::Missing AscendC ops after install: {missing}. "
+                    f"Cache contents are stale or build skipped registration.", file=sys.stderr)
+              sys.exit(1)
+          print("AscendC chunk-gdr ops registered:",
+                [n for n in ("chunk_gated_delta_rule_fwd_h", "chunk_fwd_o") if hasattr(ops, n)])
+          PY
+
       - name: Install vllm-project/vllm-ascend no device
-        if: ${{ steps.check_npu.outputs.has_npu == 'false' }}
+        if: ${{ matrix.group.npu_type == 'cpu' }}
         env:
           SOC_VERSION: ascend910b1
           COMPILE_CUSTOM_KERNELS: 0
         run: |
           pip install uc-manager
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/x86_64-linux/devlib
-          pip install . --extra-index-url https://download.pytorch.org/whl/cpu --extra-index-url https://repo.huaweicloud.com/ascend/repos/pypi
-          pip install -r requirements-dev.txt --extra-index-url https://download.pytorch.org/whl/cpu --extra-index-url https://repo.huaweicloud.com/ascend/repos/pypi
+          uv pip install -r requirements-dev.txt
+          uv pip install -e .
+
+      - name: Uninstall Triton for 310P tests
+        if: ${{ matrix.group.npu_type != 'cpu' && matrix.group.npu_type == '310p' }}
+        run: |
+          pip uninstall -y triton-ascend triton
 
       - name: Run selected tests with device
-        if: ${{ steps.check_npu.outputs.has_npu == 'true' }}
+        if: ${{ matrix.group.npu_type != 'cpu' }}
+        continue-on-error: ${{ inputs.continue_on_error }}
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
-          PYTORCH_NPU_ALLOC_CONF: max_split_size_mb:256
+          ENABLE_COVERAGE: ${{ inputs.enable-coverage}}
         run: |
-          echo -e "\033[1;34m=== TEST INFO ===\033[0m"
-          echo -e "  \033[33mDevice:\033[0m ${{ matrix.group.npu_type }}"
-          if [ "${{ matrix.group.npu_type }}" != "cpu" ]; then
-            echo -e "  \033[33mNPU count:\033[0m ${{ matrix.group.num_npus }}"
+          . /usr/local/Ascend/ascend-toolkit/set_env.sh
+          if [ "${{ inputs.enable-coverage }}" = "true" ]; then
+            export ENABLE_COVERAGE=true
           fi
-          echo -e "  \033[33mTargets:\033[0m"
-          for target in ${{ matrix.group.tests }}; do
-            echo -e "    \033[32m-\033[0m ${target}"
-          done
-          echo -e "\033[1;34m====================\033[0m"
-          pytest -sv --color=yes ${{ matrix.group.tests }}
+          TIMING_FLAG=""
+          if [ "${{ inputs.upload_timing }}" = "true" ]; then
+            TIMING_FLAG="--timing"
+          fi
+          .github/workflows/scripts/run_selected_tests.sh \
+            "${{ matrix.group.npu_type }}" \
+            "${{ matrix.group.num_npus }}" \
+            "with-device" \
+            ${TIMING_FLAG} \
+            ${{ matrix.group.tests }}
 
       - name: Run selected tests without device
-        if: ${{ steps.check_npu.outputs.has_npu == 'false' }}
+        if: ${{ matrix.group.npu_type == 'cpu' }}
+        continue-on-error: ${{ inputs.continue_on_error }}
         env:
           VLLM_WORKER_MULTIPROC_METHOD: spawn
           TORCH_DEVICE_BACKEND_AUTOLOAD: 0
+          ENABLE_COVERAGE: ${{ inputs.enable-coverage}}
         run: |
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/Ascend/ascend-toolkit/latest/x86_64-linux/devlib
-
-          echo -e "\033[1;34m=== TEST INFO ===\033[0m"
-          echo -e "  \033[33mDevice:\033[0m ${{ matrix.group.npu_type }}"
-          if [ "${{ matrix.group.npu_type }}" != "cpu" ]; then
-            echo -e "  \033[33mNPU count:\033[0m ${{ matrix.group.num_npus }}"
+          if [ "${{ inputs.enable-coverage }}" = "true" ]; then
+            export ENABLE_COVERAGE=true
           fi
-          echo -e "  \033[33mTargets:\033[0m"
-          for target in ${{ matrix.group.tests }}; do
-            echo -e "    \033[32m-\033[0m ${target}"
-          done
-          echo -e "\033[1;34m====================\033[0m"
-          pytest -sv --color=yes ${{ matrix.group.tests }}
+          .github/workflows/scripts/run_selected_tests.sh \
+            "${{ matrix.group.npu_type }}" \
+            "${{ matrix.group.num_npus }}" \
+            "without-device" \
+            ${{ matrix.group.tests }}
+
+      - name: Upload timing data
+        if: ${{ inputs.upload_timing && matrix.group.npu_type != 'cpu' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: timing-data-${{ matrix.group.npu_type }}-${{ matrix.group.num_npus }}card-${{ matrix.group.partition }}
+          path: ${{ runner.temp }}/selected-tests-*/test_timing_data.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload coverage data
+        if: ${{ !cancelled() && inputs.enable-coverage }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: selected-test-coverage-vllm-${{ inputs.vllm }}-${{ matrix.group.npu_type }}-${{ matrix.group.num_npus }}card-${{ matrix.group.partition }}
+          path: tests/outputs/**/covdata/**
+          if-no-files-found: ignore
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload selected test logs
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: selected-test-logs-vllm-${{ inputs.vllm }}-${{ matrix.group.npu_type }}-${{ matrix.group.num_npus }}card-${{ matrix.group.partition }}
+          path: ${{ runner.temp }}/selected-tests-*
+          if-no-files-found: ignore
+          retention-days: 14
+          compression-level: 0
+
+  upload-coverage-to-obs:
+      if: ${{ !cancelled() && inputs.enable-coverage }}
+      needs: selected-tests
+      runs-on: ubuntu-latest
+      continue-on-error: true
+      env:
+        OBS_ACCESS_KEY: ${{ secrets.OBS_ACCESS_KEY_PRECISION }}
+        OBS_SECRET_KEY: ${{ secrets.OBS_SECRET_ACCESS_KEY_PRECISION }}
+      steps:
+        - name: Checkout vllm-ascend source code
+          uses: actions/checkout@v7
+          with:
+            ref: ${{ inputs.ref || github.ref }}
+
+        - name: Download all coverage artifacts
+          uses: actions/download-artifact@v5
+          with:
+            path: all-coverage
+            pattern: selected-test-coverage-*
+            merge-multiple: true
+
+        - name: Debug - List downloaded coverage files
+          run: |
+            echo "=== all-coverage top level ==="
+            find all-coverage -maxdepth 1 2>/dev/null | head -20 || echo "all-coverage directory not exist"
+            echo ""
+            echo "=== all-coverage total file count ==="
+            find all-coverage -type f 2>/dev/null | wc -l
+            echo "=== sample covdata dirs ==="
+            find all-coverage -type d -name covdata 2>/dev/null | head -10
+            echo "=== sample files ==="
+            find all-coverage -path '*/covdata/*' -type f 2>/dev/null | head -10
+
+        - name: Assemble and compress coverage files
+          run: |
+            set -euo pipefail
+            TASK_DATE=$(date +%Y%m%d%H)
+            TASK_NAME="VLLM-ASCEND@task_${TASK_DATE}"
+            COVERAGE_PKG_DIR="coverage/vllm-ascend"
+            TASK_DIR="${COVERAGE_PKG_DIR}/${TASK_NAME}"
+            mkdir -p "${TASK_DIR}" "${COVERAGE_PKG_DIR}/covstub/vllm_ascend"
+
+            COVERAGE_FILE_COUNT=0
+            while IFS= read -r f; do
+              rel="${f#all-coverage/}"
+              case "${rel}" in
+                selected-test-coverage-*/*) rel="${rel#*/}" ;;
+              esac
+              dest="${TASK_DIR}/${rel}"
+              mkdir -p "$(dirname "${dest}")"
+              cp "${f}" "${dest}"
+              COVERAGE_FILE_COUNT=$((COVERAGE_FILE_COUNT + 1))
+            done < <(find all-coverage -path '*/covdata/*' -type f 2>/dev/null)
+
+            echo "Copied ${COVERAGE_FILE_COUNT} coverage files to ${TASK_DIR}"
+            if [ "${COVERAGE_FILE_COUNT}" -eq 0 ]; then
+              echo "::error::No coverage files found under all-coverage/*/covdata/"
+              exit 1
+            fi
+
+            cp -r vllm_ascend/. "${COVERAGE_PKG_DIR}/covstub/vllm_ascend/"
+            cp tests/coverage_settingInfo.xml "${COVERAGE_PKG_DIR}/settingInfo.xml"
+            echo "${TASK_NAME}" > coverage_version.txt
+
+            echo "=== package top level ==="
+            find "${COVERAGE_PKG_DIR}" -maxdepth 1 2>/dev/null | head -20 || true
+            echo "=== task dir file count ==="
+            find "${TASK_DIR}" -type f | wc -l
+
+            echo "=== building test_case_map.json ==="
+            pip install regex
+            python3 .github/workflows/scripts/test_selector.py \
+              --build-map \
+              --coverage-dir "${TASK_DIR}" \
+              --source-dir "${COVERAGE_PKG_DIR}/covstub" \
+              --map-file test_case_map.json
+            test -s test_case_map.json
+            du -h test_case_map.json
+
+            tar cf coverage.tar -C coverage vllm-ascend
+            echo "Packed coverage/vllm-ascend into coverage.tar"
+            du -h coverage.tar
+            echo "=== tar contents (sample) ==="
+            tar tf coverage.tar | head -20 || true
+            echo "=== tar task file count ==="
+            tar tf coverage.tar | grep -c "vllm-ascend/${TASK_NAME}/" || true
+
+            {
+              echo "TASK_DATE=${TASK_DATE}"
+              echo "TASK_NAME=${TASK_NAME}"
+            } >> "${GITHUB_ENV}"
+
+        - name: Upload coverage to OBS
+          run: |
+            pip install esdk-obs-python --quiet
+            python3 - <<'EOF'
+            import os
+            from obs import ObsClient
+
+            OBS_BUCKET = 'vllm-ascend'
+            OBS_PREFIX = 'ci/precision-test'
+            client = ObsClient(
+                access_key_id=os.environ['OBS_ACCESS_KEY'],
+                secret_access_key=os.environ['OBS_SECRET_KEY'],
+                server='https://obs.cn-north-4.myhuaweicloud.com'
+            )
+
+            uploads = [
+                ('coverage.tar', f'{OBS_PREFIX}/coverage.tar'),
+                ('coverage_version.txt', f'{OBS_PREFIX}/coverage_version.txt'),
+                ('test_case_map.json', f'{OBS_PREFIX}/test_case_map.json'),
+            ]
+            for local_path, obs_path in uploads:
+                resp = client.putFile(OBS_BUCKET, obs_path, local_path)
+                if resp.status < 300:
+                    print(f'Uploaded: {local_path} -> {obs_path}')
+                else:
+                    raise Exception(f'Failed to upload {local_path}: {resp.errorMessage}')
+            EOF

@@ -15,14 +15,13 @@
 
 import math
 import os
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
-from vllm.config import CompilationConfig, ModelConfig, ParallelConfig, VllmConfig
 
 from tests.ut.base import TestBase
-from tests.ut.conftest import _npu_available
 from vllm_ascend import utils
 from vllm_ascend.utils import REGISTERED_ASCEND_OPS
 
@@ -34,7 +33,6 @@ class TestUtils(TestBase):
         from vllm_ascend import platform
 
         importlib.reload(platform)
-        utils.enable_dsa_cp_with_layer_shard.cache_clear()
         utils.enable_dsa_cp_with_o_proj_tp.cache_clear()
 
     def test_nd_to_nz_2d(self):
@@ -136,44 +134,6 @@ class TestUtils(TestBase):
         with mock.patch("torch.npu.current_stream") as mock_current_stream:
             self.assertEqual(utils.current_stream(), mock_current_stream())
 
-    def test_enable_dsa_cp_with_layer_shard_accepts_kv_producer(self):
-        mock_vllm_config = mock.MagicMock()
-        mock_vllm_config.kv_transfer_config = mock.MagicMock(
-            kv_role="kv_producer", is_kv_producer=True, is_kv_consumer=False
-        )
-
-        with (
-            mock.patch("vllm.config.get_current_vllm_config", return_value=mock_vllm_config),
-            mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=True),
-        ):
-            self.assertTrue(utils.enable_dsa_cp_with_layer_shard())
-
-    def test_enable_dsa_cp_with_layer_shard_rejects_kv_both(self):
-        mock_vllm_config = mock.MagicMock()
-        mock_vllm_config.kv_transfer_config = mock.MagicMock(
-            kv_role="kv_both", is_kv_producer=True, is_kv_consumer=True
-        )
-
-        with (
-            mock.patch("vllm.config.get_current_vllm_config", return_value=mock_vllm_config),
-            mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=True),
-        ):
-            self.assertFalse(utils.enable_dsa_cp_with_layer_shard())
-
-    def test_enable_dsa_cp_with_layer_shard_rejects_missing_kv_transfer(self):
-        mock_vllm_config = mock.MagicMock()
-        mock_vllm_config.kv_transfer_config = None
-
-        with (
-            mock.patch("vllm.config.get_current_vllm_config", return_value=mock_vllm_config),
-            mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=True),
-        ):
-            self.assertFalse(utils.enable_dsa_cp_with_layer_shard())
-
-    def test_enable_dsa_cp_with_layer_shard_rejects_when_dsa_cp_disabled(self):
-        with mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=False):
-            self.assertFalse(utils.enable_dsa_cp_with_layer_shard())
-
     def test_enable_dsa_cp_with_o_proj_tp_accepts_missing_kv_transfer(self):
         mock_vllm_config = mock.MagicMock()
         mock_vllm_config.kv_transfer_config = None
@@ -196,10 +156,22 @@ class TestUtils(TestBase):
         ):
             self.assertTrue(utils.enable_dsa_cp_with_o_proj_tp())
 
-    def test_enable_dsa_cp_with_o_proj_tp_rejects_single_role_pd(self):
+    def test_enable_dsa_cp_with_o_proj_tp_accepts_kv_producer(self):
         mock_vllm_config = mock.MagicMock()
         mock_vllm_config.kv_transfer_config = mock.MagicMock(
             kv_role="kv_producer", is_kv_producer=True, is_kv_consumer=False
+        )
+
+        with (
+            mock.patch("vllm.config.get_current_vllm_config", return_value=mock_vllm_config),
+            mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=True),
+        ):
+            self.assertTrue(utils.enable_dsa_cp_with_o_proj_tp())
+
+    def test_enable_dsa_cp_with_o_proj_tp_rejects_kv_consumer(self):
+        mock_vllm_config = mock.MagicMock()
+        mock_vllm_config.kv_transfer_config = mock.MagicMock(
+            kv_role="kv_consumer", is_kv_producer=False, is_kv_consumer=True
         )
 
         with (
@@ -211,6 +183,41 @@ class TestUtils(TestBase):
     def test_enable_dsa_cp_with_o_proj_tp_rejects_when_dsa_cp_disabled(self):
         with mock.patch("vllm_ascend.utils.enable_dsa_cp", return_value=False):
             self.assertFalse(utils.enable_dsa_cp_with_o_proj_tp())
+
+    def test_flashcomm1_and_shared_expert_dp_switches_are_independent(self):
+        cases = [
+            (False, False),
+            (False, True),
+            (True, False),
+            (True, True),
+        ]
+        for enable_flashcomm1, enable_shared_expert_dp in cases:
+            with self.subTest(
+                enable_flashcomm1=enable_flashcomm1,
+                enable_shared_expert_dp=enable_shared_expert_dp,
+            ):
+                utils.clear_enable_sp()
+                vllm_config = mock.MagicMock(
+                    additional_config={
+                        "enable_flashcomm1": enable_flashcomm1,
+                        "refresh": True,
+                    }
+                )
+                ascend_config = mock.MagicMock(
+                    enable_flashcomm1=enable_flashcomm1,
+                    enable_shared_expert_dp=enable_shared_expert_dp,
+                    enable_sp_by_pass=False,
+                )
+
+                with mock.patch("vllm_ascend.utils.get_ascend_config", return_value=ascend_config):
+                    self.assertEqual(
+                        utils.enable_sp(
+                            vllm_config,
+                            enable_shared_expert_dp=enable_shared_expert_dp,
+                        ),
+                        enable_flashcomm1,
+                    )
+                    self.assertEqual(utils.shared_expert_dp_enabled(), enable_shared_expert_dp)
 
     def test_vllm_version_is(self):
         with mock.patch.dict(os.environ, {"VLLM_VERSION": "1.0.0"}):
@@ -276,24 +283,33 @@ class TestUtils(TestBase):
             utils.get_max_hidden_layers(NoLayerConfig())
         self.assertIn("num_hidden_layers", str(context.exception))
 
-    @mock.patch.dict(os.environ, {"VLLM_ASCEND_ENABLE_FLASHCOMM1": "0"})
-    @pytest.mark.skipif(not _npu_available, reason="Requires real NPU (ModelConfig inspection)")
-    def test_update_aclgraph_sizes(self):
-        test_compilation_config = CompilationConfig(cudagraph_capture_sizes=[i for i in range(150)])
-        model_path = os.path.join(os.path.dirname(__file__), "_fake_weight")
-        test_model_config = ModelConfig(model=model_path, enforce_eager=True)
-        test_parallel_config = ParallelConfig()
-        test_vllm_config = VllmConfig(
-            model_config=test_model_config,
-            compilation_config=test_compilation_config,
-            parallel_config=test_parallel_config,
-        )
-        utils.update_aclgraph_sizes(test_vllm_config)
-        os.environ["HCCL_OP_EXPANSION_MODE"] = "AIV"
-        utils.update_aclgraph_sizes(test_vllm_config)
-        del os.environ["HCCL_OP_EXPANSION_MODE"]
+    def test_is_drafter_moe_model_extract_hidden_states_is_never_moe(self):
+        """The extract_hidden_states drafter is a cache-only attention layer
+        with no MoE layers, but its hf_config copies the (possibly MoE) target
+        hf_config. The expert-key scan must not misclassify it as MoE,
+        otherwise _sync_metadata_across_dp(is_draft_model=True) performs a DP
+        all_reduce that idle DP ranks never match (DP deadlock)."""
+        vllm_config = mock.MagicMock()
+        vllm_config.speculative_config.method = "extract_hidden_states"
+        # Inherited MoE keys from the target model (e.g. MiniMax-M2)
+        vllm_config.speculative_config.draft_model_config.hf_text_config.to_dict.return_value = {
+            "num_local_experts": 256,
+            "num_experts_per_tok": 8,
+        }
 
-        self.assertEqual(0, len(test_vllm_config.compilation_config.cudagraph_capture_sizes))
+        with mock.patch("vllm_ascend.utils._IS_DRAFTER_MOE_MODEL", None):
+            self.assertFalse(utils.is_drafter_moe_model(vllm_config))
+
+    def test_is_drafter_moe_model_eagle_moe_drafter_detected(self):
+        """Non-extract_hidden_states drafters keep the expert-key detection."""
+        vllm_config = mock.MagicMock()
+        vllm_config.speculative_config.method = "eagle3"
+        vllm_config.speculative_config.draft_model_config.hf_text_config.to_dict.return_value = {
+            "num_experts_per_tok": 8,
+        }
+
+        with mock.patch("vllm_ascend.utils._IS_DRAFTER_MOE_MODEL", None):
+            self.assertTrue(utils.is_drafter_moe_model(vllm_config))
 
     @mock.patch("vllm.model_executor.custom_op.CustomOp")
     @mock.patch("vllm_ascend.ops.activation.AscendQuickGELU")
@@ -409,3 +425,102 @@ class TestUtils(TestBase):
             result = utils.maybe_trans_nz(weight)
             self.assertIs(result, weight)
             assert_nz_cast(weight)
+
+
+def test_is_pd_decode_recompute_scheduler_enabled_without_config():
+    assert utils.is_pd_decode_recompute_scheduler_enabled() is False
+
+
+def test_is_pd_decode_recompute_scheduler_enabled_kv_producer():
+    vllm_config = mock.MagicMock()
+    vllm_config.kv_transfer_config = mock.MagicMock()
+    vllm_config.kv_transfer_config.is_kv_consumer = False
+    vllm_config.kv_transfer_config.is_kv_producer = True
+    assert utils.is_pd_decode_recompute_scheduler_enabled(vllm_config) is False
+
+
+@pytest.mark.parametrize(
+    ("top_layer_types", "text_layer_types", "is_linear_attn", "expected"),
+    [
+        (["linear_attention"], None, False, True),
+        (None, ["linear_attention"], False, True),
+        (None, None, True, True),
+        (["full_attention"], ["full_attention"], False, False),
+    ],
+)
+def test_check_gdn_layer_detects_supported_config_shapes(
+    top_layer_types,
+    text_layer_types,
+    is_linear_attn,
+    expected,
+):
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                layer_types=top_layer_types,
+                text_config=SimpleNamespace(
+                    layer_types=text_layer_types,
+                    is_linear_attn=is_linear_attn,
+                ),
+            ),
+        ),
+    )
+
+    assert utils.check_gdn_layer(vllm_config) is expected
+
+
+def test_is_pd_decode_recompute_scheduler_enabled_decode_consumer():
+    vllm_config = mock.MagicMock()
+    vllm_config.kv_transfer_config = mock.MagicMock()
+    vllm_config.kv_transfer_config.is_kv_consumer = True
+    vllm_config.kv_transfer_config.is_kv_producer = False
+    ascend_config = mock.MagicMock()
+    ascend_config.scheduler_config.recompute_scheduler_enable = True
+    with mock.patch("vllm_ascend.utils.get_ascend_config", return_value=ascend_config):
+        assert utils.is_pd_decode_recompute_scheduler_enabled(vllm_config) is True
+
+
+def test_is_rc_device_returns_false_on_non_310p():
+    utils._IS_RC_DEVICE = None
+    with mock.patch("vllm_ascend.utils.is_310p", return_value=False):
+        assert utils.is_rc_device() is False
+
+
+def test_is_rc_device_detects_ep_from_lspci():
+    utils._IS_RC_DEVICE = None
+    with (
+        mock.patch("vllm_ascend.utils.is_310p", return_value=True),
+        mock.patch("subprocess.run") as mock_run,
+    ):
+        mock_run.return_value.stdout = "00:00.0 accelerators: Huawei Technologies Co., Ltd."
+        assert utils.is_rc_device() is False
+
+
+def test_is_rc_device_detects_rc_from_lspci():
+    utils._IS_RC_DEVICE = None
+    with (
+        mock.patch("vllm_ascend.utils.is_310p", return_value=True),
+        mock.patch("subprocess.run") as mock_run,
+    ):
+        mock_run.return_value.stdout = "00:00.0 PCI bridge: Huawei Technologies Co., Ltd."
+        assert utils.is_rc_device() is True
+
+
+def test_is_rc_device_defaults_to_ep_when_lspci_unavailable():
+    utils._IS_RC_DEVICE = None
+    with (
+        mock.patch("vllm_ascend.utils.is_310p", return_value=True),
+        mock.patch("subprocess.run", side_effect=FileNotFoundError),
+    ):
+        assert utils.is_rc_device() is False
+
+
+def test_is_pd_decode_recompute_scheduler_enabled_decode_consumer_disabled():
+    vllm_config = mock.MagicMock()
+    vllm_config.kv_transfer_config = mock.MagicMock()
+    vllm_config.kv_transfer_config.is_kv_consumer = True
+    vllm_config.kv_transfer_config.is_kv_producer = False
+    ascend_config = mock.MagicMock()
+    ascend_config.scheduler_config.recompute_scheduler_enable = False
+    with mock.patch("vllm_ascend.utils.get_ascend_config", return_value=ascend_config):
+        assert utils.is_pd_decode_recompute_scheduler_enabled(vllm_config) is False

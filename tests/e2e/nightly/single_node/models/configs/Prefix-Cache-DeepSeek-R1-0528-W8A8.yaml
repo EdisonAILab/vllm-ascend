@@ -11,6 +11,7 @@ test_cases:
       HCCL_BUFFSIZE: "1024"
       PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
       SERVER_PORT: "DEFAULT_PORT"
+      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
     server_cmd:
       - "--quantization"
       - "ascend"
@@ -63,7 +64,7 @@ test_cases:
         num_prompts: 210
         max_out_len: 1
         batch_size: 18
-        baseline: 1
+        baseline: 3.4877
         threshold: 0.97
       prefix75:
         case_type: performance
@@ -73,5 +74,5 @@ test_cases:
         num_prompts: 210
         max_out_len: 1
         batch_size: 18
-        baseline: 1
+        baseline: 8.6154
         threshold: 0.97

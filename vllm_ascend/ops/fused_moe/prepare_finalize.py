@@ -29,12 +29,11 @@ from vllm.distributed.parallel_state import (
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 
-from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.distributed.utils import fc3_all_gather_and_maybe_unpad_impl
+from vllm_ascend.lora.fused_moe import prepare_lora_indices
 from vllm_ascend.ops.fused_moe.moe_runtime_args import MoEPrepareOutput
 from vllm_ascend.quantization.quant_type import QuantType
-from vllm_ascend.utils import enable_sp, enable_sp_by_pass, npu_stream_switch
+from vllm_ascend.utils import enable_sp, enable_sp_by_pass
 
 
 class PrepareAndFinalize(ABC):
@@ -49,14 +48,12 @@ class PrepareAndFinalize(ABC):
                                      sizes, ranks, and communication settings.
     """
 
-    quant_stream: torch.npu.Stream | None = None
-
     def __init__(self, moe_config: FusedMoEConfig):
         self.moe_config = moe_config
-        ascend_config = get_ascend_config()
-        self.multistream_overlap_gate = ascend_config.multistream_overlap_gate
-        if self.multistream_overlap_gate and PrepareAndFinalize.quant_stream is None:
-            PrepareAndFinalize.quant_stream = torch.npu.Stream()
+        self.lora_context = None
+
+    def set_lora_context(self, lora_context) -> None:
+        self.lora_context = lora_context
 
     @abstractmethod
     def prepare(
@@ -76,7 +73,9 @@ class PrepareAndFinalize(ABC):
         Args:
             hidden_states (torch.Tensor): Input features, shape [num_tokens, hidden_size]
             router_logits (torch.Tensor): Router outputs, shape [num_tokens, num_experts]
-            enable_shared_expert_dp (bool): Skip DP communication for shared experts
+            enable_shared_expert_dp (bool): Shared-expert placement policy.
+                Retained for interface compatibility; routed-expert token
+                preparation is independent of this flag.
             replace_allreduce (bool): Bypass default all-reduce behavior
             quant_type: none, w8a8, w4a8, mxfp8, or mxfp4
 
@@ -143,18 +142,26 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
           2. If TP > 1, split along token dim and select current TP rank's slice.
           3. Save splits for later all-gather in finalize.
 
-        Skips if `enable_shared_expert_dp` or `replace_allreduce` is True.
+        Skips only if `replace_allreduce` is True. Shared-expert DP controls
+        shared-expert placement and must not change routed token layout.
 
         Returns:
             MoEPrepareOutput where `mc2_mask` is None for All2All path.
         """
         self.replace_allreduce = replace_allreduce
-        self.enable_shared_expert_dp = enable_shared_expert_dp
 
         padded_hidden_states_shape = hidden_states.shape
-        if not (self.replace_allreduce or self.enable_shared_expert_dp):
+        if not self.replace_allreduce:
             self.num_tokens, _ = hidden_states.shape
             pad_size = self.tp_size - self.num_tokens  # Pad to TP size (cyclic)
+            if self.lora_context is not None:
+                prepare_lora_indices(
+                    self.lora_context,
+                    num_tokens=self.num_tokens,
+                    pad_size=pad_size,
+                    tp_size=self.tp_size,
+                    tp_rank=self.tp_rank,
+                )
 
             if pad_size > 0:
                 hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_size))
@@ -180,7 +187,7 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
         self,
         input_ids,
     ):
-        if not (self.replace_allreduce or self.enable_shared_expert_dp):
+        if not self.replace_allreduce:
             pad_size = self.tp_size - self.num_tokens
             if pad_size > 0:
                 input_ids = nn.functional.pad(input_ids, (0, pad_size))
@@ -202,10 +209,10 @@ class PrepareAndFinalizeWithAll2All(PrepareAndFinalize):
           2. Unpad to original token count.
           3. Return [original_num_tokens, hidden_size] tensor.
 
-        Skips if `enable_shared_expert_dp` or `replace_allreduce` is True.
+        Skips only if `replace_allreduce` is True.
         """
 
-        if not (self.enable_shared_expert_dp or self.replace_allreduce):
+        if not self.replace_allreduce:
             if self.tp_size > 1:
                 assert padded_hidden_states_shape is not None
                 # Cannot reuse `split_hidden_states` from prepare phase as it
@@ -261,13 +268,12 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
           3. If TP > 1, split tensors along token dimension and select current TP rank's slice.
           4. Split and return corresponding `mc2_mask`.
 
-        Skips padding/slicing if `enable_shared_expert_dp` or `replace_allreduce` is True.
+        Skips padding/slicing only if `replace_allreduce` is True.
 
         Returns:
             MoEPrepareOutput, possibly sliced/padded.
         """
         self.replace_allreduce = replace_allreduce
-        self.enable_shared_expert_dp = enable_shared_expert_dp
         mc2_mask = _EXTRA_CTX.mc2_mask
         if self.tp_size > 1:
             # Also slice mc2_mask
@@ -280,14 +286,13 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
             target_pad_length = _EXTRA_CTX.padded_num_tokens
             pad_size = target_pad_length - self.num_tokens
 
-            # Pad if necessary (unless shared expert DP is enabled)
-            if pad_size > 0 and not self.enable_shared_expert_dp:
+            if pad_size > 0:
                 hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_size))
                 router_logits = nn.functional.pad(router_logits, (0, 0, 0, pad_size))
                 padded_hidden_states_shape = hidden_states.shape
 
             # Slice across TP ranks
-            if self.tp_size > 1 and not self.enable_shared_expert_dp:
+            if self.tp_size > 1:
                 split_hidden_states = torch.tensor_split(hidden_states, self.tp_size, dim=0)
                 split_router_logits = torch.tensor_split(router_logits, self.tp_size, dim=0)
                 hidden_states = split_hidden_states[self.tp_rank]
@@ -309,10 +314,10 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
             forward_context = get_forward_context()
             target_pad_length = forward_context.padded_num_tokens
             pad_size = target_pad_length - self.num_tokens
-            if pad_size > 0 and not self.enable_shared_expert_dp:
+            if pad_size > 0:
                 input_ids = nn.functional.pad(input_ids, (0, pad_size))
 
-            if self.tp_size > 1 and not self.enable_shared_expert_dp:
+            if self.tp_size > 1:
                 input_ids = torch.tensor_split(input_ids, self.tp_size, dim=0)
                 input_ids = input_ids[self.tp_rank]
         return input_ids
@@ -366,21 +371,20 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         pertoken_scale = None
         if quant_type == QuantType.W8A8:
             hidden_states, pertoken_scale = torch_npu.npu_dynamic_quant(hidden_states)
-        elif quant_type == QuantType.MXFP8:
-            hidden_states, pertoken_scale = torch_npu.npu_dynamic_mx_quant(hidden_states, dst_type=torch.float8_e4m3fn)
-        elif quant_type in [QuantType.MXFP4, QuantType.W4A8MXFP]:
-            # W4A4MXFP4 and  W4A8MXFP4 with AllGather+EP currently does not pre-quantize
-            # per-token activations in prepare. Keep quantization in the MoE MLP path.
-            pass
+        elif quant_type in (QuantType.W8A8MXFP, QuantType.W4A8MXFP):
+            hidden_states, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+                hidden_states,
+                dst_type=torch.float8_e4m3fn,
+            )
+        elif quant_type == QuantType.W4A4MXFP:
+            hidden_states, pertoken_scale = torch_npu.npu_dynamic_mx_quant(
+                hidden_states,
+                dst_type=torch_npu.float4_e2m1fn_x2,
+                round_mode="round",
+            )
 
-        if self.multistream_overlap_gate:
-            assert PrepareAndFinalize.quant_stream is not None
-            PrepareAndFinalize.quant_stream.wait_stream(torch.npu.current_stream())
-            with npu_stream_switch(PrepareAndFinalize.quant_stream, enabled=self.multistream_overlap_gate):
-                hidden_states = fc3_all_gather_and_maybe_unpad_impl(hidden_states)
-        else:
-            hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, True, True)
-            router_logits = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(router_logits, True, True)
+        hidden_states = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(hidden_states, True, True)
+        router_logits = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(router_logits, True, True)
 
         # TODO(fuzhihong): To adapt to self.num_token in the all_gather_input_id_with_dp_group method,
         #  when flashcomm1 is used and dp = N(N >=2).
@@ -389,8 +393,25 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         if pertoken_scale is not None:
             pertoken_scale = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(pertoken_scale, True, True)
 
-        if self.multistream_overlap_gate:
-            torch.npu.current_stream().wait_stream(PrepareAndFinalize.quant_stream)
+        if self.moe_config.pcp_size > 1:
+            max_tokens_across_pcp = _EXTRA_CTX.max_tokens_across_pcp
+
+            self.num_tokens_pcp = hidden_states.shape[0]
+            pad_size = max_tokens_across_pcp - self.num_tokens_pcp
+            if pad_size > 0:
+                hidden_states = nn.functional.pad(hidden_states, (0, 0, 0, pad_size))
+                router_logits = nn.functional.pad(router_logits, (0, 0, 0, pad_size))
+                if pertoken_scale is not None:
+                    pertoken_scale = (
+                        nn.functional.pad(pertoken_scale, (0, pad_size))
+                        if pertoken_scale.dim() == 1
+                        else nn.functional.pad(pertoken_scale, (0, 0, 0, pad_size))
+                    )
+
+            hidden_states = get_pcp_group().all_gather(hidden_states, dim=0)
+            router_logits = get_pcp_group().all_gather(router_logits, dim=0)
+            if pertoken_scale is not None:
+                pertoken_scale = get_pcp_group().all_gather(pertoken_scale, dim=0)
 
         return MoEPrepareOutput(
             hidden_states=hidden_states,
@@ -417,7 +438,6 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         Returns:
             MoEPrepareOutput with global tensors.
         """
-        self.enable_shared_expert_dp = enable_shared_expert_dp
         if self.moe_config.dp_size > 1:
             max_tokens_across_dp = _EXTRA_CTX.max_tokens_across_dp
 
@@ -495,6 +515,10 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         2 Reduce_results is True usually happens when model has no shared experts. We still do reduce scatter
         here, then skip allreudce in FusedMoe.
         """
+        if self.moe_config.pcp_size > 1:
+            hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
+            hidden_states = hidden_states[: self.num_tokens_pcp]
+
         hidden_states = torch.ops.vllm.maybe_pad_and_reduce(hidden_states, True)
 
         return hidden_states
@@ -502,17 +526,18 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
     def _finalize_with_dp_group(self, hidden_states: torch.Tensor, reduce_results: bool) -> torch.Tensor:
         """
         Finalization steps:
-          1. If DP > 1 and not shared expert, reduce-scatter output across DP group.
+          1. If DP > 1, reduce-scatter routed output across DP group.
           2. Slice to original local token count.
           3. If `reduce_results=True` and TP/EP > 1, apply tensor_model_parallel_all_reduce.
 
         Returns:
             Tensor with shape [original_local_num_tokens, hidden_size]
         """
-        if self.moe_config.dp_size > 1 and not self.enable_shared_expert_dp:
-            hidden_states = get_dp_group().reduce_scatter(hidden_states, 0)
-            hidden_states = hidden_states[: self.num_tokens]
-
         if self.moe_config.pcp_size > 1:
             hidden_states = get_pcp_group().reduce_scatter(hidden_states, dim=0)
+            hidden_states = hidden_states[: self.num_tokens_pcp]
+
+        if self.moe_config.dp_size > 1:
+            hidden_states = get_dp_group().reduce_scatter(hidden_states, 0)
+            hidden_states = hidden_states[: self.num_tokens]
         return hidden_states

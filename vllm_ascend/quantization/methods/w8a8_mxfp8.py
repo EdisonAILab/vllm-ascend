@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 import torch_npu
 from vllm.config import CompilationMode, get_current_vllm_config
-from vllm.distributed import get_ep_group
+from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -32,7 +32,6 @@ from vllm_ascend.device.mxfp_compat import (
     ensure_mxfp8_linear_available,
     ensure_mxfp8_moe_available,
 )
-from vllm_ascend.flash_common3_context import get_flash_common3_context
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 
@@ -70,17 +69,22 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
     def apply(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        # reshape x for Qwen VL models
-        original_shape = x.shape
-        if x.dim() > 2:
-            x = x.view(-1, x.shape[-1])
-        quantized_x, dynamic_scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
-        pertoken_scale = dynamic_scale
-        output_dtype = x.dtype
+        if isinstance(x, tuple):
+            quantized_x, pertoken_scale = x
+            original_shape = quantized_x.shape
+            output_dtype = torch.bfloat16
+        else:
+            # reshape x for Qwen VL models
+            original_shape = x.shape
+            if x.dim() > 2:
+                x = x.view(-1, x.shape[-1])
+            quantized_x, pertoken_scale = torch_npu.npu_dynamic_mx_quant(x, dst_type=torch.float8_e4m3fn)
+            output_dtype = x.dtype
+
         if bias is not None and bias.dtype != torch.float32:
             bias = bias.to(torch.float32)
 
@@ -112,6 +116,12 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         this method stores original shapes and can be called multiple times safely.
         Use restore_weights_for_rl_loading() before weight reload, then call this
         method again after loading.
+
+        Address stability for ACL graph:
+        The transformed buffer is what the ACL graph captures and replays. It is
+        allocated once and cached on the layer; subsequent calls copy the
+        (re)loaded original-shape data in place into the cached buffer so its
+        data_ptr never changes across RL weight reloads.
         """
 
         # Check if already transformed to avoid double transformation
@@ -129,12 +139,23 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         n_dim, k_dim = layer.weight_scale.data.shape
         # Shape should be padded if it cannot be divided by 2
         if layer.weight_scale.data.shape[-1] % 2 != 0:
-            layer.weight_scale.data = F.pad(layer.weight_scale.data, (0, 1), mode="constant", value=0)
-            layer.weight_scale.data = layer.weight_scale.data.reshape(n_dim, k_dim // 2 + 1, 2)
+            reshaped_scale = F.pad(layer.weight_scale.data, (0, 1), mode="constant", value=0)
+            reshaped_scale = reshaped_scale.reshape(n_dim, k_dim // 2 + 1, 2)
         else:
-            layer.weight_scale.data = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
-        layer.weight.data = layer.weight.data.transpose(0, 1)
-        layer.weight_scale.data = layer.weight_scale.data.transpose(0, 1)
+            reshaped_scale = layer.weight_scale.data.reshape(n_dim, k_dim // 2, 2)
+        target_scale = reshaped_scale.transpose(0, 1)
+
+        if not hasattr(layer, "_mxfp8_weight_buf"):
+            # First call: allocate the persistent transformed buffers.
+            layer._mxfp8_weight_buf = layer.weight.data.transpose(0, 1).contiguous()
+            layer._mxfp8_scale_buf = target_scale.contiguous()
+        else:
+            # Subsequent calls (RL reload path): copy in place to keep data_ptr stable.
+            layer._mxfp8_weight_buf.copy_(layer.weight.data.transpose(0, 1).contiguous())
+            layer._mxfp8_scale_buf.copy_(target_scale.contiguous())
+
+        layer.weight.data = layer._mxfp8_weight_buf
+        layer.weight_scale.data = layer._mxfp8_scale_buf
 
         # Mark as transformed
         layer._mxfp8_transformed = True
@@ -159,10 +180,13 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
             return
 
         if not hasattr(layer, "_mxfp8_original_shapes"):
-            raise RuntimeError(
-                "Cannot restore weights: original shapes not recorded. "
+            err_msg = (
+                "[vllm-ascend/W8A8_MXFP8] Cannot restore weights: original "
+                "shapes not recorded. "
                 "This should not happen if process_weights_after_loading was called first."
             )
+            logger.error(err_msg)
+            raise RuntimeError(err_msg)
 
         orig_shapes = layer._mxfp8_original_shapes
         orig_scale_shape = orig_shapes["weight_scale"]
@@ -176,7 +200,7 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         # Current shape: (k_dim//2, n_dim, 2)
         # Target shape: (n_dim, k_dim)
         target_scale = layer.weight_scale.data.transpose(0, 1).reshape(orig_scale_shape).contiguous()
-        layer.weight_scale.data = layer.weight_scale.data.transpose(0, 1).view(orig_scale_shape)
+        layer.weight_scale.data = layer.weight_scale.data.transpose(0, 1).reshape(orig_scale_shape)
         layer.weight_scale.data.copy_(target_scale)
 
         # Mark as not transformed (ready for weight loading)
@@ -185,14 +209,13 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
 
 @register_scheme("W8A8_MXFP8", "moe")
 class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
-    """FusedMoe method for Ascend W8A8_DYNAMIC."""
+    """FusedMoe method for Ascend W8A8_MXFP8."""
 
     model_dtype = None
-    quant_type: QuantType = QuantType.MXFP8
+    quant_type: QuantType = QuantType.W8A8MXFP
 
     def __init__(self):
         ensure_mxfp8_moe_available("W8A8_MXFP8 MoE quantization")
-        self.ep_group = get_ep_group()
 
         vllm_config = get_current_vllm_config()
         self.group_size = vllm_config.quant_config.quant_description.get("group_size", 32)
@@ -202,7 +225,6 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             and not vllm_config.model_config.enforce_eager
         )
         self.dynamic_eplb = ascend_config.eplb_config.dynamic_eplb
-        self.multistream_overlap_gate = ascend_config.multistream_overlap_gate
 
     @staticmethod
     def get_weight(
@@ -266,27 +288,21 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             num_shared_experts=num_shared_experts,
         )
         assert router_logits.shape[1] == num_logical_experts, "Number of global experts mismatch (excluding redundancy)"
-        if self.multistream_overlap_gate:
-            fc3_context = get_flash_common3_context()
-            assert fc3_context is not None
-            topk_weights = fc3_context.topk_weights
-            topk_ids = fc3_context.topk_ids
-        else:
-            topk_weights, topk_ids = select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                top_k=top_k,
-                use_grouped_topk=use_grouped_topk,
-                renormalize=renormalize,
-                topk_group=topk_group,
-                num_expert_group=num_expert_group,
-                custom_routing_function=custom_routing_function,
-                scoring_func=scoring_func,
-                routed_scaling_factor=routed_scaling_factor,
-                e_score_correction_bias=e_score_correction_bias,
-                num_experts=num_logical_experts,
-                tid2eid=tid2eid,
-            )
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+            num_experts=num_logical_experts,
+            tid2eid=tid2eid,
+        )
 
         if topk_weights is None or topk_ids is None:
             raise RuntimeError("topk_weights and topk_ids must be set before fused MoE execution.")
@@ -392,10 +408,13 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
             return
 
         if not hasattr(layer, "_mxfp8_original_shapes"):
-            raise RuntimeError(
-                "Cannot restore weights: original shapes not recorded. "
+            err_msg = (
+                "[vllm-ascend/W8A8_MXFP8] Cannot restore weights: original "
+                "shapes not recorded. "
                 "This should not happen if process_weights_after_loading was called first."
             )
+            logger.error(err_msg)
+            raise RuntimeError(err_msg)
 
         orig_shapes = layer._mxfp8_original_shapes
 

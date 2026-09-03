@@ -47,6 +47,8 @@ class TestAscendW8A8MXFP8LinearMethod(TestBase):
         self.assertEqual(layer._mxfp8_original_shapes["weight"], (128, 256))
         self.assertTrue(layer._mxfp8_transformed)
         self.assertEqual(layer.weight_scale.shape, (4, 128, 2))
+        self.assertTrue(layer.weight.data.is_contiguous())
+        self.assertTrue(layer.weight_scale.data.is_contiguous())
 
     def test_restore_after_process_returns_original_shape(self):
         layer = nn.Module()
@@ -59,6 +61,43 @@ class TestAscendW8A8MXFP8LinearMethod(TestBase):
         self.assertEqual(layer.weight.shape, original_weight_shape)
         self.assertEqual(layer.weight_scale.shape, original_scale_shape)
         self.assertFalse(layer._mxfp8_transformed)
+
+    def test_transform_buffer_data_ptr_stable_across_reloads(self):
+        # The transformed buffer is what the ACL graph captures and replays.
+        # It must keep a stable data_ptr across RL weight reloads so graph
+        # replay never reads stale/freed memory and produces garbled output.
+        # The transformed weight/scale must also stay contiguous, since ACL
+        # graph capture expects contiguous weight/scale tensors.
+        layer = nn.Module()
+        layer.weight = nn.Parameter(
+            torch.randint(0, 255, (128, 256), dtype=torch.uint8).to(torch.float8_e4m3fn), requires_grad=False
+        )
+        layer.weight_scale = nn.Parameter(torch.randint(0, 255, (128, 8), dtype=torch.uint8), requires_grad=False)
+        self.scheme.process_weights_after_loading(layer)
+        transform_weight_ptr = layer._mxfp8_weight_buf.data_ptr()
+        transform_scale_ptr = layer._mxfp8_scale_buf.data_ptr()
+        # Buffers and the weight/scale views over them must be contiguous.
+        self.assertTrue(layer._mxfp8_weight_buf.is_contiguous())
+        self.assertTrue(layer._mxfp8_scale_buf.is_contiguous())
+        self.assertTrue(layer.weight.data.is_contiguous())
+        self.assertTrue(layer.weight_scale.data.is_contiguous())
+        for _ in range(3):
+            self.scheme.restore_weights_for_rl_loading(layer)
+            # Simulate model.load_weights() writing new data via copy_.
+            new_w = torch.randint(0, 255, layer.weight.shape, dtype=torch.uint8).to(torch.float8_e4m3fn)
+            new_s = torch.randint(0, 255, layer.weight_scale.shape, dtype=torch.uint8)
+            layer.weight.data.copy_(new_w)
+            layer.weight_scale.data.copy_(new_s)
+            self.scheme.process_weights_after_loading(layer)
+            self.assertEqual(layer._mxfp8_weight_buf.data_ptr(), transform_weight_ptr)
+            self.assertEqual(layer._mxfp8_scale_buf.data_ptr(), transform_scale_ptr)
+            self.assertEqual(layer.weight.data.data_ptr(), transform_weight_ptr)
+            self.assertEqual(layer.weight_scale.data.data_ptr(), transform_scale_ptr)
+            # Contiguity must be preserved across reloads.
+            self.assertTrue(layer._mxfp8_weight_buf.is_contiguous())
+            self.assertTrue(layer._mxfp8_scale_buf.is_contiguous())
+            self.assertTrue(layer.weight.data.is_contiguous())
+            self.assertTrue(layer.weight_scale.data.is_contiguous())
 
     @patch("vllm_ascend.quantization.methods.w8a8_mxfp8.torch_npu")
     def test_apply(self, mock_torch_npu):
@@ -90,13 +129,11 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
     intermediate_size = 256
 
     @patch("vllm_ascend.quantization.methods.w8a8_mxfp8.ensure_mxfp8_moe_available")
-    @patch("vllm_ascend.quantization.methods.w8a8_mxfp8.get_ep_group")
     @patch("vllm_ascend.quantization.methods.w8a8_mxfp8.get_current_vllm_config")
     @patch("vllm_ascend.quantization.methods.w8a8_mxfp8.get_ascend_config")
-    def setUp(self, mock_ascend, mock_vllm, mock_ep, mock_ensure):
+    def setUp(self, mock_ascend, mock_vllm, mock_ensure):
         mock_vllm.return_value = create_mock_vllm_config()
         mock_ascend.return_value = create_mock_ascend_config()
-        mock_ep.return_value = Mock()
         mock_ensure.return_value = None
         self.scheme = AscendW8A8MXFP8DynamicFusedMoEMethod()
 
@@ -122,6 +159,10 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
         self.assertTrue(hasattr(layer, "_mxfp8_original_shapes"))
         self.assertIn("w13_weight", layer._mxfp8_original_shapes)
         self.assertEqual(layer.w13_weight.shape, (original_shape[0], original_shape[2], original_shape[1]))
+        self.assertFalse(layer.w13_weight.data.is_contiguous())
+        self.assertFalse(layer.w2_weight.data.is_contiguous())
+        self.assertFalse(layer.w13_weight_scale.data.is_contiguous())
+        self.assertFalse(layer.w2_weight_scale.data.is_contiguous())
 
     def test_restore_weights_for_rl_loading(self):
         layer = create_mxfp_moe_layer(

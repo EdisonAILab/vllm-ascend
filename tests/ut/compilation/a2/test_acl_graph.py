@@ -12,7 +12,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-
+import weakref
 from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
@@ -22,19 +22,59 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import BatchDescriptor, ForwardContext
 
 from tests.ut.base import TestBase
-from vllm_ascend.attention.attention_v1 import AscendMetadata, AscendMetadataForDecode
-from vllm_ascend.attention.context_parallel.attention_cp import AscendAttentionCPImpl
-from vllm_ascend.attention.context_parallel.mla_cp import AscendMlaCPImpl
-from vllm_ascend.attention.mla_v1 import AscendMLADecodeMetadata, AscendMLAMetadata
+from vllm_ascend.attention.context_parallel.attention_cp import (
+    AscendAttentionDCPImpl,
+    AscendAttentionDCPMetadata,
+    AscendMetadataForDecode,
+)
+from vllm_ascend.attention.context_parallel.mla_cp import (
+    AscendMLADCPDecodeMetadata,
+    AscendMlaDCPImpl,
+)
+from vllm_ascend.attention.mla_v1 import AscendMLAMetadata
+from vllm_ascend.compilation import acl_graph
 from vllm_ascend.compilation.acl_graph import (
     ACLGraphEntry,
     ACLGraphWrapper,
+    GraphParams,
     get_draft_graph_params,
     get_graph_params,
     set_draft_graph_params,
     set_graph_params,
     update_draft_graph_params_workspaces,
+    update_full_graph_params,
 )
+from vllm_ascend.device_allocator.sleep_mem_optimized import AclGraphSleepWakeupManager
+
+
+def test_update_full_graph_params_dispatches_draft_metadata_by_keyword():
+    impl_cls = MagicMock()
+    attn_backend = MagicMock()
+    attn_backend.get_impl_cls.return_value = impl_cls
+    update_stream = MagicMock()
+    forward_context = MagicMock()
+    vllm_config = MagicMock()
+    speculative_config = MagicMock()
+    draft_attn_metadatas = MagicMock()
+
+    update_full_graph_params(
+        attn_backend,
+        update_stream,
+        forward_context,
+        8,
+        vllm_config,
+        speculative_config,
+        draft_attn_metadatas=draft_attn_metadatas,
+    )
+
+    impl_cls.update_graph_params.assert_called_once_with(
+        update_stream,
+        forward_context,
+        8,
+        vllm_config,
+        speculative_config,
+        draft_attn_metadatas=draft_attn_metadatas,
+    )
 
 
 class TestACLGraphEntry(TestBase):
@@ -758,6 +798,51 @@ class TestACLGraphWrapper(TestBase):
         unwrapped = wrapper.unwrap()
         self.assertEqual(unwrapped, self.mock_runnable)
 
+    def test_acl_graph_wrappers_use_weak_refs(self):
+        self.assertIsInstance(acl_graph._acl_graph_wrappers, weakref.WeakSet)
+
+
+class TestSleepGraphParams(TestBase):
+    def test_clear_attention_workspaces_preserves_capture_size_keys(self):
+        graph_params = GraphParams(
+            events={4: [], 8: []},
+            workspaces={4: torch.empty(1), 8: torch.empty(2)},
+            handles={4: [], 8: []},
+            attn_params={4: [], 8: []},
+        )
+
+        with (
+            patch("vllm_ascend.compilation.acl_graph._graph_params", graph_params),
+            patch("vllm_ascend.compilation.acl_graph._draft_graph_params", None),
+            patch("vllm_ascend.compilation.acl_graph._draft_graph_prefill_params", None),
+        ):
+            AclGraphSleepWakeupManager.clear_all_attention_workspaces()
+
+        self.assertEqual(set(graph_params.workspaces), {4, 8})
+        self.assertIsNone(graph_params.workspaces[4])
+        self.assertIsNone(graph_params.workspaces[8])
+
+    def test_reset_graph_params_for_sleep_clears_registered_wrappers(self):
+        wrapper = MagicMock()
+        wrapper.concrete_aclgraph_entries = {"entry": object()}
+        wrapper.first_run_finished = True
+        empty_params = GraphParams(
+            events={},
+            workspaces={},
+            handles={},
+            attn_params={},
+        )
+        with (
+            patch("vllm_ascend.compilation.acl_graph._graph_params", empty_params),
+            patch("vllm_ascend.compilation.acl_graph._draft_graph_params", empty_params),
+            patch("vllm_ascend.compilation.acl_graph._draft_graph_prefill_params", empty_params),
+            patch("vllm_ascend.compilation.acl_graph._acl_graph_wrappers", [wrapper]),
+        ):
+            AclGraphSleepWakeupManager.reset_all_graph_params()
+
+        self.assertEqual(wrapper.concrete_aclgraph_entries, {})
+        self.assertFalse(wrapper.first_run_finished)
+
 
 class TestDraftGraphParams(TestBase):
     def test_set_draft_graph_params(self):
@@ -779,7 +864,7 @@ class TestDraftGraphParams(TestBase):
         self.assertIs(draft_graph_params_mock, graph_params)
 
 
-class TestPCPDCPGraphParams(TestBase):
+class TestDCPGraphParams(TestBase):
     def setUp(self):
         self.update_stream = MagicMock(name="FakeStream")
         import vllm_ascend.compilation.acl_graph as acl_graph_mod
@@ -810,7 +895,7 @@ class TestPCPDCPGraphParams(TestBase):
     )
     @patch("torch.npu.graph_task_update_begin", MagicMock())
     @patch("torch_npu.npu_fused_infer_attention_score.out", MagicMock())
-    def test_update_mla_dcp_pcp_params(self, _mock_graph_task_end, mock_context):
+    def test_update_mla_dcp_params(self, _mock_graph_task_end, mock_context):
         input_positions = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8])
         block_table = torch.zeros(2, 5, dtype=torch.long)
         seq_lens = torch.tensor([4, 4])
@@ -821,11 +906,17 @@ class TestPCPDCPGraphParams(TestBase):
         query_start_loc = torch.tensor([0, 4])
         block_tables = torch.zeros(2, 5, dtype=torch.long)
 
-        decode = AscendMLADecodeMetadata(
-            input_positions, block_table, seq_lens, max_seq_lens, seq_lens_list, cp_seq_len=cp_seq_len
+        decode = AscendMLADCPDecodeMetadata(
+            input_positions=input_positions,
+            block_table=block_table,
+            seq_lens=seq_lens,
+            seq_lens_device=seq_lens,
+            max_seq_lens=max_seq_lens,
+            seq_lens_list=seq_lens_list,
+            cp_seq_len=cp_seq_len,
         )
         metadata = AscendMLAMetadata(
-            8, 8, slot_mapping, query_start_loc, seq_lens, seq_lens, block_tables, 4, 4, 0, decode=decode
+            8, slot_mapping, query_start_loc, seq_lens, seq_lens, block_tables, 4, 4, 0, decode=decode
         )
         forward_context = MagicMock()
         forward_context.attn_metadata = {"attn_layer_0": metadata}
@@ -871,7 +962,7 @@ class TestPCPDCPGraphParams(TestBase):
         )
 
         with patch("torch_npu._C._npu_setStream", return_value=None):
-            AscendMlaCPImpl.update_graph_params(self.update_stream, forward_context, 4)
+            AscendMlaDCPImpl.update_graph_params(self.update_stream, forward_context, 4)
 
         _mock_graph_task_end.assert_called_once()
 
@@ -881,7 +972,7 @@ class TestPCPDCPGraphParams(TestBase):
     )
     @patch("torch.npu.graph_task_update_begin", MagicMock())
     @patch("torch_npu.npu_fused_infer_attention_score.out", MagicMock())
-    def test_update_attn_dcp_pcp_params(self, _mock_graph_task_end, mock_context):
+    def test_update_attn_dcp_params(self, _mock_graph_task_end, mock_context):
         block_table = torch.zeros(2, 5, dtype=torch.long)
         num_heads = 256
         scale = 0.1
@@ -896,10 +987,10 @@ class TestPCPDCPGraphParams(TestBase):
         out = torch.randn(2, 16, 128)
         lse = torch.randn(2, 16, 8)
 
-        num_computed_tokens_of_pcp_dcp = np.array([[[1, 1], [1, 1]], [[1, 1], [1, 1]]])
-        decode = AscendMetadataForDecode(num_computed_tokens_of_pcp_dcp)
-        metadata = AscendMetadata(
-            num_actual_tokens_pcp_padded=[1, 1],
+        num_computed_tokens_of_dcp = np.array([[1, 1], [1, 1]])
+        decode = AscendMetadataForDecode(num_computed_tokens_of_dcp)
+        metadata = AscendAttentionDCPMetadata(
+            num_actual_tokens=2,
             actual_seq_lengths_q=actual_seq_lengths_q,
             num_decode_tokens=1,
             decode_meta=decode,
@@ -926,11 +1017,11 @@ class TestPCPDCPGraphParams(TestBase):
                 lse,
                 2,
                 0,
-                0,
+                None,
             )
         )
 
         with patch("torch_npu._C._npu_setStream", return_value=None):
-            AscendAttentionCPImpl.update_graph_params(self.update_stream, forward_context, 4, None)
+            AscendAttentionDCPImpl.update_graph_params(self.update_stream, forward_context, 4, None)
 
         _mock_graph_task_end.assert_called_once()

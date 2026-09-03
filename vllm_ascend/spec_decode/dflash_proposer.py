@@ -8,7 +8,7 @@ from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
-from vllm_ascend.ops.triton.spec_decode.utils import copy_and_expand_dflash_inputs_kernel_single_grid
+from vllm_ascend.ops.triton.spec_decode.utils import copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 
 
@@ -28,7 +28,7 @@ class AscendDflashProposer(AscendEagleProposer):
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
         self.max_positions = self.max_num_tokens + self.max_query_tokens
 
-        self._context_slot_mapping_buffer = torch.zeros(
+        self._context_slot_mapping_buffers = torch.zeros(
             self.max_num_tokens,
             dtype=torch.int32,
             device=device,
@@ -92,15 +92,16 @@ class AscendDflashProposer(AscendEagleProposer):
 
         has_num_rejected = num_rejected_tokens_gpu is not None
 
-        copy_and_expand_dflash_inputs_kernel_single_grid[1,](
+        copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid[1,](
             # Inputs
             next_token_ids_ptr=next_token_ids,
             target_positions_ptr=target_positions,
+            context_slot_mapping_ptr=cad.slot_mapping,
             # Outputs
             out_input_ids_ptr=self.input_ids,
             out_context_positions_ptr=self._context_positions_buffer,
             out_query_positions_ptr=self.positions,
-            out_context_slot_mapping_ptr=self._context_slot_mapping_buffer,
+            out_context_slot_mapping_ptr=self._context_slot_mapping_buffers,
             out_query_slot_mapping_ptr=self._slot_mapping_buffer,
             out_token_indices_ptr=token_indices_to_sample,
             # Block table
@@ -108,6 +109,7 @@ class AscendDflashProposer(AscendEagleProposer):
             block_table_stride=cad.block_table_tensor.stride(0),
             # Metadata
             query_start_loc_ptr=cad.query_start_loc,
+            seq_lens_ptr=cad.seq_lens,
             num_rejected_tokens_ptr=(num_rejected_tokens_gpu if has_num_rejected else 0),
             # Scalars
             parallel_drafting_token_id=self.parallel_drafting_token_id,
@@ -167,6 +169,8 @@ class AscendDflashProposer(AscendEagleProposer):
             _,
         ) = self.runner._sync_metadata_across_dp(num_query_tokens, is_draft_model=True)
 
+        if not self.use_cuda_graph:
+            aclgraph_runtime_mode = CUDAGraphMode.NONE
         num_query_per_req = 1 + self.num_speculative_tokens
         num_query_total = num_reqs * num_query_per_req
 
@@ -189,6 +193,7 @@ class AscendDflashProposer(AscendEagleProposer):
                 slot_mapping=self._slot_mapping_buffer[:num_query_total],
                 attn_state=AscendAttentionState.ChunkedPrefill,
                 causal=False,
+                is_prefilling=torch.zeros(num_reqs, dtype=torch.bool),
                 block_table_tensor=self.runner.input_batch.block_table[self.kv_cache_gid].get_device_tensor()[
                     :num_reqs
                 ],
@@ -207,6 +212,8 @@ class AscendDflashProposer(AscendEagleProposer):
                 per_layer_attn_metadata[layer_name] = attn_metadata_dflash
             multi_steps_attn_metadata.append(per_layer_attn_metadata)
 
+        self.token_indices_to_sample.fill_(0)
+
         with set_ascend_forward_context(
             multi_steps_attn_metadata[0] if multi_steps_attn_metadata else None,
             self.vllm_config,
@@ -222,8 +229,8 @@ class AscendDflashProposer(AscendEagleProposer):
             if is_profile:
                 self.model.precompute_and_store_context_kv(context_states, context_positions)
                 self.model(
-                    input_ids=self.input_ids[:num_query_total],
-                    positions=self._get_positions(num_query_total),
+                    input_ids=self.input_ids[:num_input_tokens],
+                    positions=self._get_positions(num_input_tokens),
                     inputs_embeds=None,
                 )
 
@@ -246,17 +253,21 @@ class AscendDflashProposer(AscendEagleProposer):
     def build_model_inputs_first_pass(
         self,
         num_input_tokens: int,
-    ) -> dict[str, Any]:
+        _context_slots: torch.Tensor | list[torch.Tensor],
+    ) -> None:
         num_context = self._dflash_num_context
+
+        if _context_slots is None:
+            _context_slots = None
+        elif isinstance(_context_slots, list):
+            _context_slots = [_one_context_slots[:num_context] for _one_context_slots in _context_slots]
+        else:
+            _context_slots = _context_slots[:num_context]
 
         self.model.precompute_and_store_context_kv(
             self._dflash_hidden_states[:num_context],
             self._context_positions_buffer[:num_context],
-            self._context_slot_mapping_buffer[:num_context],
-        )
-
-        return dict(
-            input_ids=self.input_ids[:num_input_tokens], positions=self.positions[:num_input_tokens], inputs_embeds=None
+            _context_slots,
         )
 
     def _raise_if_multimodal(self):

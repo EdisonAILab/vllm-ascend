@@ -118,6 +118,9 @@ def get_chip_type() -> str:
         elif "950" in chip_name:
             assert npu_name
             return (chip_name + "_" + npu_name).lower()
+        elif "a2g3" in chip_name.lower():
+            # A2 case: CH version of the HDK
+            return "ascend910b1"
         else:
             raise ValueError(f"Unable to recognize chip name: {chip_name}, please manually set env SOC_VERSION")
     except subprocess.CalledProcessError as e:
@@ -520,10 +523,10 @@ setup(
     project_urls={
         "Homepage": "https://github.com/vllm-project/vllm-ascend",
     },
-    # TODO: Add 3.12 back when torch-npu support 3.12
     classifiers=[
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
         "License :: OSI Approved :: Apache Software License",
         "Intended Audience :: Developers",
         "Intended Audience :: Information Technology",

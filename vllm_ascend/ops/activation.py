@@ -15,28 +15,93 @@
 # This file is a part of the vllm-ascend project.
 #
 
-import torch
-from vllm.model_executor.layers.activation import QuickGELU, SiluAndMul, SwigluOAIAndMul
+from dataclasses import dataclass
 
-from vllm_ascend.utils import get_weight_prefetch_method
+import torch
+import torch_npu
+from torch import nn
+from vllm.model_executor.layers.activation import (
+    QuickGELU,
+    SiluAndMul,
+    SiluAndMulWithClamp,
+    SwigluOAIAndMul,
+    SwigluStepAndMul,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SituActivationConfig:
+    """Runtime parameters for Kimi's SiTU gated activation."""
+
+    beta: float = 1.0
+    linear_beta: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.beta <= 0:
+            raise ValueError(f"SiTU beta must be positive, got {self.beta}.")
+        if self.linear_beta is not None and self.linear_beta <= 0:
+            raise ValueError(f"SiTU linear_beta must be positive, got {self.linear_beta}.")
+
+
+def situ_and_mul(
+    x: torch.Tensor,
+    *,
+    beta: float = 1.0,
+    linear_beta: float | None = None,
+) -> torch.Tensor:
+    """Apply Kimi SiTU with FP32 intermediates and restore the input dtype."""
+    config = SituActivationConfig(beta=beta, linear_beta=linear_beta)
+    if x.shape[-1] % 2 != 0:
+        raise ValueError(f"SiTU expects an even last dimension, got {x.shape[-1]}.")
+
+    gate, up = x.to(torch.float32).chunk(2, dim=-1)
+    gate = config.beta * torch.tanh(gate / config.beta) * torch.sigmoid(gate)
+    if config.linear_beta is not None:
+        up = config.linear_beta * torch.tanh(up / config.linear_beta)
+    return (gate * up).to(x.dtype)
+
+
+class AscendSituAndMul(nn.Module):
+    """Module form of Kimi SiTU used by dense and shared-expert MLPs."""
+
+    def __init__(self, beta: float = 1.0, linear_beta: float | None = None) -> None:
+        super().__init__()
+        self.config = SituActivationConfig(beta=beta, linear_beta=linear_beta)
+
+    @property
+    def beta(self) -> float:
+        return self.config.beta
+
+    @property
+    def linear_beta(self) -> float | None:
+        return self.config.linear_beta
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return situ_and_mul(x, beta=self.beta, linear_beta=self.linear_beta)
+
+    def extra_repr(self) -> str:
+        return f"beta={self.beta}, linear_beta={self.linear_beta}"
 
 
 class AscendQuickGELU(QuickGELU):
     def forward_oot(self, x: torch.tensor) -> torch.Tensor:
-        import torch_npu
-
         out = torch_npu.npu_fast_gelu(x)
         return out
 
 
 class AscendSiluAndMul(SiluAndMul):
     def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
-        import torch_npu
-
-        weight_prefetch_method = get_weight_prefetch_method()
-        weight_prefetch_method.maybe_prefetch_mlp_weight_preprocess(weight_prefetch_method.MLP_DOWN, x)
         out = torch_npu.npu_swiglu(x)
-        weight_prefetch_method.maybe_prefetch_mlp_weight_postprocess(out)
+        return out
+
+
+class AscendSiluAndMulWithClamp(SiluAndMulWithClamp):
+    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        gate = torch.clamp(x[..., :d], max=self.swiglu_limit)
+        up = torch.clamp(x[..., d:], min=-self.swiglu_limit, max=self.swiglu_limit)
+        x = torch.cat([gate, up], dim=-1)
+        out = torch_npu.npu_swiglu(x)
         return out
 
 
@@ -49,3 +114,30 @@ class AscendSwigluOAIAndMul:
 
         layer = MinimalSwigluOAIAndMul()
         return SwigluOAIAndMul.forward_native(layer, x)
+
+
+class AscendSwigluStepAndMul:
+    def swiglustep_forward(x: torch.Tensor, limit: float = 7.0) -> torch.Tensor:
+        if limit is None:
+            raise ValueError("SwigluStepAndMul requires limit to be set.")
+
+        # Triton fused path: 1D-grid row-loop kernel that fuses
+        # silu + clamp + mul into a single launch (see
+        # vllm_ascend/ops/triton/activation/swiglustep.py). Numerically
+        # equivalent to forward_native below.
+        from vllm.triton_utils import HAS_TRITON
+
+        if HAS_TRITON:
+            from vllm_ascend.ops.triton.activation.swiglustep import (
+                swiglustep_forward_triton,
+            )
+
+            return swiglustep_forward_triton(x, limit)
+
+        # Fallback when triton is unavailable: vllm's native silu+clamp+mul.
+        class MinimalSwigluStepAndMul:
+            def __init__(self):
+                self.limit = limit
+
+        layer = MinimalSwigluStepAndMul()
+        return SwigluStepAndMul.forward_native(layer, x)

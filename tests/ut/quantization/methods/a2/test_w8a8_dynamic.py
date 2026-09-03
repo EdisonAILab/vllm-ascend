@@ -99,11 +99,9 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
     @patch("torch.distributed.get_rank")
     @patch("vllm_ascend.quantization.methods.w8a8_dynamic.get_mc2_group")
     @patch("vllm_ascend.quantization.methods.w8a8_dynamic.get_ascend_config")
-    @patch("vllm_ascend.quantization.methods.w8a8_dynamic.get_ep_group")
-    def setUp(self, mock_ep, mock_ascend, mock_mc2, mock_rank):
+    def setUp(self, mock_ascend, mock_mc2, mock_rank):
         with patch("vllm_ascend.quantization.methods.w8a8_dynamic.get_current_vllm_config") as mock_vllm:
             mock_vllm.return_value = create_mock_vllm_config()
-            mock_ep.return_value = Mock()
             mock_ascend.return_value = create_mock_ascend_config()
             mock_mc2.return_value = MagicMock(
                 device_group=Mock(
@@ -165,7 +163,6 @@ class TestAscendW8A8FusedMoEMethod(TestBase):
         mock_comm.fused_experts.return_value = torch.randn(tokens, hidden_size, dtype=torch.float32)
         mock_extra_ctx.moe_comm_method = mock_comm
         mock_extra_ctx.moe_comm_type = MoECommType.ALLGATHER
-        self.quant_method.multistream_overlap_gate = False
         self.quant_method.in_dtype = torch.float32
 
         self.quant_method.apply(

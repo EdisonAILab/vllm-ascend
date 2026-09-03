@@ -21,12 +21,11 @@ from typing import Any
 import torch
 import torch_npu
 from vllm.config import CompilationMode, get_current_vllm_config
-from vllm.distributed import get_ep_group
+from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType, use_cann_megamoe
 from vllm_ascend.distributed.parallel_state import get_mc2_group
-from vllm_ascend.flash_common3_context import get_flash_common3_context
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, enable_dsa_cp, maybe_trans_nz
@@ -53,6 +52,8 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
     and per-channel quantization for weights.
     """
 
+    act_quant_type: torch.dtype = torch.int8
+
     def __init__(self):
         pass
 
@@ -77,7 +78,7 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
         bias: torch.Tensor | None = None,
         tp_rank: int | None = 0,
     ) -> torch.Tensor:
-        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
+        quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x, dst_type=self.act_quant_type)
         need_unsqz = False
         if pertoken_scale.dim() == 2:
             need_unsqz = True
@@ -115,7 +116,7 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
                 layer.weight,
                 layer.weight_scale,
                 pertoken_scale=pertoken_scale,
-                bias=bias,
+                bias=bias if self.act_quant_type == torch.int8 else None,
                 output_dtype=x.dtype,
             )
         if need_unsqz:
@@ -143,7 +144,8 @@ class AscendW8A8DynamicLinearMethod(AscendLinearScheme):
             del layer.weight_offset
         else:
             # cast quantized weight tensors in NZ format for higher inference speed
-            layer.weight.data = maybe_trans_nz(layer.weight.data)
+            if self.act_quant_type == torch.int8:
+                layer.weight.data = maybe_trans_nz(layer.weight.data)
             layer.weight_scale.data = layer.weight_scale.data.flatten()
             layer.weight_scale_fp32 = layer.weight_scale.data.to(torch.float32)
             layer.weight_offset.data = layer.weight_offset.data.flatten()
@@ -157,16 +159,12 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
     quant_type: QuantType = QuantType.W8A8
 
     def __init__(self):
-        self.ep_group = get_ep_group()
-
         vllm_config = get_current_vllm_config()
         ascend_config = get_ascend_config()
         self.use_aclgraph = (
             vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE
             and not vllm_config.model_config.enforce_eager
         )
-        self.multistream_overlap_gate = ascend_config.multistream_overlap_gate
-
         self.dynamic_eplb = ascend_config.eplb_config.dynamic_eplb
         self.in_dtype = vllm_config.model_config.dtype
         self.supports_eplb = True
@@ -178,6 +176,10 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             backend = device_group._get_backend(torch.device("npu"))
             self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
         except AttributeError:
+            logger.warning_once(
+                "[vllm-ascend/W8A8_DYNAMIC] MC2 group metadata unavailable, "
+                "falling back to empty moe_all_to_all_group_name."
+            )
             self.moe_all_to_all_group_name = ""
 
     def get_weight(
@@ -246,33 +248,32 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         )
         if zero_expert_num == 0 or zero_expert_type is None:
             assert router_logits.shape[1] == num_logical_experts, (
-                "Number of global experts mismatch (excluding redundancy)"
+                "[vllm-ascend/W8A8_DYNAMIC] Number of global experts mismatch "
+                "(excluding redundancy). "
+                f"router_experts={router_logits.shape[1]}, "
+                f"expected_experts={num_logical_experts}, "
+                f"zero_expert_num={zero_expert_num}, "
+                f"zero_expert_type={zero_expert_type}"
             )
 
-        if self.multistream_overlap_gate:
-            fc3_context = get_flash_common3_context()
-            assert fc3_context is not None
-            topk_weights = fc3_context.topk_weights
-            topk_ids = fc3_context.topk_ids
-        else:
-            topk_weights, topk_ids = select_experts(
-                hidden_states=x,
-                router_logits=router_logits,
-                top_k=top_k,
-                use_grouped_topk=use_grouped_topk,
-                renormalize=renormalize,
-                topk_group=topk_group,
-                num_expert_group=num_expert_group,
-                custom_routing_function=custom_routing_function,
-                scoring_func=scoring_func,
-                routed_scaling_factor=routed_scaling_factor,
-                e_score_correction_bias=e_score_correction_bias,
-                mix_placement=mix_placement,
-                num_logical_experts=router_logits.shape[1],
-                num_shared_experts=n_shared_experts,
-                num_experts=num_logical_experts,
-                tid2eid=tid2eid,
-            )
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            top_k=top_k,
+            use_grouped_topk=use_grouped_topk,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+            mix_placement=mix_placement,
+            num_logical_experts=router_logits.shape[1],
+            num_shared_experts=n_shared_experts,
+            num_experts=num_logical_experts,
+            tid2eid=tid2eid,
+        )
         assert topk_ids is not None
         assert topk_weights is not None
         if zero_expert_num > 0 and zero_expert_type is not None:
@@ -293,23 +294,36 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         assert topk_weights is not None
         topk_weights = topk_weights.to(self.in_dtype)
 
+        act_name = getattr(activation, "value", activation)
         moe_comm_method = _EXTRA_CTX.moe_comm_method
         fused_scale_flag = (
-            _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2 and get_ascend_config().enable_fused_mc2 == 1
+            _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2
+            and get_ascend_config().enable_fused_mc2 == 1
+            and act_name != "swigluoai_uninterleave"
         )
         if self.dynamic_eplb:
             w1 = layer.w13_weight_list
             w1_scale = layer.fused_w1_scale_list if fused_scale_flag else layer.w13_weight_scale_fp32_list
             w2 = layer.w2_weight_list
             w2_scale = layer.fused_w2_scale_list if fused_scale_flag else layer.w2_weight_scale_list
+            w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
+            w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
+
+        elif fused_scale_flag and _EXTRA_CTX.use_mega_moe:
+            w1 = layer.cann_mega_moe_w13_weight_list
+            w1_scale = layer.cann_mega_moe_fused_w1_scale_list
+            w2 = layer.cann_mega_moe_w2_weight_list
+            w2_scale = layer.cann_mega_moe_fused_w2_scale_list
+            w1_scale_bias = None
+            w2_scale_bias = None
+
         else:
             w1 = [layer.w13_weight]
             w1_scale = [layer.fused_w1_scale] if fused_scale_flag else [layer.w13_weight_scale_fp32]
             w2 = [layer.w2_weight]
             w2_scale = [layer.fused_w2_scale] if fused_scale_flag else [layer.w2_weight_scale]
-
-        w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
-        w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
+            w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
+            w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
 
         final_hidden_states = moe_comm_method.fused_experts(
             fused_experts_input=build_fused_experts_input(
@@ -332,6 +346,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 w1_scale_bias=w1_scale_bias,
                 w2_scale_bias=w2_scale_bias,
                 swiglu_limit=layer.swiglu_limit,
+                swiglu_alpha=getattr(layer, "swiglu_alpha", 1.0),
+                swiglu_beta=getattr(layer, "swiglu_beta", 0.0),
             )
         )
         if zero_expert_num > 0 and zero_expert_type is not None:
@@ -343,8 +359,9 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
         # TODO(zzzzwwjj): Currently, `torch_npu.npu_grouped_matmul_swiglu_quant`
         # can only support weight nz.
-        layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
-        layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
+        if self.quant_type == QuantType.W8A8:
+            layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
+            layer.w2_weight.data = torch_npu.npu_format_cast(layer.w2_weight.data, ACL_FORMAT_FRACTAL_NZ)
         layer.w13_weight_scale.data = layer.w13_weight_scale.data.view(layer.w13_weight_scale.data.shape[0], -1)
         layer.w13_weight_scale_fp32 = layer.w13_weight_scale.data.to(torch.float32)
         layer.w13_weight_offset.data = layer.w13_weight_offset.data.view(layer.w13_weight_offset.data.shape[0], -1)
@@ -380,3 +397,13 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 del layer.fused_w1_scale
                 del layer.fused_w2_scale
             torch.npu.empty_cache()
+
+        elif use_cann_megamoe(get_current_vllm_config()):
+            layer.cann_mega_moe_w13_weight_list = list(layer.w13_weight.data.unbind(dim=0))
+            layer.cann_mega_moe_w2_weight_list = list(layer.w2_weight.data.unbind(dim=0))
+            layer.cann_mega_moe_fused_w1_scale_list = list(
+                layer.fused_w1_scale.view(layer.w13_weight.shape[0], -1).data.unbind(dim=0)
+            )
+            layer.cann_mega_moe_fused_w2_scale_list = list(
+                layer.fused_w2_scale.view(layer.w2_weight.shape[0], -1).data.unbind(dim=0)
+            )

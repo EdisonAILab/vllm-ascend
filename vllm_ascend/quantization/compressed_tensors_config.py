@@ -22,7 +22,7 @@ from typing import Any, Optional, cast
 import torch
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy, QuantizationType
 from vllm.logger import logger
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import MoERunner, RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
 from vllm.model_executor.layers.quantization import QUANTIZATION_METHODS, register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig, QuantizeMethodBase
@@ -38,6 +38,10 @@ from vllm_ascend.utils import COMPRESSED_TENSORS_METHOD
 from .methods import AscendLinearScheme, AscendMoEScheme
 
 
+def _is_fused_moe_layer(layer: torch.nn.Module) -> bool:
+    return isinstance(layer, (MoERunner, RoutedExperts))
+
+
 # Remove the original compressed_tensors method to replace with our implementation
 def _remove_quantization_method():
     if COMPRESSED_TENSORS_METHOD in QUANTIZATION_METHODS:
@@ -47,6 +51,7 @@ def _remove_quantization_method():
 _remove_quantization_method()
 
 QUANTIZATION_SCHEME_MAP_TYPE = dict[str, dict[str, "QuantizationArgs"] | None]
+MXFP4_PACK_QUANTIZED_FORMAT = "mxfp4-pack-quantized"
 
 
 @register_quantization_config(COMPRESSED_TENSORS_METHOD)
@@ -89,13 +94,13 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
     def _add_fused_moe_to_target_scheme_map(self):
         """
         Helper function to update target_scheme_map
-        since linear layers get fused into FusedMoE
+        since linear layers get fused into MoE modules
         targeting 'Linear' needs to also match
-        FusedMoE modules.
+        RoutedExperts modules.
         """
-        if "Linear" not in self.target_scheme_map or "FusedMoE" in self.target_scheme_map:
+        if "Linear" not in self.target_scheme_map or "RoutedExperts" in self.target_scheme_map:
             return
-        self.target_scheme_map["FusedMoE"] = self.target_scheme_map["Linear"]
+        self.target_scheme_map["RoutedExperts"] = self.target_scheme_map["Linear"]
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "AscendCompressedTensorsConfig":
@@ -167,7 +172,7 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
             logger.info_once("Using the vLLM Ascend llmcompressor Quantization now!")
             return AscendLinearMethod(linear_scheme)
 
-        if isinstance(layer, FusedMoE):
+        if _is_fused_moe_layer(layer):
             # Delayed import to avoid circular import
             from vllm_ascend.ops.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod
 
@@ -288,7 +293,11 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
                 targets=self.target_scheme_map.keys(),
                 fused_mapping=self.packed_modules_mapping,
             )
+            if matched_target is None:
+                return None
             scheme_dict = self.target_scheme_map[matched_target]
+            if scheme_dict is None:
+                return None
             if scheme_dict.get("format") is None:
                 scheme_dict["format"] = self.quant_format
             return scheme_dict
@@ -326,6 +335,8 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
                 f"quant_type={quant_type}, layer_type={layer_type}."
             )
 
+        if quant_type == "W4A8_MXFP" and format == MXFP4_PACK_QUANTIZED_FORMAT:
+            return scheme_cls(use_weight_packed=True)
         return scheme_cls()
 
     def _detect_quant_type(
@@ -346,6 +357,9 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
         """
         # use the per-layer format if defined, otherwise, use global format
         format = format if format is not None else self.quant_format
+        if self._is_packed_mxfp4(weight_quant, input_quant, format):
+            return "W4A8_MXFP"
+
         act_quant_format = is_activation_quantization_format(format)
 
         if act_quant_format and input_quant is not None:
@@ -353,7 +367,10 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
                 return "W8A8"
 
             if self._is_dynamic_token_w8a8(weight_quant, input_quant):
-                return "W8A8_DYNAMIC"
+                if weight_quant.type == QuantizationType.FLOAT and input_quant.type == QuantizationType.FLOAT:
+                    return "W8A8FP8_DYNAMIC"
+                else:
+                    return "W8A8_DYNAMIC"
 
             if self._is_dynamic_token_w4a8(weight_quant, input_quant):
                 return "W4A8_DYNAMIC"
@@ -362,6 +379,25 @@ class AscendCompressedTensorsConfig(QuantizationConfig):
             return "W4A16"
 
         raise NotImplementedError("No compressed-tensors compatible quantization type was found.")
+
+    def _is_packed_mxfp4(
+        self,
+        weight_quant: "QuantizationArgs",
+        input_quant: Optional["QuantizationArgs"],
+        format: str | None,
+    ) -> bool:
+        """Match only the explicit compressed-tensors packed MXFP4 format."""
+        if format != MXFP4_PACK_QUANTIZED_FORMAT or weight_quant is None:
+            return False
+
+        return (
+            input_quant is None
+            and weight_quant.type == QuantizationType.FLOAT
+            and weight_quant.num_bits == 4
+            and weight_quant.strategy == QuantizationStrategy.GROUP.value
+            and weight_quant.group_size == 32
+            and not weight_quant.dynamic
+        )
 
     def _is_static_tensor_w8a8(self, weight_quant: "QuantizationArgs", input_quant: "QuantizationArgs") -> bool:
         is_8_bits = weight_quant.num_bits == input_quant.num_bits == 8

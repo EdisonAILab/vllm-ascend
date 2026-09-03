@@ -2,9 +2,34 @@
 
 ROOT_DIR=$1
 SOC_VERSION=$2
+: "${ROOT_DIR:?ROOT_DIR is not set}"
 
 log() {
     echo "[build_aclnn] $*"
+}
+
+setup_catlass_dependency() {
+    local catlass_path="${ROOT_DIR}/csrc/third_party/catlass/include"
+    local catlass_commit
+    local absolute_catlass_path
+
+    git config --global --add safe.directory "$ROOT_DIR"
+    catlass_commit=$(git config -f "${ROOT_DIR}/.gitmodules" --get submodule.csrc/third_party/catlass.commit)
+    if [[ ! -d "${catlass_path}" ]]; then
+        echo "dependency catlass is missing, try to fetch it..."
+        git submodule sync
+        if ! git submodule update --init --recursive; then
+            log "fetch failed"
+            exit 1
+        fi
+        cd "${ROOT_DIR}/csrc/third_party/catlass" || exit 1
+        git fetch origin
+        git checkout "${catlass_commit}" || exit 1
+        cd - || exit 1
+    fi
+    absolute_catlass_path=$(cd "${catlass_path}" && pwd)
+    export CPATH="${absolute_catlass_path}${CPATH:+:${CPATH}}"
+    log "catlass include=${absolute_catlass_path}"
 }
 
 resolve_op_dir() {
@@ -53,9 +78,14 @@ log "env: ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-<unset>} ASCEND_TOOLKIT_HOME=${AS
 if [[ "$SOC_VERSION" =~ ^ascend310 ]]; then
     log "matched SOC branch: ascend310"
     # ASCEND310P series
+    # dependency: catlass
+    setup_catlass_dependency
+
     CUSTOM_OPS_ARRAY=(
         "causal_conv1d_v310"
         "recurrent_gated_delta_rule_v310"
+        "chunk_fwd_o"
+        "chunk_gated_delta_rule_fwd_h"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend310p"
@@ -63,44 +93,26 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
     log "matched SOC branch: ascend910b"
     # ASCEND910B (A2) series
     # dependency: catlass
-    git config --global --add safe.directory "$ROOT_DIR"
-    CATLASS_PATH=${ROOT_DIR}/csrc/third_party/catlass/include
-    CATLASS_COMMIT=$(git config -f "${ROOT_DIR}/.gitmodules" --get submodule.csrc/third_party/catlass.commit)
-    if [[ ! -d "${CATLASS_PATH}" ]]; then
-        echo "dependency catlass is missing, try to fetch it..."
-        git submodule sync
-        if ! git submodule update --init --recursive; then
-            echo "fetch failed"
-            exit 1
-        fi
-        cd "${ROOT_DIR}/csrc/third_party/catlass" || exit 1
-        git fetch origin
-        git checkout "${CATLASS_COMMIT}" || exit 1
-        cd - || exit 1
-    fi
-    ABSOLUTE_CATLASS_PATH=$(cd "${CATLASS_PATH}" && pwd)
-    export CPATH=${ABSOLUTE_CATLASS_PATH}:${CPATH}
-    log "catlass include=${ABSOLUTE_CATLASS_PATH}"
+    setup_catlass_dependency
 
     CUSTOM_OPS_ARRAY=(
         "scatter_nd_update_v2"
         "moe_grouped_matmul"
         "grouped_matmul_swiglu_quant_weight_nz_tensor_list"
-        "lightning_indexer_vllm"
+        "lightning_indexer"
         "sparse_flash_attention"
-        "matmul_allreduce_add_rmsnorm"
-        "moe_init_routing_custom"
+        "kv_quant_sparse_flash_attention"
         "moe_gating_top_k"
         "moe_gating_top_k_hash"
         "add_rms_norm_bias"
-        "apply_top_k_top_p_custom"
         "transpose_kv_cache_by_block"
         "copy_and_expand_eagle_inputs"
         "causal_conv1d"
         "lightning_indexer_quant"
         "compressor"
-        "quant_lightning_indexer"
-        "quant_lightning_indexer_metadata"
+        "compressor_metadata"
+        "vllm_quant_lightning_indexer"
+        "vllm_quant_lightning_indexer_metadata"
         "sparse_attn_sharedkv"
         "sparse_attn_sharedkv_metadata"
         "hc_pre_sinkhorn"
@@ -109,15 +121,20 @@ elif [[ "$SOC_VERSION" =~ ^ascend910b ]]; then
         "hc_post"
         "inplace_partial_rotary_mul"
         "rms_norm_dynamic_quant"
+        "dequant_situ_quant"
         "dequant_swiglu_quant"
         "grouped_matmul_swiglu_quant"
         "grouped_matmul_swiglu_quant_v2"
-        "hamming_dist_top_k"
-        "reshape_and_cache_bnsd"
         "recurrent_gated_delta_rule"
-        "ngram_spec_decode"
+        "recurrent_kda"
         "chunk_fwd_o"
         "chunk_gated_delta_rule_fwd_h"
+        "chunk_kda_fwd"
+        "kda_gate_cumsum"
+        "kda_layout_swap12"
+        "store_kv_block"
+        "store_kv_block_metadata"
+        "sparse_attention_score"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -126,64 +143,29 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
     log "matched SOC branch: ascend910_93"
     # ASCEND910C (A3) series
     # dependency: catlass
-    git config --global --add safe.directory "$ROOT_DIR"
-    CATLASS_PATH=${ROOT_DIR}/csrc/third_party/catlass/include
-    CATLASS_COMMIT=$(git config -f "${ROOT_DIR}/.gitmodules" --get submodule.csrc/third_party/catlass.commit)
-    if [[ ! -d "${CATLASS_PATH}" ]]; then
-        echo "dependency catlass is missing, try to fetch it..."
-        git submodule sync
-        if ! git submodule update --init --recursive; then
-            echo "fetch failed"
-            exit 1
-        fi
-        cd "${ROOT_DIR}/csrc/third_party/catlass" || exit 1
-        git fetch origin
-        git checkout "${CATLASS_COMMIT}" || exit 1
-        cd - || exit 1
-    fi
-    # dependency: cann-toolkit file moe_distribute_base.h
-    HCCL_STRUCT_FILE_PATH=$(find -L "${ASCEND_TOOLKIT_HOME}" -name "moe_distribute_base.h" 2>/dev/null | head -n1)
-    if [ -z "$HCCL_STRUCT_FILE_PATH" ]; then
-        echo "cannot find moe_distribute_base.h file in CANN env"
-        exit 1
-    fi
-    # for dispatch_gmm_combine_decode
-    yes | cp "${HCCL_STRUCT_FILE_PATH}" "${ROOT_DIR}/csrc/utils/inc/kernel"
+    setup_catlass_dependency
 
-    # for dispatch_normal and combine_normal
-    TARGET_DIR="$SCRIPT_DIR/mc2/moe_dispatch_normal/op_kernel/utils/"
-    cp "$HCCL_STRUCT_FILE_PATH" "$TARGET_DIR"
-
-    TARGET_DIR="$SCRIPT_DIR/mc2/moe_combine_normal/op_kernel/utils/"
-    echo "$TARGET_DIR"
-    cp "$HCCL_STRUCT_FILE_PATH" "$TARGET_DIR"
-    
     CUSTOM_OPS_ARRAY=(
         "scatter_nd_update_v2"
         "grouped_matmul_swiglu_quant_weight_nz_tensor_list"
-        "lightning_indexer_vllm"
+        "lightning_indexer"
         "sparse_flash_attention"
+        "kv_quant_sparse_flash_attention"
         "dispatch_ffn_combine"
         "dispatch_ffn_combine_w4_a8"
         "dispatch_ffn_combine_bf16"
-        "dispatch_gmm_combine_decode"
-        "moe_combine_normal"
-        "moe_dispatch_normal"
-        "dispatch_layout"
-        "notify_dispatch"
-        "moe_init_routing_custom"
         "moe_gating_top_k"
         "moe_gating_top_k_hash"
         "add_rms_norm_bias"
-        "apply_top_k_top_p_custom"
         "transpose_kv_cache_by_block"
         "copy_and_expand_eagle_inputs"
         "causal_conv1d"
         "moe_grouped_matmul"
         "lightning_indexer_quant"
         "compressor"
-        "quant_lightning_indexer"
-        "quant_lightning_indexer_metadata"
+        "compressor_metadata"
+        "vllm_quant_lightning_indexer"
+        "vllm_quant_lightning_indexer_metadata"
         "sparse_attn_sharedkv"
         "sparse_attn_sharedkv_metadata"
         "hc_pre_sinkhorn"
@@ -192,15 +174,20 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "hc_post"
         "inplace_partial_rotary_mul"
         "rms_norm_dynamic_quant"
+        "dequant_situ_quant"
         "dequant_swiglu_quant"
         "grouped_matmul_swiglu_quant"
         "grouped_matmul_swiglu_quant_v2"
-        "hamming_dist_top_k"
-        "reshape_and_cache_bnsd"
         "recurrent_gated_delta_rule"
-        "ngram_spec_decode"
+        "recurrent_kda"
         "chunk_fwd_o"
         "chunk_gated_delta_rule_fwd_h"
+        "chunk_kda_fwd"
+        "kda_gate_cumsum"
+        "kda_layout_swap12"
+        "store_kv_block"
+        "store_kv_block_metadata"
+        "sparse_attention_score"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend910_93"
@@ -208,24 +195,7 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
     log "matched SOC branch: ascend950"
     # ASCEND950 (A5) series
     # dependency: catlass
-    git config --global --add safe.directory "$ROOT_DIR"
-    CATLASS_PATH=${ROOT_DIR}/csrc/third_party/catlass/include
-    CATLASS_COMMIT=$(git config -f "${ROOT_DIR}/.gitmodules" --get submodule.csrc/third_party/catlass.commit)
-    if [[ ! -d "${CATLASS_PATH}" ]]; then
-        echo "dependency catlass is missing, try to fetch it..."
-        git submodule sync
-        if ! git submodule update --init --recursive; then
-            echo "fetch failed"
-            exit 1
-        fi
-        cd "${ROOT_DIR}/csrc/third_party/catlass" || exit 1
-        git fetch origin
-        git checkout "${CATLASS_COMMIT}" || exit 1
-        cd - || exit 1
-    fi
-    ABSOLUTE_CATLASS_PATH=$(cd "${CATLASS_PATH}" && pwd)
-    export CPATH=${ABSOLUTE_CATLASS_PATH}:${CPATH}
-    log "catlass include=${ABSOLUTE_CATLASS_PATH}"
+    setup_catlass_dependency
 
     CUSTOM_OPS_ARRAY=(
         "moe_gating_top_k_hash"
@@ -233,8 +203,9 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "inplace_partial_rotary_mul"
         "kv_compress_epilog"
         "compressor"
-        "quant_lightning_indexer"
-        "quant_lightning_indexer_metadata"
+        "compressor_metadata"
+        "vllm_quant_lightning_indexer"
+        "vllm_quant_lightning_indexer_metadata"
         "kv_quant_sparse_attn_sharedkv"
         "kv_quant_sparse_attn_sharedkv_metadata"
         "hc_pre_sinkhorn"
@@ -242,12 +213,21 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "hc_post"
         "hc_pre"
         "swiglu_group_quant"
+        "situ_mx_quant"
         "load_index_kv_cache"
         "indexer_compress_epilog_v2"
         "causal_conv1d"
         "recurrent_gated_delta_rule"
+        "recurrent_kda"
         "chunk_fwd_o"
         "chunk_gated_delta_rule_fwd_h"
+        "chunk_kda_fwd"
+        "kda_gate_cumsum"
+        "kda_layout_swap12"
+        "store_kv_block"
+        "store_kv_block_metadata"
+        "sparse_attention_score"
+        "mla_prolog_v3"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -275,13 +255,19 @@ log_selected_ops
 (
   set -euo pipefail
 
+  : "${ROOT_DIR:?ROOT_DIR is not set}"
+
   log "subshell cwd before cd=$(pwd)"
-  cd csrc
+  cd "${ROOT_DIR}/csrc"
   log "subshell cwd after cd=$(pwd)"
-  log "cleaning csrc build dirs"
+  # The CANN op generator does not model every op definition and kernel source
+  # as a dependency of the generated ACLNN/proto/kernel artifacts. Reusing the
+  # build tree can therefore package stale signatures or binaries after a
+  # source update. Editable builds must regenerate the custom-op package from
+  # one consistent source snapshot.
+  log "cleaning custom-op build dirs to regenerate ACLNN/proto/kernel artifacts"
   rm -rf -- build output build_out
 
-  : "${ROOT_DIR:?ROOT_DIR is not set}"
   : "${CUSTOM_OPS:?CUSTOM_OPS is not set}"
   : "${SOC_VERSION:?SOC_VERSION is not set}"
   : "${SOC_ARG:?SOC_ARG is not set}"
@@ -323,4 +309,20 @@ log_selected_ops
   log "installer finished"
   log "installed files under ${custom_ops_install_dir} (maxdepth=4, first 120 entries):"
   { find "${custom_ops_install_dir}" -mindepth 1 -maxdepth 4 -print | sort | head -n 120 | sed 's#^#[build_aclnn] install: #'; } || true
+
+  # install batch_invariant run package and whl package
+  if [[ "${VLLM_BATCH_INVARIANT:-0}" == "1" ]]; then
+    log "VLLM_BATCH_INVARIANT=1, installing batch_invariant run package and whl package..."
+
+    # call separate installation script
+    batch_invariant_script="${ROOT_DIR}/csrc/build_batch_invariant_ops.sh"
+    if [[ -f "${batch_invariant_script}" ]]; then
+      log "Calling batch_invariant_ops build script: ${batch_invariant_script}"
+      bash "${batch_invariant_script}" "${SOC_ARG}"
+    else
+      log "Warning: batch_invariant_ops build script not found at ${batch_invariant_script}"
+    fi
+  else
+    log "VLLM_BATCH_INVARIANT is not set to 1, skipping batch_invariant ops build"
+  fi
 )

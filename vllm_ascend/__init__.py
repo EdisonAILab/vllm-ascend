@@ -45,8 +45,10 @@ def register_connector():
     _ensure_global_patch()
 
     from vllm_ascend.distributed.kv_transfer import register_connector
+    from vllm_ascend.distributed.weight_transfer import register_engine
 
     register_connector()
+    register_engine()
 
 
 def register_model_loader():
@@ -68,6 +70,19 @@ def register_service_profiling():
 
 
 def register_model():
+    from vllm_ascend.transformers_utils.configs.kimi_k3 import register_kimi_k3_config
+
+    register_kimi_k3_config()
+
+    from vllm_ascend.patch.hunyuan_vl_processor_compat import (
+        install_hunyuan_vl_processor_compat,
+    )
+
     from .models import register_model
 
+    install_hunyuan_vl_processor_compat()
+
     register_model()
+
+
+import vllm_ascend.logger  # noqa: E402, F401

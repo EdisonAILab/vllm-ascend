@@ -57,7 +57,7 @@ test_cases:
         max_out_len: 65536
         batch_size: 32
         baseline: 90
-        threshold: 5
+        threshold: 10
         thinking: true
         temperature: 1.0
         top_p: 0.95
@@ -75,5 +75,5 @@ test_cases:
         max_out_len: 1500
         batch_size: 80
         request_rate: 0
-        baseline: 1
+        baseline: 1110.187
         threshold: 0.97

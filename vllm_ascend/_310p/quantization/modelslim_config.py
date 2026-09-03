@@ -22,7 +22,7 @@ from typing import Any
 import torch
 from vllm.config import get_current_vllm_config
 from vllm.logger import logger
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import MoERunner, RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
@@ -42,6 +42,10 @@ from vllm_ascend.quantization.modelslim_config import (
 from vllm_ascend.utils import ASCEND_QUANTIZATION_METHOD
 
 
+def _is_fused_moe_layer(layer: torch.nn.Module) -> bool:
+    return isinstance(layer, (MoERunner, RoutedExperts))
+
+
 def create_scheme_for_layer(
     quant_description: dict[str, Any],
     prefix: str,
@@ -59,7 +63,7 @@ def create_scheme_for_layer(
     Returns:
         An instance of the appropriate quantization scheme class.
     """
-    logger.info_once("Using the vLLM Ascend modelslim Quantization now!")
+    logger.info_once("Using vLLM Ascend ModelSlim quantization.")
     quant_type = get_quant_type_for_layer(quant_description, prefix, layer_type, packed_modules_mapping)
 
     if quant_type is None:
@@ -72,7 +76,7 @@ def create_scheme_for_layer(
     if scheme_cls is not None:
         return scheme_cls()
 
-    err_msg = f"Currently, vLLM Ascend doesn't support quant_type={quant_type} for layer_type={layer_type}."
+    err_msg = f"Unsupported quant_type={quant_type} for layer_type={layer_type}."
     logger.error(err_msg)
     raise NotImplementedError(err_msg)
 
@@ -118,7 +122,7 @@ class AscendModelSlimConfig310(AscendModelSlimConfig):
             logger.debug("Select AscendLinearMethod for %s (layer=%s)", prefix, "LinearBase")
             return AscendLinearMethod(scheme)
 
-        elif isinstance(layer, FusedMoE):
+        elif _is_fused_moe_layer(layer):
             if self.is_layer_skipped_ascend(prefix, self.packed_modules_mapping):
                 from vllm_ascend._310p.fused_moe.fused_moe import AscendUnquantizedFusedMoEMethod310
 

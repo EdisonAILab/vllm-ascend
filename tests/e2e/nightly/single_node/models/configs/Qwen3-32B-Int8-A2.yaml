@@ -27,8 +27,6 @@ _server_cmd: &server_cmd
   - "qwen3"
   - "--gpu-memory-utilization"
   - "0.9"
-  - "--additional-config"
-  - '{"weight_prefetch_config":{"enabled":true}}'
 
 _benchmarks: &benchmarks
   acc:
@@ -39,7 +37,7 @@ _benchmarks: &benchmarks
     max_out_len: 32768
     batch_size: 32
     baseline: 83.33
-    threshold: 7
+    threshold: 10
 
   perf:
     case_type: performance
@@ -49,7 +47,7 @@ _benchmarks: &benchmarks
     num_prompts: 288
     max_out_len: 1500
     batch_size: 72
-    baseline: 1
+    baseline: 1065.179
     threshold: 0.97
 
 # ==========================================

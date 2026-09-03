@@ -41,7 +41,13 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ops.linear_op import get_parallel_op, get_replicated_op
-from vllm_ascend.utils import enable_sp, maybe_trans_nz
+from vllm_ascend.utils import (
+    AscendDeviceType,
+    enable_sp,
+    get_ascend_device_type,
+    is_310p,
+    maybe_trans_nz,
+)
 
 
 def unquantized_gemm(
@@ -70,16 +76,26 @@ direct_register_custom_op(
 )
 
 
+def _should_keep_nd_for_310p_weight(weight: torch.Tensor) -> bool:
+    return is_310p() and weight.ndim >= 2 and (weight.shape[-1] == 1 or weight.shape[-2] == 1)
+
+
 class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
     """Linear method without quantization"""
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)
+        keep_nd_weight = _should_keep_nd_for_310p_weight(layer.weight.data)
         # must use fp32 to avoid accuracy degradation in dsv4.
         if getattr(layer, "precast_fp32_weight", False):
-            layer.weight_fp32 = maybe_trans_nz(layer.weight.data.to(torch.float32))
+            weight_fp32 = layer.weight.data.to(torch.float32)
+            layer.weight_fp32 = weight_fp32 if keep_nd_weight else maybe_trans_nz(weight_fp32)
         if "conv1d" not in layer.prefix:
-            layer.weight.data = maybe_trans_nz(layer.weight.data)
+            # 310P torch_npu rejects FRACTAL_NZ matmul when the weight-side
+            # matrix has n=1 or k=1. Keep scalar gates such as Qwen MoE's
+            # shared_expert_gate in ND format, leaving non-310P policy intact.
+            if not keep_nd_weight:
+                layer.weight.data = maybe_trans_nz(layer.weight.data)
 
     def apply(
         self,
@@ -224,7 +240,13 @@ class AscendMergedColumnParallelLinear(MergedColumnParallelLinear):
         return_bias: bool = True,
         disable_tp: bool = False,
     ):
-        self.custom_op, self.tp_rank, self.tp_size = get_parallel_op(disable_tp, prefix, self, "column")
+        self.custom_op, self.tp_rank, self.tp_size = get_parallel_op(
+            disable_tp,
+            prefix,
+            self,
+            "column",
+            output_size=sum(output_sizes),
+        )
         # TODO(realliujiaxu): Replace the initialization code below with super().__init__ after
         # linear of vllm supports custom comm group
         self.output_sizes = output_sizes
@@ -378,7 +400,13 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
         disable_tp: bool = False,
     ):
         #
-        self.custom_op, self.tp_rank, self.tp_size = get_parallel_op(disable_tp, prefix, self, "column")
+        self.custom_op, self.tp_rank, self.tp_size = get_parallel_op(
+            disable_tp,
+            prefix,
+            self,
+            "column",
+            output_size=output_size,
+        )
         # TODO(realliujiaxu): Replace the initialization code below with super().__init__ after
         # linear of vllm supports custom comm group
         self.input_size_per_partition = input_size
@@ -449,7 +477,7 @@ class AscendColumnParallelLinear(ColumnParallelLinear):
         return super().forward(input_)
 
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
-        if "wo_a" in self.prefix:
+        if "wo_a" in self.prefix and get_ascend_device_type() != AscendDeviceType.A5:
             if self.weight.ndim == 2:
                 super().weight_loader(param, loaded_weight)
                 self.weight.data = (

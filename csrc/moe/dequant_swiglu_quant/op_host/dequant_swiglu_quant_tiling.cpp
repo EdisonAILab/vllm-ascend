@@ -521,7 +521,7 @@ ge::graphStatus DequantSwigluQuantDskTiling::GetShapeAttrsInfoInner() {
   // set the relevant param of group, hasGroupIndex_, groupNum_ and speGroupType_
   auto shapeGroupIndex = context_->GetOptionalInputShape(INPUT_GROUP_INDEX);
   hasGroupIndex_ = shapeGroupIndex != nullptr;
-  groupNum_ = 0;
+  groupNum_ = 1;
   speGroupType_ = false;
   if (hasGroupIndex_) {
     const gert::Shape& inputShapeGroupIndex = shapeGroupIndex->GetStorageShape();
@@ -557,7 +557,14 @@ bool DequantSwigluQuantDskTiling::IsPerformanceAndGroupIndexBrach() {
   if (shapeGroupIndex != nullptr) {
     return true;
   }
-  return false;
+
+  auto xPtr = context_->GetInputDesc(X_INDEX);
+  auto attrs = context_->GetAttrs();
+  if (xPtr == nullptr || attrs == nullptr) {
+    return false;
+  }
+  auto* swigluMode = attrs->GetAttrPointer<int>(SWIGLU_MODE_INDEX);
+  return xPtr->GetDataType() == ge::DT_INT32 && swigluMode != nullptr && *swigluMode == 1;
 }
 
 bool DequantSwigluQuantDskTiling::IsCapable() {
@@ -618,7 +625,8 @@ ge::graphStatus DequantSwigluQuantDskTiling::CountMaxDim(int64_t& ubFactorDimx) 
   int64_t quantOffsetSpace = quantMode_ == QUANT_MODE_DYNAMIC ? 0 : static_cast<int64_t>(sizeof(float));
 
   // UbFactorDimx is 1,compute maxOutDimy
-  int64_t numerator = static_cast<int64_t>(ubSize_) - UB_RESERVE - BLOCK_SIZE - db * BLOCK_SIZE - static_cast<int64_t>(sizeof(float));
+  int64_t numerator = static_cast<int64_t>(ubSize_) - UB_RESERVE - BLOCK_SIZE - db * BLOCK_SIZE - static_cast<int64_t>(sizeof(float)) -
+                       BLOCK_ELEM * BLOCK_ELEM * static_cast<int64_t>(sizeof(float));
   int64_t denominator =
       5 * static_cast<int64_t>(sizeof(float)) + db * SWI_FACTOR * static_cast<int64_t>(sizeof(float)) + static_cast<int64_t>(sizeof(int8_t)) + biasBufferY + SweiGLUBufferY + quantOffsetSpace;
   maxOutDimy = static_cast<int64_t>(numerator / denominator);
@@ -636,7 +644,8 @@ ge::graphStatus DequantSwigluQuantDskTiling::CountMaxDim(int64_t& ubFactorDimx) 
   numerator = static_cast<int64_t>(ubSize_) - UB_RESERVE - outDimy_ * static_cast<int64_t>(sizeof(float)) - BLOCK_SIZE - SWI_FACTOR * outDimy_ * static_cast<int64_t>(sizeof(float)) - biasBufferX - quantOffsetSpace;
 
   denominator = db * (outDimy_ * SWI_FACTOR + BLOCK_ELEM) * static_cast<int64_t>(sizeof(float)) + outDimy_ * static_cast<int64_t>(sizeof(int8_t)) + static_cast<int64_t>(sizeof(float)) +
-                outDimy_ * SWI_FACTOR * static_cast<int64_t>(sizeof(float)) + SweiGLUBufferX;
+                outDimy_ * SWI_FACTOR * static_cast<int64_t>(sizeof(float)) + SweiGLUBufferX +
+                BLOCK_ELEM * static_cast<int64_t>(sizeof(float));
   ubFactorDimx  = static_cast<int64_t>(numerator / denominator);
   ubFactorDimx = std::min(ubFactorDimx, inDimx_);
   OP_LOGI(context_->GetNodeName(), "Get ubFactorDimx[%ld]", ubFactorDimx);

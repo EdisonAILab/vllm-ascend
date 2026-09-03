@@ -1,6 +1,6 @@
 import threading
-from collections.abc import Iterable
-from typing import Any
+from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING, Any
 
 import torch
 import zmq
@@ -20,18 +20,27 @@ from vllm.forward_context import ForwardContext
 from vllm.logger import logger
 from vllm.utils.network_utils import make_zmq_socket
 from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackDecoder
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+    AscendStoreKVConnectorWorkerMetadata,
+    block_hash_to_bytes,
+)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
     KVPoolScheduler,
     get_zmq_rpc_path_lookup,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorHandshakeMetadata
 
 
 class AscendStoreKVEvents(KVConnectorKVEvents):
@@ -69,6 +78,11 @@ class AscendStoreKVEvents(KVConnectorKVEvents):
 
 
 class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
+    @property
+    def requires_kv_delivery(self) -> bool:
+        # AscendStore is a best-effort cache: a dropped save is a future miss.
+        return False
+
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         """
@@ -82,6 +96,9 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.kv_role = vllm_config.kv_transfer_config.kv_role
 
         self.use_layerwise = vllm_config.kv_transfer_config.kv_connector_extra_config.get("use_layerwise", False)
+        backend_name = vllm_config.kv_transfer_config.kv_connector_extra_config.get("backend", "mooncake")
+        self.backend_name = backend_name.lower()
+        self.use_gva_layerwise = self.use_layerwise and self.backend_name == "memcache"
         self.consumer_is_to_put = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "consumer_is_to_put", False
         )
@@ -96,24 +113,34 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         self.kv_caches: dict[str, torch.Tensor] = {}
         self._kv_cache_events: AscendStoreKVEvents | None = None
 
-        self.sended_but_unfinished_reqs: set[str] = set()
+        self._current_step_has_real_forward = False
 
         if role == KVConnectorRole.SCHEDULER:
-            self.connector_scheduler = KVPoolScheduler(vllm_config, self.use_layerwise, kv_cache_config)
+            assert kv_cache_config is not None
+            page_size_bytes = kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
+            self.connector_scheduler = KVPoolScheduler(
+                vllm_config, self.use_layerwise, kv_cache_config, page_size_bytes=page_size_bytes
+            )
         else:
             self.connector_worker = KVPoolWorker(
                 vllm_config,
                 self.use_layerwise,
                 kv_cache_config,
             )
-
             assert self.connector_worker is not None
-            if vllm_config.parallel_config.rank == 0:
-                self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config, self.use_layerwise)
+            if not self.use_layerwise and vllm_config.parallel_config.rank == 0:
+                self.lookup_server = LookupKeyServer(self.connector_worker, vllm_config)
 
     ############################################################
     # Scheduler Side Methods
     ############################################################
+
+    def set_xfer_handshake_metadata_pp_aware(
+        self,
+        metadata: dict[tuple[int, int], "KVConnectorHandshakeMetadata"],
+    ) -> None:
+        """Ignore P/D handshake metadata because AscendStore handles PP via pool keys."""
+        pass
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         assert self.connector_scheduler is not None
@@ -153,6 +180,9 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         Args:
             connector_output (KVConnectorOutput): the worker-side connectors output.
         """
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.update_connector_output(connector_output)
+
         # Get the KV events
         kv_cache_events = connector_output.kv_cache_events
         if not kv_cache_events or not isinstance(kv_cache_events, AscendStoreKVEvents):
@@ -182,6 +212,12 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     ############################################################
     # Worker Side Methods
     ############################################################
+    def set_external_slot_release_waiter(self, waiter: Callable[[int], None]) -> bool:
+        if not self.use_gva_layerwise or getattr(self, "connector_worker", None) is None:
+            return False
+        self.connector_worker.set_external_slot_release_waiter(waiter)
+        return True
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
@@ -189,6 +225,7 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         metadata = self._get_connector_metadata()
+        self._current_step_has_real_forward = forward_context is not None
         logger.debug(
             "KV pool connector start_load_kv metadata_requests=%d specs=%s",
             len(metadata.requests),
@@ -215,8 +252,8 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         if not self.use_layerwise:
             return
 
-        if self.kv_role == "kv_consumer":
-            # Don't do save if the role is kv_consumer
+        if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
+            # A load-only consumer does not publish KV.
             return
         self.connector_worker.save_kv_layer(self._get_connector_metadata())
 
@@ -233,9 +270,13 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
-        done_sending, done_recving = self.connector_worker.get_finished(
-            finished_req_ids, self._get_connector_metadata()
-        )
+        metadata = self._get_connector_metadata()
+        if self._current_step_has_real_forward:
+            try:
+                self.connector_worker.ensure_store_initialized()
+            finally:
+                self._current_step_has_real_forward = False
+        done_sending, done_recving = self.connector_worker.get_finished(finished_req_ids, metadata)
         return done_sending, done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -255,16 +296,22 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         ascend_store_kv_events.add_events(events)
         return ascend_store_kv_events
 
+    def bind_gpu_block_pool(self, gpu_block_pool: "BlockPool") -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.bind_gpu_block_pool(gpu_block_pool)
+
+    def build_connector_worker_meta(self) -> AscendStoreKVConnectorWorkerMetadata | None:
+        assert self.connector_worker is not None
+        return self.connector_worker.build_connector_worker_meta()
+
 
 class LookupKeyServer:
     def __init__(
         self,
         pool_worker: KVPoolWorker,
         vllm_config: "VllmConfig",
-        use_layerwise: bool,
     ):
         self.decoder = MsgpackDecoder()
-        self.decoder_tensor = MsgpackDecoder(torch.Tensor)
         self.ctx = zmq.Context()  # type: ignore[attr-defined]
         socket_path = get_zmq_rpc_path_lookup(vllm_config)
         self.socket = make_zmq_socket(
@@ -276,20 +323,21 @@ class LookupKeyServer:
 
         self.pool_worker = pool_worker
         self.running = True
-        self.use_layerwise = use_layerwise
 
         def process_request():
             while self.running:
                 all_frames = self.socket.recv_multipart(copy=False)
                 token_len = int.from_bytes(all_frames[0], byteorder="big")
                 kv_group_ids = self.decoder.decode([all_frames[1]])
-                hash_frames = all_frames[2:]
-                hashes_str = self.decoder.decode(hash_frames)
+                hbm_hit_tokens = int.from_bytes(all_frames[2], byteorder="big")
+                hashes_str = self.decoder.decode(all_frames[3:])
+                block_hashes = [BlockHash(block_hash_to_bytes(block_hash)) for block_hash in hashes_str]
                 result = self.pool_worker.lookup_scheduler(
                     token_len,
-                    hashes_str,
+                    block_hashes,
                     kv_group_ids,
-                    self.use_layerwise,
+                    use_layerwise=False,
+                    hbm_hit_tokens=hbm_hit_tokens,
                 )
                 logger.debug(
                     "KV pool lookup response token_len=%d groups=%s hit_tokens=%d",
@@ -305,4 +353,3 @@ class LookupKeyServer:
 
     def close(self):
         self.socket.close(linger=0)
-        # TODO: close the thread!

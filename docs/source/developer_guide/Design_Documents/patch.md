@@ -17,20 +17,19 @@ We should keep in mind that Patch is not the best way to make vLLM Ascend compat
 In `vllm_ascend/patch`, you can see the code structure as follows:
 
 ```shell
-vllm_ascend
-├── patch
-│   ├── platform
-│   │   ├── patch_xxx.py
-│   ├── worker
-│   │   ├── patch_yyy.py
-└───────────
+vllm_ascend/
+└── patch/
+    ├── platform/
+    │   └── patch_xxx.py
+    └── worker/
+        └── patch_yyy.py
 ```
 
-- **platform**: The patch code in this directory is for patching the code in vLLM main process. It's called by `vllm_ascend/platform::NPUPlatform::pre_register_and_update` very early when vLLM is initialized.
-    - For online mode, vLLM process calls the platform patch in `vllm/vllm/engine/arg_utils.py::AsyncEngineArgs.add_cli_args` when parsing the cli args.
+- **platform**: The patch code in this directory is for patching the code in vLLM Main process. It's called by `vllm_ascend/platform::NPUPlatform::pre_register_and_update` very early when vLLM is initialized.
+    - For online mode, vLLM process calls the platform patch in `vllm/vllm/engine/arg_utils.py::AsyncEngineArgs.add_cli_args` when parsing the CLI args.
     - For offline mode, vLLM process calls the platform patch in `vllm/vllm/engine/arg_utils.py::EngineArgs.create_engine_config` when parsing the input parameters.
-- **worker**: The patch code in this directory is for patching the code in vLLM worker process. It's called by `vllm_ascend/worker/worker::NPUWorker::__init__` when the vLLM worker process is initialized.
-    - For both online and offline mode, vLLM engine core process calls the worker patch in `vllm/vllm/worker/worker_base.py::WorkerWrapperBase.init_worker` when initializing the worker process.
+- **worker**: The patch code in this directory is for patching the code in vLLM worker process. It's called by `vllm_ascend/worker/worker::NPUWorker::__init__` when the vLLM Worker process is initialized.
+    - For both online and offline mode, vLLM EngineCore process calls the worker patch in `vllm/vllm/worker/worker_base.py::WorkerWrapperBase.init_worker` when initializing the worker process.
 
 ## How to write a patch
 
@@ -38,7 +37,12 @@ Before writing a patch, following the principle above, we should patch the least
 
 1. Decide which version of vLLM we should patch. For example, after analysis, here we want to patch both `0.10.0` and `main` of vLLM.
 2. Decide which process we should patch. For example, here `distributed` belongs to the vLLM main process, so we should patch `platform`.
-3. Create the patch file in the right folder. The file should be named as `patch_{module_name}.py`. The example here is `vllm_ascend/patch/platform/patch_distributed.py`.
+3. Create the patch entry file in the right folder. Entry files imported directly
+   from the `platform` or `worker` package's `__init__.py` should be named
+   `patch_{module_name}.py`. Supporting implementation modules imported by an
+   entry file may use descriptive names and should not be imported directly from
+   the patch package's `__init__.py`. The example entry file here is
+   `vllm_ascend/patch/platform/patch_distributed.py`.
 4. Write your patch code in the new file. Here is an example:
 
     ```python

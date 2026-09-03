@@ -30,27 +30,27 @@
 #include "utils.h"
 #include "aclnn_torch_adapter/op_api_common.h"
 #include "moe/add_rms_norm_bias/add_rms_norm_bias_torch_adpt.h"
-#include "moe/apply_top_k_top_p_custom/apply_top_k_top_p_custom_torch_adpt.h"
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
-#include "batch_matmul_transpose/batch_matmul_transpose_torch_adpt.h"
 #include "mla_preprocess/mla_preprocess_torch_adpt.h"
 #endif
 #include "mc2/dispatch_ffn_combine/dispatch_ffn_combine_torch_adpt.h"
-#include "mc2/dispatch_gmm_combine_decode/dispatch_gmm_combine_decode_torch_adpt.h"
-#include "mc2/dispatch_layout/dispatch_layout_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_weight_nz_tensor_list/grouped_matmul_swiglu_quant_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_v2/grouped_matmul_swiglu_quant_v2_torch_adpt.h"
-#include "attention/lightning_indexer_vllm/lightning_indexer_vllm_torch_adpt.h"
-#include "mc2/matmul_allreduce_add_rmsnorm/matmul_allreduce_add_rmsnorm_torch_adpt.h"
-#include "mc2/moe_combine_normal/moe_combine_normal_torch_adpt.h"
+#include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
-#include "moe/moe_init_routing_custom/moe_init_routing_custom_torch_adpt.h"
 #include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
+#include "attention/kv_quant_sparse_flash_attention/kv_quant_sparse_flash_attention_torch_adpt.h"
 #include "attention/lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
-#include "attention/ngram_spec_decode/ngram_spec_decode_torch_adpt.h"
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
+#include "attention/recurrent_kda/recurrent_kda_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
+#include "attention/sparse_attention_score/sparse_attention_score_torch_adpt.h"
+#include "attention/store_kv_block/store_kv_block_torch_adpt.h"
+#include "attention/store_kv_block_metadata/store_kv_block_metadata_torch_adpt.cpp"
+#include "moe/dequant_situ_quant/dequant_situ_quant_torch_adpt.h"
+#include "moe/situ_mx_quant/situ_mx_quant_torch_adpt.h"
+#include "attention/mla_prolog_v3/mla_prolog_v3_torch_adpt.h"
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/Exception.h>
@@ -67,6 +67,9 @@
 namespace vllm_ascend {
 
 namespace {
+
+constexpr int64_t DSA_SLOT_MAPPING_FLAT = 1;
+constexpr int64_t DSA_SLOT_MAPPING_BLOCK_OFFSET = 2;
 
 struct DevicePrintPayload {
     std::string message;
@@ -313,110 +316,6 @@ AscendType get_dtype_from_torch(at::ScalarType scalarType)
     }
 }
 
-std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask(
-    at::Tensor &input,
-    const int64_t org_vocab_start_index,
-    const int64_t org_vocab_end_index,
-    const int64_t num_org_vocab_padding,
-    const int64_t added_vocab_start_index,
-    const int64_t added_vocab_end_index)
-    /*
-    https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/vocab_parallel_embedding.py#L161-L198
-    Embedding parallelized in the vocabulary dimension.
-
-    Adapted from torch.nn.Embedding, note that we pad the vocabulary size to
-    make sure it is divisible by the number of model parallel GPUs.
-
-    In order to support various loading methods, we ensure that LoRA-added
-    embeddings are always at the end of TP-sharded tensors. In other words,
-    we shard base embeddings and LoRA embeddings separately (both padded),
-    and place them in the same tensor.
-    In this example, we will have the original vocab size = 1010,
-    added vocab size = 16 and padding to 64. Therefore, the total
-    vocab size with padding will be 1088 (because we first pad 1010 to
-    1024, add 16, and then pad to 1088).
-    Therefore, the tensor format looks like the following:
-    TP1, rank 0 (no sharding):
-                            |< --------BASE-------- >|< -BASE PADDING-- >|< -----LORA------ >|< -LORA PADDING-- >|
-    corresponding token_id: |  0  |  1  | ... | 1009 |  -1  | ... |  -1  | 1010 | ... | 1015 |  -1  | ... |  -1  |
-                     index: |  0  |  1  | ... | 1009 | 1010 | ... | 1023 | 1024 | ... | 1039 | 1040 | ... | 1087 |
-
-    TP2, rank 0:
-                            |< --------------------BASE--------------------- >|< -----LORA------ >|< -LORA PADDING- >|
-    corresponding token_id: |  0  |  1  |  2  | ... | 497  | 498 | ...  | 511 | 1000 | ... | 1015 |  -1  | ... |  -1 |
-                     index: |  0  |  1  |  2  | ... | 497  | 498 | ...  | 511 | 512  | ... | 527  |  520 | ... | 543 |
-    TP2, rank 1:
-                            |< -----------BASE----------- >|< -BASE PADDING- >|< -----------LORA PADDING----------- >|
-    corresponding token_id: | 512 | 513 | 514 | ... | 1009 | -1  | ...  | -1  |  -1  | ... |  -1  | -1  | ... |   -1 |
-                     index: |  0  |  1  |  2  | ... | 497  | 498 | ...  | 511 | 512  | ... | 519  | 520 | ... |  543 |
-    Parameters:
-        org_vocab_start_index //base embeddings start
-        org_vocab_end_index //base embeddings end
-        num_org_vocab_padding //base embeddings padding
-        added_vocab_start_index //LoRA embeddings start
-        added_vocab_end_index //LoRA embeddings end
-    */
-{
-    // Input validation
-    TORCH_CHECK(input.dim() >= 1, "input must have at least 1 dimension");
-    TORCH_CHECK(org_vocab_start_index >= 0, "org_vocab_start_index must be non-negative");
-    TORCH_CHECK(org_vocab_end_index >= org_vocab_start_index, "org_vocab_end_index must be greater than org_vocab_start_index");
-    TORCH_CHECK(num_org_vocab_padding >= 0, "num_org_vocab_padding must be non-negative");
-    TORCH_CHECK(added_vocab_start_index >= org_vocab_end_index, "added_vocab_start_index must be greater than org_vocab_end_index");
-    TORCH_CHECK(added_vocab_end_index >= added_vocab_start_index, "added_vocab_end_index must be greater than added_vocab_start_index");
-
-    // Get total number of elements
-    int64_t size = input.numel();
-
-    // Create output tensors
-    at::Tensor masked_input = at::empty_like(input);
-    at::Tensor mask = at::empty_like(input).to(at::kBool);
-
-    // Get data pointers
-    void *input_ptr = input.data_ptr();
-    void *masked_input_ptr = masked_input.data_ptr();
-    void *mask_ptr = mask.data_ptr();
-
-    // Get current stream
-    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-
-    // Get scalar type
-    at::ScalarType scalar_type = input.scalar_type();
-
-    // Create and configure OpCommand
-    at_npu::native::OpCommand cmd;
-    cmd.Name("get_masked_input_and_mask");
-    cmd.SetCustomHandler([scalar_type, size, stream,
-                         input_ptr, masked_input_ptr, mask_ptr,
-                         org_vocab_start_index, org_vocab_end_index,
-                         num_org_vocab_padding, added_vocab_start_index,
-                         added_vocab_end_index]() -> int {
-        int device_id = 0;
-        int64_t aiv_num = 0;
-        TORCH_CHECK(aclGetDeviceCapability(device_id, ACL_DEVICE_INFO_VECTOR_CORE_NUM, &aiv_num) == ACL_SUCCESS);
-        uint32_t loop_cnt = (size + aiv_num - 1) / aiv_num;
-
-        // Call implementation
-        get_masked_input_and_mask_impl(
-            stream,
-            input_ptr,
-            masked_input_ptr,
-            mask_ptr,
-            org_vocab_start_index,
-            org_vocab_end_index,
-            num_org_vocab_padding,
-            added_vocab_start_index,
-            added_vocab_end_index,
-            size,
-            loop_cnt,
-            aiv_num);
-
-        return 0;
-    });
-    cmd.Run();
-    return {masked_input, mask};
-}
-
 void bgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Tensor &y, double scale)
 {
     at::ScalarType scalar_type = x.scalar_type();
@@ -591,215 +490,6 @@ at::Tensor sgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indic
 }
 #endif
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> dispatch_prefill(
-    const at::Tensor& x, const at::Tensor& topk_idx, const at::Tensor& topk_weights,
-    const at::Tensor& num_tokens_per_rank, const at::Tensor& is_token_in_rank, at::Tensor& num_tokens_per_expert,
-    int64_t num_worst_tokens, c10::string_view groupEp, int64_t rank, int64_t num_ranks) {
-    std::vector<char> group_ep_chrs(groupEp.begin(), groupEp.end());
-    group_ep_chrs.push_back('\0');
-    char* group_ep_ptr = &group_ep_chrs[0];
-    at::Tensor new_x = x;
-
-    // Type checks
-    TORCH_BIND_ASSERT(is_token_in_rank.scalar_type() == at::kBool);
-    TORCH_BIND_ASSERT(num_tokens_per_expert.scalar_type() == at::kInt);
-    TORCH_BIND_ASSERT(num_tokens_per_rank.scalar_type() == at::kInt);
-
-    // Shape and contiguous checks
-    TORCH_BIND_ASSERT(new_x.dim() == 2 and new_x.is_contiguous());
-    // TORCH_BIND_ASSERT((x.size(1) * x.element_size()) % sizeof(int4) == 0);
-    TORCH_BIND_ASSERT(is_token_in_rank.dim() == 2 and is_token_in_rank.is_contiguous());
-    TORCH_BIND_ASSERT(is_token_in_rank.size(0) == new_x.size(0) and is_token_in_rank.size(1) == num_ranks);
-    TORCH_BIND_ASSERT(num_tokens_per_expert.dim() == 1 and num_tokens_per_expert.is_contiguous());
-    TORCH_BIND_ASSERT(num_tokens_per_expert.size(0) % num_ranks == 0);
-    TORCH_BIND_ASSERT(num_tokens_per_rank.dim() == 1 and num_tokens_per_rank.is_contiguous());
-    TORCH_BIND_ASSERT(num_tokens_per_rank.size(0) == num_ranks);
-
-    auto num_tokens = static_cast<int>(new_x.size(0));
-    auto hidden = static_cast<int>(new_x.size(1));
-    auto num_experts = static_cast<int64_t>(num_tokens_per_expert.size(0));
-    auto num_local_experts = static_cast<int>(num_experts / num_ranks);
-
-    // Top-k checks
-    int num_topk = 0;
-    num_topk = static_cast<int>(topk_idx.size(1));
-    TORCH_BIND_ASSERT(num_experts > 0);
-    TORCH_BIND_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
-    TORCH_BIND_ASSERT(topk_weights.dim() == 2 and topk_weights.is_contiguous());
-    TORCH_BIND_ASSERT(num_tokens == topk_idx.size(0));
-    TORCH_BIND_ASSERT(num_topk == topk_weights.size(1));
-    TORCH_BIND_ASSERT(topk_weights.scalar_type() == at::kFloat);
-
-    int send_per_group = 3;  // (send_to_expert_num, send_to_expert_offset, send_rank_tokens)
-
-    auto send_data = at::empty({num_experts * send_per_group}, at::dtype(at::kInt).device(x.device()));
-    int64_t send_count = send_per_group * num_local_experts * num_ranks;
-
-    auto send_data_offset = at::empty({num_experts}, at::dtype(at::kInt).device(x.device()));
-    at::Tensor recv_data = at::empty({num_experts * send_per_group}, at::dtype(at::kInt).device(x.device()));
-
-    int64_t local_rank_size = num_ranks;
-    int64_t local_rank_id = rank % local_rank_size;
-
-    EXEC_NPU_CMD(aclnnNotifyDispatch,
-        send_data,
-        num_tokens_per_expert,
-        send_count,
-        num_tokens,
-        group_ep_ptr,  // commGroup
-        num_ranks,     // rankSize
-        rank,          // rankId
-        local_rank_size,
-        local_rank_id,
-        send_data_offset,
-        recv_data);
-
-    auto options_cpu = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
-    std::vector<int32_t> local_expert_acc(num_experts, 0);
-    auto send_token_idx_cpu = at::empty({num_tokens, num_topk}, options_cpu);
-    auto send_token_idx_ptr = send_token_idx_cpu.data_ptr<int>();
-
-    auto topk_idx_cpu = topk_idx.to(at::kCPU);
-    auto topk_idx_ptr = topk_idx_cpu.data_ptr<int64_t>();
-    for (int i = 0; i < num_tokens; ++i) {
-        for (int j = 0; j < num_topk; ++j) {
-            int64_t expert_idx = topk_idx_ptr[i * num_topk + j];
-            if (expert_idx >= 0) {
-                int32_t cnt = local_expert_acc[expert_idx];
-                send_token_idx_ptr[i * num_topk + j] = cnt;
-                local_expert_acc[expert_idx]++;
-            }
-        }
-    }
-
-    TORCH_BIND_ASSERT(recv_data.dim() == 1 and recv_data.is_contiguous());
-    TORCH_BIND_ASSERT(recv_data.size(0) % num_experts == 0);
-    at::Tensor recv_offset_cpu = at::empty({num_experts}, options_cpu);
-    at::Tensor recv_count_cpu = at::empty({num_experts}, options_cpu);
-    auto recv_data_cpu = recv_data.to(at::kCPU);
-    auto recv_data_ptr = recv_data_cpu.data_ptr<int>();
-    auto recv_count_ptr = recv_count_cpu.data_ptr<int>();
-    auto recv_offset_ptr = recv_offset_cpu.data_ptr<int>();
-    int64_t total_recv_tokens = 0;
-    int64_t num_max_dispatch_tokens_per_rank = 0;
-    std::vector<int64_t> num_recv_tokens_per_expert_list;
-
-    for (int64_t local_e = 0; local_e < num_local_experts; ++local_e) {
-        int64_t local_expert_recv_tokens = 0;
-        for (int64_t src_rank = 0; src_rank < num_ranks; ++src_rank) {
-            int64_t index = local_e * num_ranks + src_rank;
-            int64_t pair_idx = send_per_group * (src_rank * num_local_experts + local_e);
-
-            int recv_cnt = recv_data_ptr[pair_idx];                 // count from this src_rank for
-                                                                    // this global_expert
-            int recv_off = recv_data_ptr[pair_idx + 1];             // offset in that src_rank's window
-            int64_t send_num_tokens = recv_data_ptr[pair_idx + 2];  // all bs from rank
-
-            total_recv_tokens += recv_cnt;
-            recv_count_ptr[index] = total_recv_tokens;
-            recv_offset_ptr[index] = recv_off;
-            num_max_dispatch_tokens_per_rank = std::max(num_max_dispatch_tokens_per_rank, send_num_tokens);
-
-            local_expert_recv_tokens += recv_cnt;
-        }
-        num_recv_tokens_per_expert_list.push_back(local_expert_recv_tokens);
-    }
-    auto option = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
-    at::Tensor num_recv_tokens_per_expert = torch::from_blob(
-        num_recv_tokens_per_expert_list.data(), {static_cast<int64_t>(num_recv_tokens_per_expert_list.size())}, option)
-        .clone();
-
-    at::Tensor expert_ids = topk_idx.to(at::kInt);
-    int64_t tp_size = 1;
-    int64_t tp_rank = 0;
-    int64_t quant_mode = 0;
-    int64_t global_bs = static_cast<int64_t>(
-        std::max(num_max_dispatch_tokens_per_rank * num_ranks, static_cast<int64_t>(num_worst_tokens)));
-
-    auto send_token_idx = send_token_idx_cpu.to(x.device());
-    auto recv_offset = recv_offset_cpu.to(x.device());
-    auto recv_count = recv_count_cpu.to(x.device());
-
-    int total_cnt = total_recv_tokens;
-    if (total_cnt == 0) {
-        total_cnt = 1;
-    }
-    auto expandx_out = at::empty({total_cnt, hidden}, x.options());
-    auto dynamic_scales_out = at::empty({total_cnt}, at::dtype(at::kFloat).device(x.device()));
-    auto expand_idx_out = at::empty({total_cnt * 3}, at::dtype(at::kInt).device(x.device()));
-
-    EXEC_NPU_CMD(aclnnMoeDispatchNormal,
-        new_x,
-        expert_ids,
-        send_data_offset,
-        send_token_idx,
-        recv_offset,
-        recv_count,
-        group_ep_ptr,  // commGroup
-        num_ranks,     // rankSize
-        rank,          // rankId
-        group_ep_ptr,
-        tp_size,
-        tp_rank,
-        num_experts,
-        quant_mode,
-        global_bs,
-        expandx_out,
-        dynamic_scales_out,
-        expand_idx_out);
-
-    // Return values
-    return {expandx_out, expand_idx_out, recv_count, num_recv_tokens_per_expert};
-}
-
-at::Tensor convert_hamming_dist_top_k_output(const at::Tensor &hashq,
-                                             const at::Tensor &hashkCache,
-                                             const c10::optional<at::Tensor>& indices) {
-    if (indices.has_value()) {
-        return indices.value();
-    }
-    uint32_t MAX_BLOCK_PER_REQ_INHSA = 512;
-
-    auto n_bs = hashq.size(0);
-    auto n_kv_heads = hashkCache.size(1);
-    auto n_max_kv = MAX_BLOCK_PER_REQ_INHSA;
-    at::Tensor res = at::empty({n_bs, n_kv_heads, n_max_kv}, torch::TensorOptions().dtype(torch::kInt32).device(hashq.device()));
-    return res;
-}
-
-at::Tensor npu_hamming_dist_top_k(const at::Tensor &hashq,
-                                       const at::Tensor &hashkCache,
-                                       const at::Tensor& hashkCacheRope,
-                                       const at::Tensor &topN,
-                                       const at::Tensor &seqLen,
-                                       const c10::optional<at::Tensor> &chunkSize,
-                                       const c10::optional<int64_t> maxSeqLen,
-                                       const c10::optional<int64_t> sink,
-                                       const c10::optional<int64_t> recent,
-                                       const c10::optional<int64_t> supportOffload,
-                                       const c10::optional<at::Tensor> &blockTable,
-                                       const c10::optional<at::Tensor> &mask,
-                                       const c10::optional<at::Tensor>& indices) {
-
-    auto&& maxSeqLen_ = maxSeqLen.value_or(0);
-    auto&& sink_ = sink.value_or(0);
-    auto&& recent_ = recent.value_or(0);
-    auto&& supportOffload_ = supportOffload.value_or(0);
-
-    at::Tensor out = convert_hamming_dist_top_k_output(hashq, hashkCache, indices);
-    EXEC_NPU_CMD(aclnnHammingDistTopK, hashq, hashkCache, topN, seqLen, chunkSize, blockTable, indices, hashkCacheRope, mask, maxSeqLen_, sink_, recent_, supportOffload_, out);
-    return out;
-}
-
-at::Tensor npu_reshape_and_cache_bnsd(const at::Tensor& hashq,
-                                           const at::Tensor& hashkCache,
-                                           const at::Tensor& slotMapping,
-                                           const at::Tensor& seqLen,
-                                           const at::Tensor& hashkCacheOut) {
-    EXEC_NPU_CMD(aclnnReshapeAndCacheBnsd, hashq, hashkCache, slotMapping, seqLen, hashkCacheOut);
-    return hashkCacheOut;
-}
-
 at::Tensor npu_sign_bits_pack(const at::Tensor& input,
                                    const int64_t size) {
     int64_t ySize = (input.size(0) + 7) / 8;
@@ -942,10 +632,10 @@ at::Tensor npu_causal_conv1d_custom(
     const at::Tensor& weight,
     const at::Tensor& conv_state,
     const c10::optional<at::Tensor>& bias_opt,
-    at::IntArrayRef query_start_loc_opt,
-    at::IntArrayRef cache_indices_opt,
-    at::IntArrayRef initial_state_mode_opt,
-    at::IntArrayRef num_accepted_tokens_opt,
+    const c10::optional<at::Tensor>& query_start_loc_opt,
+    const c10::optional<at::Tensor>& cache_indices_opt,
+    const c10::optional<at::Tensor>& initial_state_mode_opt,
+    const c10::optional<at::Tensor>& num_accepted_tokens_opt,
     int64_t  activation_mode,
     int64_t  pad_slot_id,
     int64_t  run_mode)
@@ -1191,6 +881,118 @@ std::tuple<at::Tensor> compressor(const at::Tensor &x, const at::Tensor &wkv, co
     return std::tuple<at::Tensor>(cmp_kv);
 }
 
+void check_compressor_metadata_common(
+    const at::Tensor &rope_cos, const at::Tensor &rope_sin, const at::Tensor &cu_seqlens,
+    const at::Tensor &start_pos, const at::Tensor &kv_block_table, int64_t kv_block_size,
+    int64_t slot_mapping_format, int64_t compress_ratio, int64_t num_reqs_actual)
+{
+    constexpr int64_t DIM_2 = 2;
+    constexpr int64_t VALUE_0 = 0;
+
+    TORCH_CHECK(rope_cos.defined() && rope_sin.defined(), "rope_cos and rope_sin should be defined");
+    TORCH_CHECK(rope_cos.dim() == DIM_2 && rope_sin.dim() == DIM_2,
+                "rope_cos and rope_sin should be 2D tensors");
+    TORCH_CHECK(rope_cos.scalar_type() == rope_sin.scalar_type(),
+                "rope_cos and rope_sin should have same dtype");
+    TORCH_CHECK(rope_cos.size(0) == rope_sin.size(0) && rope_cos.size(1) == rope_sin.size(1),
+                "rope_cos and rope_sin should have same shape");
+    TORCH_CHECK(rope_cos.size(0) > VALUE_0 && rope_cos.size(1) > VALUE_0,
+                "rope_cos shape should be non-empty");
+    TORCH_CHECK(cu_seqlens.defined() && cu_seqlens.dim() == 1, "cu_seqlens should be a 1D tensor");
+    TORCH_CHECK(start_pos.defined() && start_pos.dim() == 1, "start_pos should be a 1D tensor");
+    TORCH_CHECK(kv_block_table.defined() && kv_block_table.dim() == DIM_2, "kv_block_table should be a 2D tensor");
+    TORCH_CHECK(kv_block_size > VALUE_0, "kv_block_size should be greater than 0");
+    TORCH_CHECK(compress_ratio > VALUE_0, "compress_ratio should be greater than 0");
+    TORCH_CHECK(slot_mapping_format == DSA_SLOT_MAPPING_BLOCK_OFFSET || slot_mapping_format == DSA_SLOT_MAPPING_FLAT,
+                "slot_mapping_format should be 1(flat) or 2(block_offset), but got ", slot_mapping_format);
+    TORCH_CHECK(num_reqs_actual > VALUE_0, "num_reqs_actual should be greater than 0");
+    TORCH_CHECK(cu_seqlens.size(0) > num_reqs_actual,
+                "cu_seqlens dim0 should be greater than num_reqs_actual");
+    TORCH_CHECK(start_pos.size(0) >= num_reqs_actual,
+                "start_pos dim0 should be greater than or equal to num_reqs_actual");
+    TORCH_CHECK(kv_block_table.size(0) >= num_reqs_actual,
+                "kv_block_table dim0 should be greater than or equal to num_reqs_actual");
+}
+
+void check_compressor_metadata_outputs(
+    const at::Tensor &rope_cos, const at::Tensor &compress_cos, const at::Tensor &compress_sin,
+    const at::Tensor &slot_mapping, int64_t slot_mapping_format)
+{
+    constexpr int64_t DIM_2 = 2;
+    constexpr int64_t VALUE_0 = 0;
+
+    TORCH_CHECK(compress_cos.defined() && compress_sin.defined() && slot_mapping.defined(),
+                "compress_cos, compress_sin, and slot_mapping should be defined");
+    TORCH_CHECK(compress_cos.dim() >= DIM_2, "compress_cos dim num should be at least 2");
+    TORCH_CHECK(compress_sin.dim() == compress_cos.dim(), "compress_cos and compress_sin should have same dim num");
+    TORCH_CHECK(compress_cos.size(0) > VALUE_0, "compress_cos dim0 should be greater than 0");
+    TORCH_CHECK(compress_cos.size(compress_cos.dim() - 1) == rope_cos.size(1),
+                "compress_cos last dim should match rope dim");
+    for (int64_t dim_idx = 0; dim_idx < compress_cos.dim(); ++dim_idx) {
+        TORCH_CHECK(compress_sin.size(dim_idx) == compress_cos.size(dim_idx),
+                    "compress_cos and compress_sin should have same shape");
+    }
+    TORCH_CHECK(compress_cos.scalar_type() == rope_cos.scalar_type() &&
+                    compress_sin.scalar_type() == rope_cos.scalar_type(),
+                "compress outputs should have same dtype as rope_cos");
+    TORCH_CHECK(slot_mapping.scalar_type() == at::kInt, "slot_mapping dtype should be int32");
+    if (slot_mapping_format == DSA_SLOT_MAPPING_BLOCK_OFFSET) {
+        TORCH_CHECK(slot_mapping.dim() == DIM_2 && slot_mapping.size(0) == compress_cos.size(0) &&
+                        slot_mapping.size(1) == DIM_2,
+                    "block_offset slot_mapping should have shape [num_rows, 2]");
+    } else {
+        TORCH_CHECK(slot_mapping.dim() == 1 && slot_mapping.size(0) == compress_cos.size(0),
+                    "flat slot_mapping should have shape [num_rows]");
+    }
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> compressor_metadata(
+    const at::Tensor &rope_cos, const at::Tensor &rope_sin, const at::Tensor &cu_seqlens,
+    const at::Tensor &start_pos, const at::Tensor &kv_block_table, int64_t kv_block_size,
+    int64_t slot_mapping_format, int64_t compress_ratio, int64_t num_compressed_tokens, int64_t num_reqs_actual)
+{
+    constexpr int64_t VALUE_0 = 0;
+
+    check_compressor_metadata_common(
+        rope_cos, rope_sin, cu_seqlens, start_pos, kv_block_table, kv_block_size, slot_mapping_format, compress_ratio,
+        num_reqs_actual);
+    TORCH_CHECK(num_compressed_tokens > VALUE_0, "num_compressed_tokens should be greater than 0");
+
+    at::SmallVector<int64_t, 4> rope_output_size = {num_compressed_tokens, 1, 1, rope_cos.size(1)};
+    at::Tensor compress_cos = at::empty(rope_output_size, rope_cos.options());
+    at::Tensor compress_sin = at::empty(rope_output_size, rope_sin.options());
+
+    at::SmallVector<int64_t, 2> slot_mapping_size;
+    if (slot_mapping_format == DSA_SLOT_MAPPING_BLOCK_OFFSET) {
+        slot_mapping_size = {num_compressed_tokens, 2};
+    } else {
+        slot_mapping_size = {num_compressed_tokens};
+    }
+    at::Tensor slot_mapping = at::empty(slot_mapping_size, kv_block_table.options().dtype(at::kInt));
+
+    EXEC_NPU_CMD(aclnnCompressorMetadata, rope_cos, rope_sin, cu_seqlens, start_pos, kv_block_table,
+                 kv_block_size, slot_mapping_format, compress_ratio, num_reqs_actual, compress_cos, compress_sin,
+                 slot_mapping);
+    return std::make_tuple(compress_cos, compress_sin, slot_mapping);
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> compressor_metadata_out(
+    const at::Tensor &rope_cos, const at::Tensor &rope_sin, const at::Tensor &cu_seqlens,
+    const at::Tensor &start_pos, const at::Tensor &kv_block_table, int64_t kv_block_size,
+    int64_t slot_mapping_format, int64_t compress_ratio, int64_t num_reqs_actual, at::Tensor &compress_cos,
+    at::Tensor &compress_sin, at::Tensor &slot_mapping)
+{
+    check_compressor_metadata_common(
+        rope_cos, rope_sin, cu_seqlens, start_pos, kv_block_table, kv_block_size, slot_mapping_format, compress_ratio,
+        num_reqs_actual);
+    check_compressor_metadata_outputs(rope_cos, compress_cos, compress_sin, slot_mapping, slot_mapping_format);
+
+    EXEC_NPU_CMD(aclnnCompressorMetadata, rope_cos, rope_sin, cu_seqlens, start_pos, kv_block_table,
+                 kv_block_size, slot_mapping_format, compress_ratio, num_reqs_actual, compress_cos, compress_sin,
+                 slot_mapping);
+    return std::make_tuple(compress_cos, compress_sin, slot_mapping);
+}
+
 std::tuple<at::Tensor, at::Tensor> construct_quant_lightning_indexer_output_tensor(const at::Tensor& query, const at::Tensor& key,
                                                            int64_t sparse_count, std::string query_layout_str,
                                                            std::string key_layout_str, bool return_value)
@@ -1227,7 +1029,7 @@ std::tuple<at::Tensor, at::Tensor> construct_quant_lightning_indexer_output_tens
     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
 }
 
-std::tuple<at::Tensor, at::Tensor> npu_quant_lightning_indexer_npu(
+std::tuple<at::Tensor, at::Tensor> npu_vllm_quant_lightning_indexer_npu(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &weights,
     const at::Tensor &query_dequant_scale, const at::Tensor &key_dequant_scale,
     int64_t query_quant_mode, int64_t key_quant_mode,
@@ -1259,7 +1061,7 @@ std::tuple<at::Tensor, at::Tensor> npu_quant_lightning_indexer_npu(
                     "key_dequant_scale must be contiguous on all axes except axis 0");
     }
 
-    EXEC_NPU_CMD(aclnnQuantLightningIndexer, query,
+    EXEC_NPU_CMD(aclnnVllmQuantLightningIndexer, query,
         key, weights, query_dequant_scale, key_dequant_scale, actual_seq_lengths_query, actual_seq_lengths_key,
         block_table, metadata, query_quant_mode, key_quant_mode, query_layout_ptr, key_layout_ptr, sparse_count, sparse_mode,
         pre_tokens, next_tokens, cmp_ratio, return_value, stride, scale_stride, sparse_indices_out, sparse_values_out);
@@ -1388,7 +1190,7 @@ at::Tensor npu_sparse_attn_sharedkv_metadata_npu(
     return output;
 }
 
-at::Tensor npu_quant_lightning_indexer_metadata_npu(
+at::Tensor npu_vllm_quant_lightning_indexer_metadata_npu(
     int64_t num_heads_q, int64_t num_heads_k, int64_t head_dim, int64_t query_quant_mode, int64_t key_quant_mode,
     const c10::optional<at::Tensor> &actual_seq_lengths_query, const c10::optional<at::Tensor> &actual_seq_lengths_key, int64_t batch_size,
     int64_t max_seqlen_q, int64_t max_seqlen_k, const c10::string_view layout_query, c10::string_view layout_key, int64_t sparse_count,
@@ -1411,7 +1213,7 @@ at::Tensor npu_quant_lightning_indexer_metadata_npu(
     std::string layout_key_str = std::string(layout_key);
     char *layout_key_ptr = const_cast<char *>(layout_key_str.c_str());
 
-    EXEC_NPU_CMD(aclnnQuantLightningIndexerMetadata, actual_seq_lengths_query_val, actual_seq_lengths_key_val,
+    EXEC_NPU_CMD(aclnnVllmQuantLightningIndexerMetadata, actual_seq_lengths_query_val, actual_seq_lengths_key_val,
                     num_heads_q, num_heads_k, head_dim, query_quant_mode, key_quant_mode, batch_size,
                     max_seqlen_q, max_seqlen_k, layout_query_ptr, layout_key_ptr, sparse_count,
                     sparse_mode, pre_tokens, next_tokens, cmp_ratio, output);
@@ -1485,9 +1287,6 @@ constexpr int64_t HC_PRE_HC_LIMIT = 4;
 constexpr int64_t HC_PRE_D_LIMIT = 4096;
 constexpr int64_t HC_PRE_D_LIMIT_EXTEND = 7168;
 constexpr int64_t HC_PRE_MIX_HC_LIMIT = 24;
-constexpr int64_t HC_PRE_FUSION_BASE_BS = 8192;
-constexpr int64_t HC_PRE_FUSION_SPLIT_K_MAX_BS = 512;
-constexpr const char* ASCEND_950_PREFIX = "Ascend950";
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_hc_pre_output_tensor(const at::Tensor& x, int64_t hc_mult)
 {
@@ -1573,29 +1372,6 @@ void check_hc_pre_shape_and_dtype(
     TORCH_CHECK(hc_base.dtype() == at::kFloat, "hc_base's dtype should be FLOAT32.");
 }
 
-int64_t get_hc_pre_batch_size(const at::Tensor& x)
-{
-    if (x.dim() == 4) {
-        return x.size(0) * x.size(1);
-    }
-    return x.size(0);
-}
-
-bool is_ascend950()
-{
-    static const char* soc_name = aclrtGetSocName();
-    return soc_name != nullptr && std::string(soc_name).find(ASCEND_950_PREFIX) == 0;
-}
-
-bool should_use_hc_pre_fusion(const at::Tensor& x)
-{
-    if (!is_ascend950()) {
-        return true;
-    }
-    auto bs = get_hc_pre_batch_size(x);
-    return bs <= HC_PRE_FUSION_SPLIT_K_MAX_BS || bs % HC_PRE_FUSION_BASE_BS == 0;
-}
-
 std::tuple<at::Tensor, at::Tensor, at::Tensor> run_hc_pre_composite(
     const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base,
     int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps, double hc_eps)
@@ -1650,9 +1426,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_v2_npu(
     int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps, double hc_eps)
 {
     check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, hc_mult);
-    if (!should_use_hc_pre_fusion(x)) {
-        return run_hc_pre_composite(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
-    }
     return run_hc_pre_fusion(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
 }
 
@@ -2142,9 +1915,7 @@ std::tuple<at::Tensor, at::Tensor> npu_dequant_swiglu_quant(
     const at::Tensor& bias_opt = c10::value_or_else(bias, [] { return at::Tensor(); });
     const at::Tensor& quant_scale_opt = c10::value_or_else(quant_scale, [] { return at::Tensor(); });
     const at::Tensor& quant_offset_opt = c10::value_or_else(quant_offset, [] { return at::Tensor(); });
-    const at::Tensor& group_index_value = c10::value_or_else(group_index, [&x] {
-        return at::empty({1}, x.options().dtype(c10::ScalarType::Long)).fill_(x.size(0));
-    });
+    const at::Tensor& group_index_opt = c10::value_or_else(group_index, [] { return at::Tensor(); });
 
     static const bool is_v2_available =
         GetOpApiFuncAddr("aclnnDequantSwigluQuantV2") != nullptr &&
@@ -2152,13 +1923,13 @@ std::tuple<at::Tensor, at::Tensor> npu_dequant_swiglu_quant(
 
     if (swiglu_mode == 0 && !is_v2_available) {
         EXEC_NPU_CMD(aclnnDequantSwigluQuant, x, weight_scale_value, activation_scale_opt, bias_opt, quant_scale_opt,
-                     quant_offset_opt, group_index_value, activate_left, quant_mode_ptr, y, scale);
+                     quant_offset_opt, group_index_opt, activate_left, quant_mode_ptr, y, scale);
     } else {
         int64_t dst_type = 2;
         char* round_mode = const_cast<char*>("rint");
         int64_t activate_dim = -1;
         EXEC_NPU_CMD(aclnnDequantSwigluQuantV2, x, weight_scale_value, activation_scale_opt, bias_opt, quant_scale_opt,
-                     quant_offset_opt, group_index_value, activate_left, quant_mode_ptr, dst_type, round_mode,
+                     quant_offset_opt, group_index_opt, activate_left, quant_mode_ptr, dst_type, round_mode,
                      activate_dim, swiglu_mode, clamp_limit, glu_alpha, glu_bias, y, scale);
     }
 
@@ -2271,6 +2042,320 @@ at::Tensor chunk_fwd_o(
     return o;
 }
 
+namespace {
+
+int64_t kda_ceil_div(int64_t x, int64_t y)
+{
+    return (x + y - 1) / y;
+}
+
+int64_t get_kda_seq_num(int64_t batch, const c10::optional<at::IntArrayRef> &cu_seqlens)
+{
+    if (!cu_seqlens.has_value()) {
+        return batch;
+    }
+    return static_cast<int64_t>(cu_seqlens.value().size()) - 1;
+}
+
+void check_kda_cu_seqlens(const c10::optional<at::IntArrayRef> &cu_seqlens,
+                          int64_t total_tokens,
+                          const char *op_name)
+{
+    if (!cu_seqlens.has_value()) {
+        return;
+    }
+    auto cu = cu_seqlens.value();
+    TORCH_CHECK(cu.size() >= 2, op_name, ": cu_seqlens must contain at least [0, total_tokens].");
+    TORCH_CHECK(cu[0] == 0, op_name, ": cu_seqlens[0] must be 0, but got ", cu[0], ".");
+    TORCH_CHECK(cu[cu.size() - 1] == total_tokens,
+                op_name, ": cu_seqlens[-1] must equal sequence length ",
+                total_tokens, ", but got ", cu[cu.size() - 1], ".");
+    for (size_t i = 0; i + 1 < cu.size(); ++i) {
+        TORCH_CHECK(cu[i] <= cu[i + 1],
+                    op_name, ": cu_seqlens must be nondecreasing, but cu_seqlens[",
+                    i, "]=", cu[i], " > cu_seqlens[", i + 1, "]=", cu[i + 1], ".");
+    }
+}
+
+void check_kda_chunk_indices(const c10::optional<at::IntArrayRef> &chunk_indices,
+                             const c10::optional<at::IntArrayRef> &cu_seqlens,
+                             int64_t chunk_size,
+                             const char *op_name)
+{
+    if (!chunk_indices.has_value()) {
+        return;
+    }
+    auto indices = chunk_indices.value();
+    TORCH_CHECK(indices.size() % 2 == 0,
+                op_name, ": chunk_indices must contain (seq_id, chunk_id) pairs, but got ",
+                indices.size(), " elements.");
+    TORCH_CHECK(cu_seqlens.has_value(), op_name, ": chunk_indices requires cu_seqlens.");
+    auto cu = cu_seqlens.value();
+    int64_t expected_chunks = 0;
+    for (size_t seq = 0; seq + 1 < cu.size(); ++seq) {
+        expected_chunks += kda_ceil_div(cu[seq + 1] - cu[seq], chunk_size);
+    }
+    TORCH_CHECK(static_cast<int64_t>(indices.size() / 2) == expected_chunks,
+                op_name, ": chunk_indices must contain exactly one pair per chunk.");
+    for (size_t idx = 0; idx < indices.size(); idx += 2) {
+        int64_t seq = indices[idx];
+        int64_t chunk = indices[idx + 1];
+        TORCH_CHECK(seq >= 0 && seq + 1 < static_cast<int64_t>(cu.size()),
+                    op_name, ": chunk_indices seq_id is out of range.");
+        int64_t chunks = kda_ceil_div(cu[seq + 1] - cu[seq], chunk_size);
+        TORCH_CHECK(chunk >= 0 && chunk < chunks,
+                    op_name, ": chunk_indices chunk_id is out of range.");
+    }
+}
+
+int64_t get_kda_total_chunks(int64_t batch,
+                             int64_t seqlen,
+                             int64_t chunk_size,
+                             const c10::optional<at::IntArrayRef> &cu_seqlens,
+                             const c10::optional<at::IntArrayRef> &chunk_indices)
+{
+    if (chunk_indices.has_value()) {
+        return static_cast<int64_t>(chunk_indices.value().size()) / 2;
+    }
+    if (!cu_seqlens.has_value()) {
+        return kda_ceil_div(seqlen, chunk_size);
+    }
+    (void)batch;
+    int64_t total = 0;
+    auto cu = cu_seqlens.value();
+    for (size_t i = 0; i + 1 < cu.size(); ++i) {
+        total += kda_ceil_div(cu[i + 1] - cu[i], chunk_size);
+    }
+    return total;
+}
+
+std::vector<int64_t> build_kda_chunk_indices(at::IntArrayRef cu_seqlens, int64_t chunk_size)
+{
+    std::vector<int64_t> indices;
+    int64_t total_chunks = 0;
+    for (size_t i = 0; i + 1 < cu_seqlens.size(); ++i) {
+        total_chunks += kda_ceil_div(cu_seqlens[i + 1] - cu_seqlens[i], chunk_size);
+    }
+    indices.reserve(static_cast<size_t>(total_chunks * 2));
+    for (size_t seq = 0; seq + 1 < cu_seqlens.size(); ++seq) {
+        int64_t seq_len = cu_seqlens[seq + 1] - cu_seqlens[seq];
+        int64_t chunks = kda_ceil_div(seq_len, chunk_size);
+        for (int64_t chunk = 0; chunk < chunks; ++chunk) {
+            indices.push_back(static_cast<int64_t>(seq));
+            indices.push_back(chunk);
+        }
+    }
+    return indices;
+}
+
+} // namespace
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+           at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+chunk_kda_fwd(
+    const at::Tensor &q,
+    const at::Tensor &k,
+    const at::Tensor &v,
+    const at::Tensor &gk,
+    const at::Tensor &beta,
+    double scale,
+    int64_t chunk_size,
+    c10::string_view layout,
+    const c10::optional<at::Tensor> &initial_state,
+    c10::optional<bool> output_final_state,
+    c10::optional<at::IntArrayRef> cu_seqlens,
+    c10::optional<at::IntArrayRef> chunk_indices,
+    c10::optional<bool> return_intermediate,
+    c10::optional<bool> safe_gate,
+    c10::optional<bool> transpose_state_layout)
+{
+    std::string layout_str(layout.data(), layout.size());
+    TORCH_CHECK(layout_str == "BSND" || layout_str == "BNSD" || layout_str == "TND" || layout_str == "NTD",
+                "chunk_kda_fwd: layout must be one of BSND, BNSD, TND, NTD and must be uppercase.");
+    TORCH_CHECK(!safe_gate.value_or(false), "chunk_kda_fwd: safe_gate=True is not supported.");
+    TORCH_CHECK(!transpose_state_layout.value_or(false),
+                "chunk_kda_fwd: transpose_state_layout=True is not supported.");
+    TORCH_CHECK(chunk_size == 32 || chunk_size == 64 || chunk_size == 128,
+                "chunk_kda_fwd: chunk_size must be 32, 64 or 128.");
+
+    bool is_tnd = layout_str == "TND";
+    bool is_ntd = layout_str == "NTD";
+    bool is_bsnd = layout_str == "BSND";
+    bool is_bnsd = layout_str == "BNSD";
+    bool is_rank3 = is_tnd || is_ntd;
+    TORCH_CHECK((is_rank3 && q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && gk.dim() == 3 && beta.dim() == 2) ||
+                    (!is_rank3 && q.dim() == 4 && k.dim() == 4 && v.dim() == 4 && gk.dim() == 4 && beta.dim() == 3),
+                "chunk_kda_fwd: layout/rank mismatch.");
+    TORCH_CHECK(q.sizes() == k.sizes(), "chunk_kda_fwd: q and k must have identical shape.");
+
+    auto q_sizes = q.sizes();
+    auto v_sizes = v.sizes();
+    bool is_internal_layout = is_bnsd || is_ntd;
+    int64_t B = is_rank3 ? 1 : q_sizes[0];
+    int64_t T = is_tnd ? q_sizes[0] : (is_ntd ? q_sizes[1] : (is_bnsd ? q_sizes[2] : q_sizes[1]));
+    int64_t H = is_tnd ? q_sizes[1] : (is_ntd ? q_sizes[0] : (is_bnsd ? q_sizes[1] : q_sizes[2]));
+    int64_t K = is_rank3 ? q_sizes[2] : q_sizes[3];
+    int64_t HV = is_tnd ? v_sizes[1] : (is_ntd ? v_sizes[0] : (is_bnsd ? v_sizes[1] : v_sizes[2]));
+    int64_t V = is_rank3 ? v_sizes[2] : v_sizes[3];
+    TORCH_CHECK(H > 0 && HV >= H, "chunk_kda_fwd: H and HV must be positive and H must be <= HV.");
+    TORCH_CHECK(H <= 128 && HV <= 128, "chunk_kda_fwd: H and HV must be <= 128.");
+    TORCH_CHECK(!is_tnd || H == 1,
+                "chunk_kda_fwd: TND layout with H > 1 is not supported; use NTD for multi-head rank3 input.");
+    check_kda_cu_seqlens(cu_seqlens, T, "chunk_kda_fwd");
+    check_kda_chunk_indices(chunk_indices, cu_seqlens, chunk_size, "chunk_kda_fwd");
+    TORCH_CHECK(!cu_seqlens.has_value() || is_rank3 || B == 1,
+                "chunk_kda_fwd: rank4 varlen input with cu_seqlens currently requires B=1.");
+    TORCH_CHECK(HV % H == 0, "chunk_kda_fwd: HV must be divisible by H.");
+    TORCH_CHECK(q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16,
+                "chunk_kda_fwd: q/k/v must use float16 or bfloat16.");
+    TORCH_CHECK(k.scalar_type() == q.scalar_type() && v.scalar_type() == q.scalar_type(),
+                "chunk_kda_fwd: q/k/v dtype must match.");
+    TORCH_CHECK(chunk_size == 64 && K >= 16 && V >= 16 && K % 16 == 0 && V % 16 == 0 && V <= 256 &&
+                    K * V >= 4 * 64 * 64 && K * V >= chunk_size * (K + V),
+                "chunk_kda_fwd: shape is outside the supported split cube/vector template.");
+
+    int64_t seq_num = get_kda_seq_num(B, cu_seqlens);
+    at::Tensor initial_state_tensor = initial_state.value_or(at::Tensor());
+    if (initial_state_tensor.defined()) {
+        TORCH_CHECK(initial_state_tensor.scalar_type() == at::kFloat,
+                    "chunk_kda_fwd: initial_state must be float32 when provided.");
+        TORCH_CHECK(initial_state_tensor.dim() == 4 && initial_state_tensor.size(0) == seq_num &&
+                        initial_state_tensor.size(1) == HV && initial_state_tensor.size(2) == K &&
+                        initial_state_tensor.size(3) == V,
+                    "chunk_kda_fwd: initial_state must be [seq_num,Hv,K,V].");
+    }
+
+    std::vector<int64_t> generated_chunk_indices;
+    c10::optional<at::IntArrayRef> chunk_indices_for_call;
+    if (chunk_indices.has_value()) {
+        chunk_indices_for_call = chunk_indices.value();
+    } else if (cu_seqlens.has_value()) {
+        generated_chunk_indices = build_kda_chunk_indices(cu_seqlens.value(), chunk_size);
+        chunk_indices_for_call = at::IntArrayRef(generated_chunk_indices);
+    } else {
+        chunk_indices_for_call = c10::nullopt;
+    }
+
+    int64_t total_chunks = get_kda_total_chunks(B, T, chunk_size, cu_seqlens, chunk_indices_for_call);
+    at::Tensor o = at::empty_like(v);
+    at::Tensor final_state_work = at::empty({seq_num, HV, K, V}, q.options().dtype(at::kFloat));
+    at::Tensor aqk = is_rank3 ? (is_internal_layout ? at::empty({HV, T, chunk_size}, q.options()) :
+        at::empty({T, HV, chunk_size}, q.options())) : (is_internal_layout ?
+        at::empty({B, HV, T, chunk_size}, q.options()) : at::empty({B, T, HV, chunk_size}, q.options()));
+    at::Tensor akk = at::empty_like(aqk);
+    at::Tensor w = is_rank3 ? (is_internal_layout ? at::empty({HV, T, K}, q.options()) :
+        at::empty({T, HV, K}, q.options())) : (is_internal_layout ?
+        at::empty({B, HV, T, K}, q.options()) : at::empty({B, T, HV, K}, q.options()));
+    at::Tensor u = at::empty_like(v);
+    at::Tensor qg = at::empty_like(w);
+    at::Tensor kg = at::empty_like(w);
+    at::Tensor v_new = at::empty_like(v);
+    at::Tensor h = is_rank3 ? (is_internal_layout ? at::empty({HV, total_chunks, K, V}, q.options()) :
+        at::empty({total_chunks, HV, K, V}, q.options())) : (is_internal_layout ?
+        at::empty({B, HV, total_chunks, K, V}, q.options()) :
+        at::empty({B, total_chunks, HV, K, V}, q.options()));
+
+    bool recompute_output_final_state = true;
+    char *layout_cstr = const_cast<char *>(layout_str.c_str());
+    EXEC_NPU_CMD(
+        aclnnChunkKdaFwd,
+        q, k, v, gk, beta, initial_state_tensor,
+        cu_seqlens, chunk_indices_for_call,
+        layout_cstr, scale, chunk_size, recompute_output_final_state, total_chunks,
+        o, final_state_work, aqk, akk, w, u, qg, kg, v_new, h
+    );
+
+    at::Tensor final_state = output_final_state.value_or(false) ?
+        final_state_work : at::empty({0}, q.options().dtype(at::kFloat));
+    at::Tensor empty = at::empty({0}, q.options());
+    at::Tensor g = gk.scalar_type() == at::kFloat ? gk : gk.to(at::kFloat);
+    at::Tensor initial_state_out = initial_state_tensor.defined() ? initial_state_tensor : empty;
+    (void)return_intermediate;
+    return std::make_tuple(o, final_state, g, aqk, akk, w, u, qg, kg, v_new, h, initial_state_out);
+}
+
+at::Tensor kda_gate_cumsum(
+    const at::Tensor &g,
+    int64_t chunk_size,
+    const c10::optional<at::Tensor> &A_log,
+    const c10::optional<at::Tensor> &dt_bias,
+    c10::optional<at::IntArrayRef> cu_seqlens,
+    c10::optional<bool> use_gate_in_kernel,
+    c10::optional<bool> safe_gate,
+    c10::optional<double> lower_bound,
+    c10::string_view layout)
+{
+    TORCH_CHECK(g.dim() == 3 || g.dim() == 4,
+                "kda_gate_cumsum: g must be BSND/BNSD rank4 or TND/NTD rank3.");
+    TORCH_CHECK(chunk_size == 32 || chunk_size == 64 || chunk_size == 128,
+                "kda_gate_cumsum: chunk_size must be 32, 64 or 128.");
+    auto gate_dtype = g.scalar_type();
+    TORCH_CHECK(gate_dtype == at::kFloat || gate_dtype == at::kBFloat16 || gate_dtype == at::kHalf,
+                "kda_gate_cumsum: g must be float32, bfloat16 or float16.");
+    std::string layout_str(layout.data(), layout.size());
+    TORCH_CHECK(layout_str == "BSND" || layout_str == "BNSD" || layout_str == "TND" || layout_str == "NTD",
+                "kda_gate_cumsum: layout must be uppercase and one of BSND, BNSD, TND or NTD.");
+    bool is_bnsd = layout_str == "BNSD";
+    bool is_ntd = layout_str == "NTD";
+    int64_t T = is_bnsd ? g.sizes()[2] : (is_ntd ? g.sizes()[1] : (g.dim() == 4 ? g.sizes()[1] : g.sizes()[0]));
+    int64_t K = g.dim() == 4 ? g.sizes()[3] : g.sizes()[2];
+    int64_t HV = is_bnsd ? g.sizes()[1] : (is_ntd ? g.sizes()[0] : (g.dim() == 4 ? g.sizes()[2] : g.sizes()[1]));
+    TORCH_CHECK(K <= 256, "kda_gate_cumsum: K must be <= 256.");
+    check_kda_cu_seqlens(cu_seqlens, T, "kda_gate_cumsum");
+    TORCH_CHECK(!cu_seqlens.has_value() || g.dim() == 3 || g.sizes()[0] == 1,
+                "kda_gate_cumsum: rank4 varlen input with cu_seqlens currently requires B=1.");
+
+    bool use_gate = use_gate_in_kernel.value_or(false);
+    bool safe = safe_gate.value_or(false);
+    double lower = lower_bound.value_or(-5.0);
+    at::Tensor A_log_tensor = A_log.value_or(at::Tensor());
+    at::Tensor dt_bias_tensor = dt_bias.value_or(at::Tensor());
+    if (use_gate) {
+        TORCH_CHECK(A_log_tensor.defined(), "kda_gate_cumsum: A_log is required when use_gate_in_kernel=True.");
+        TORCH_CHECK(A_log_tensor.scalar_type() == at::kFloat && A_log_tensor.dim() == 1 && A_log_tensor.sizes()[0] == HV,
+                    "kda_gate_cumsum: A_log must be float32 with shape [HV].");
+        TORCH_CHECK(safe, "kda_gate_cumsum: raw gate path currently requires safe_gate=True.");
+        TORCH_CHECK(lower >= -5.0 && lower < 0.0, "kda_gate_cumsum: lower_bound must be in [-5, 0).");
+    } else {
+        TORCH_CHECK(!safe, "kda_gate_cumsum: safe_gate only applies when use_gate_in_kernel=True.");
+    }
+
+    at::Tensor gk = at::empty(g.sizes(), g.options().dtype(at::kFloat));
+    char *layout_cstr = const_cast<char *>(layout_str.c_str());
+    EXEC_NPU_CMD(
+        aclnnKdaGateCumsum,
+        g, A_log_tensor, dt_bias_tensor, cu_seqlens,
+        chunk_size, use_gate, safe, lower, layout_cstr, gk
+    );
+    return gk;
+}
+
+at::Tensor kda_layout_swap12(
+    const at::Tensor &x,
+    const c10::optional<at::Tensor> &dependency)
+{
+    TORCH_CHECK(x.dim() >= 3, "kda_layout_swap12: x must have rank >= 3.");
+    auto dtype = x.scalar_type();
+    TORCH_CHECK(dtype == at::kFloat || dtype == at::kHalf || dtype == at::kBFloat16,
+                "kda_layout_swap12: x must be float32, float16 or bfloat16.");
+
+    std::vector<int64_t> y_sizes(x.sizes().begin(), x.sizes().end());
+    if (x.dim() == 3) {
+        std::swap(y_sizes[0], y_sizes[1]);
+    } else {
+        std::swap(y_sizes[1], y_sizes[2]);
+    }
+    at::Tensor y = at::empty(y_sizes, x.options());
+    at::Tensor dependency_tensor = dependency.value_or(at::Tensor());
+    if (dependency_tensor.defined()) {
+        TORCH_CHECK(dependency_tensor.sizes() == y.sizes(),
+                    "kda_layout_swap12: dependency must have the same shape as output.");
+    }
+
+    EXEC_NPU_CMD(aclnnKdaLayoutSwap12, x, dependency_tensor, y);
+    return y;
+}
+
 std::vector<int64_t> get_npu_storage_shape(const at::Tensor& tensor)
 {
     TORCH_CHECK(
@@ -2315,6 +2400,31 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                                   Tensor? num_accepted_tokens, "
         "                                   float scale_value=1.0) -> (Tensor output)");
     ops.impl("npu_recurrent_gated_delta_rule_310", torch::kPrivateUse1, &vllm_ascend::npu_recurrent_gated_delta_rule_310);
+
+    ops.def(
+        "chunk_gated_delta_rule_fwd_h(Tensor k, Tensor w, Tensor u, Tensor? g=None, *, Tensor? gk=None, Tensor? initial_state=None, bool? output_final_state=False, int? chunk_size=None, bool? save_new_value=True, int[]? cu_seqlens=None, int[]? chunk_indices=None, bool? use_exp2=False, bool? transpose_state_layout=False) -> (Tensor h_out, Tensor v_new_out, Tensor final_state_out)"
+    );
+    ops.impl("chunk_gated_delta_rule_fwd_h", torch::kPrivateUse1, &vllm_ascend::chunk_gated_delta_rule_fwd_h);
+
+    ops.def(
+        "chunk_fwd_o(Tensor q, Tensor k, Tensor v, Tensor h, float scale, *, Tensor? g=None, Tensor? g_gamma=None, int[]? cu_seqlens=None, int[]? chunk_indices=None, int? chunk_size=None, bool? transpose_state_layout=False) -> Tensor"
+    );
+    ops.impl("chunk_fwd_o", torch::kPrivateUse1, &vllm_ascend::chunk_fwd_o);
+
+    ops.def(
+        "chunk_kda_fwd(Tensor q, Tensor k, Tensor v, Tensor gk, Tensor beta, float scale, int chunk_size, str layout=\"BSND\", *, Tensor? initial_state=None, bool? output_final_state=False, int[]? cu_seqlens=None, int[]? chunk_indices=None, bool? return_intermediate=False, bool? safe_gate=False, bool? transpose_state_layout=False) -> (Tensor o, Tensor final_state, Tensor g, Tensor aqk, Tensor akk, Tensor w, Tensor u, Tensor qg, Tensor kg, Tensor v_new, Tensor h, Tensor initial_state_out)"
+    );
+    ops.impl("chunk_kda_fwd", torch::kPrivateUse1, &vllm_ascend::chunk_kda_fwd);
+
+    ops.def(
+        "kda_gate_cumsum(Tensor g, int chunk_size, *, Tensor? A_log=None, Tensor? dt_bias=None, int[]? cu_seqlens=None, bool? use_gate_in_kernel=False, bool? safe_gate=False, float? lower_bound=-5.0, str layout=\"BSND\") -> Tensor"
+    );
+    ops.impl("kda_gate_cumsum", torch::kPrivateUse1, &vllm_ascend::kda_gate_cumsum);
+
+    ops.def(
+        "kda_layout_swap12(Tensor x, *, Tensor? dependency=None) -> Tensor"
+    );
+    ops.impl("kda_layout_swap12", torch::kPrivateUse1, &vllm_ascend::kda_layout_swap12);
 }
 #else
 // Pybind on other platform
@@ -2346,17 +2456,39 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                               Tensor? gk=None) -> Tensor");
     ops.impl("npu_recurrent_gated_delta_rule", torch::kPrivateUse1, &vllm_ascend::npu_recurrent_gated_delta_rule);
 
+    ops.def(
+        "recurrent_kda(Tensor query, Tensor key, Tensor value, Tensor gate, Tensor beta, "
+        "Tensor(a!) initial_state, Tensor cu_seqlens, Tensor ssm_state_indices, Tensor A_log, Tensor dt_bias, *, "
+        "Tensor? num_accepted_tokens=None, float scale=0.08838834764831845, "
+        "bool use_qk_l2norm_in_kernel=True, bool use_gate_in_kernel=True, "
+        "bool use_beta_sigmoid_in_kernel=False, bool allow_neg_eigval=False, "
+        "bool safe_gate=True, float lower_bound=-5.0) -> Tensor output");
+    ops.impl("recurrent_kda", torch::kPrivateUse1, &vllm_ascend::recurrent_kda);
+
+    ops.def(
+        "dequant_situ_quant(Tensor x, "
+        "                   *, Tensor? weight_scale=None, "
+        "                   Tensor? activation_scale=None, "
+        "                   Tensor? bias=None, "
+        "                   Tensor? quant_scale=None, "
+        "                   Tensor? quant_offset=None, "
+        "                   Tensor? group_index=None, "
+        "                   float beta=4.0, "
+        "                   float linear_beta=25.0, "
+        "                   bool activate_left=True, "
+        "                   str quant_mode=\"dynamic\") -> (Tensor y, Tensor scale)");
+    ops.impl("dequant_situ_quant", torch::kPrivateUse1, &vllm_ascend::dequant_situ_quant);
+
+    ops.def(
+        "situ_mx_quant(Tensor x, "
+        "              float beta=1.0, "
+        "              float linear_beta=0.0, "
+        "              bool activate_left=False, "
+        "              int dst_type=36) -> (Tensor y, Tensor mxscale)");
+    ops.impl("situ_mx_quant", torch::kPrivateUse1, &vllm_ascend::situ_mx_quant);
+
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
     // Direct kernel custom ops
-    ops.def(
-        "get_masked_input_and_mask(Tensor input, "
-        "                         int org_vocab_start_index, "
-        "                         int org_vocab_end_index, "
-        "                         int num_org_vocab_padding, "
-        "                         int added_vocab_start_index, "
-        "                         int added_vocab_end_index) -> (Tensor masked_input, Tensor mask)");
-    ops.impl("get_masked_input_and_mask", torch::kPrivateUse1, &vllm_ascend::get_masked_input_and_mask);
-
     ops.def("bgmv_shrink(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y, float scale) -> ()");
     ops.impl("bgmv_shrink", torch::kPrivateUse1, &vllm_ascend::bgmv_shrink);
 
@@ -2376,7 +2508,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.def(
         "mla_preprocess(Tensor hiddenState, Tensor wdqkv,"
         "               Tensor? descale0, Tensor gamma1, Tensor? beta1, Tensor wuq, Tensor? descale1,"
-        "               Tensor gamma2, Tensor cos, Tensor sin, Tensor wuk, Tensor kv_cache,"
+        "               Tensor gamma2, Tensor? cos, Tensor? sin, Tensor wuk, Tensor kv_cache,"
         "               Tensor kv_cache_rope, Tensor slotmapping, Tensor? quant_scale0,"
         "               Tensor? quant_offset0, Tensor? bias0, Tensor? quant_scale1, Tensor? quant_offset1,"
         "               Tensor? bias1, Tensor? ctkv_scale, Tensor? q_nope_scale, str? cache_mode,"
@@ -2386,14 +2518,27 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     );
     ops.impl("mla_preprocess", torch::kPrivateUse1, &vllm_ascend::mla_preprocess);
 
-    //batch_matmul ops refer to sgl-kernel-npu
-    ops.def(
-            "batch_matmul_transpose(Tensor tensor_a, Tensor tensor_b, Tensor tensor_c, str? format_mode=None, str? quant_mode=None) -> ()");
-    ops.impl("batch_matmul_transpose", torch::kPrivateUse1, &vllm_ascend::batch_matmul_transpose);
-
     ops.def("swap_blocks(Tensor! x, Tensor! y, Tensor z) -> ()");
     ops.impl("swap_blocks", torch::kPrivateUse1, &vllm_ascend::swap_blocks);
 #endif
+
+    // npu_mla_prolog_v3: aligned with torch_npu; underlying aclnn op is MlaPrologV3 (950-only).
+    ops.def(
+        "npu_mla_prolog_v3(Tensor token_x, Tensor weight_dq, Tensor weight_uq_qr, Tensor weight_uk,"
+        "           Tensor weight_dkv_kr, Tensor rmsnorm_gamma_cq, Tensor rmsnorm_gamma_ckv,"
+        "           Tensor rope_sin, Tensor rope_cos, Tensor(a!) kv_cache, Tensor(b!) kr_cache, *,"
+        "           Tensor? cache_index=None, Tensor? dequant_scale_x=None,"
+        "           Tensor? dequant_scale_w_dq=None, Tensor? dequant_scale_w_uq_qr=None,"
+        "           Tensor? dequant_scale_w_dkv_kr=None, Tensor? quant_scale_ckv=None,"
+        "           Tensor? quant_scale_ckr=None, Tensor? smooth_scales_cq=None,"
+        "           Tensor? actual_seq_len=None, Tensor? k_nope_clip_alpha=None,"
+        "           float rmsnorm_epsilon_cq=1e-05, float rmsnorm_epsilon_ckv=1e-05,"
+        "           str cache_mode=\"PA_BSND\", bool query_norm_flag=False,"
+        "           int weight_quant_mode=0, int kv_cache_quant_mode=0, int query_quant_mode=0,"
+        "           int ckvkr_repo_mode=0, int quant_scale_repo_mode=0, int tile_size=128,"
+        "           float qc_qr_scale=1.0, float kc_scale=1.0)"
+        " -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+    ops.impl("npu_mla_prolog_v3", torch::kPrivateUse1, &vllm_ascend::npu_mla_prolog_v3);
 
     // swap_blocks_batch takes CPU tensors (int64 pointer/size arrays), not NPU
     // tensors, so dispatch must be registered on the CPU backend. The function
@@ -2427,20 +2572,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("grouped_matmul_swiglu_quant_weight_nz", torch::kPrivateUse1, &vllm_ascend::grouped_matmul_swiglu_quant_weight_nz);
 
     ops.def(
-        "dispatch_gmm_combine_decode(Tensor x, Tensor expert_ids, Tensor[] gmm1_permuted_weight,"
-        "                            Tensor[] gmm1_permuted_weight_scale,"
-        "                            Tensor[] gmm2_weight, Tensor[] gmm2_weight_scale,"
-        "                            Tensor expert_scales, Tensor? expert_smooth_scales=None,"
-        "                            Tensor? x_active_mask=None,"
-        "                            str group_ep='',"
-        "                            int ep_rank_size=0, int ep_rank_id=0, int moe_expert_num=0,"
-        "                            int shared_expert_num=1, int shared_expert_rank_num=0,"
-        "                            int quant_mode=0,"
-        "                            int global_bs=0) -> (Tensor output, Tensor expert_token_nums)"
-    );
-    ops.impl("dispatch_gmm_combine_decode", torch::kPrivateUse1, &vllm_ascend::dispatch_gmm_combine_decode);
-
-    ops.def(
         "grouped_matmul_swiglu_quant_weight_nz_tensor_list(Tensor x, Tensor[] weight, Tensor[] weight_scale, Tensor x_scale,"
         "                                                  Tensor group_list, *,"
         "                                                  Tensor? bias=None, Tensor? offset=None, float swiglu_limit=0.0) ->"
@@ -2457,22 +2588,57 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("grouped_matmul_swiglu_quant_v2", torch::kPrivateUse1, &vllm_ascend::grouped_matmul_swiglu_quant_v2);
 
     ops.def(
-        "npu_lightning_indexer(Tensor query, Tensor key, Tensor weights, *,"
-        "                      Tensor? actual_seq_lengths_query=None, Tensor? actual_seq_lengths_key=None,"
-        "                      Tensor? block_table=None, str layout_query='BSND', str layout_key='BSND',"
-        "                      int sparse_count=2048, int sparse_mode=3) -> Tensor"
+        "npu_lightning_indexer("
+            "Tensor query, Tensor key, Tensor weights, "
+            "*, "
+            "Tensor? actual_seq_lengths_query=None, "
+            "Tensor? actual_seq_lengths_key=None, "
+            "Tensor? block_table=None, "
+            "str layout_query=\"BSND\", str layout_key=\"BSND\", "
+            "int sparse_count=2048, int sparse_mode=3, "
+            "int pre_tokens=9223372036854775807, "
+            "int next_tokens=9223372036854775807, "
+            "bool return_value=False"
+        ") -> (Tensor sparse_indices, Tensor sparse_values)"
     );
     ops.impl("npu_lightning_indexer", torch::kPrivateUse1, &vllm_ascend::npu_lightning_indexer);
 
     ops.def(
         "npu_sparse_flash_attention(Tensor query, Tensor key, Tensor value,"
-        "                           Tensor sparse_indices, float scale_value, int sparse_block_size, *,"
+        "                           Tensor sparse_indices, float scale_value, *,"
         "                           Tensor? block_table=None, Tensor? actual_seq_lengths_query=None,"
         "                           Tensor? actual_seq_lengths_kv=None, Tensor? query_rope=None,"
-        "                           Tensor? key_rope=None, str layout_query='BSND', str layout_kv='BSND',"
-        "                           int sparse_mode=3) -> Tensor"
+        "                           Tensor? key_rope=None, int sparse_block_size=1,"
+        "                           str layout_query='BSND', str layout_kv='BSND',"
+        "                           int sparse_mode=3, int pre_tokens=9223372036854775807,"
+        "                           int next_tokens=9223372036854775807, int attention_mode=2,"
+        "                           bool return_softmax_lse=False) -> (Tensor attention_out, Tensor softmax_max, Tensor softmax_sum)"
     );
     ops.impl("npu_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention);
+
+    ops.def(
+        "npu_kv_quant_sparse_flash_attention(Tensor query, Tensor key, Tensor value,"
+        "                                    Tensor sparse_indices, float scale_value, *,"
+        "                                    int key_quant_mode=1, int value_quant_mode=1,"
+        "                                    Tensor? key_dequant_scale=None,"
+        "                                    Tensor? value_dequant_scale=None,"
+        "                                    Tensor? block_table=None,"
+        "                                    Tensor? actual_seq_lengths_query=None,"
+        "                                    Tensor? actual_seq_lengths_kv=None,"
+        "                                    int sparse_block_size=1,"
+        "                                    str layout_query='BSND', str layout_kv='BSND',"
+        "                                    int sparse_mode=3,"
+        "                                    int pre_tokens=9223372036854775807,"
+        "                                    int next_tokens=9223372036854775807,"
+        "                                    int attention_mode=2,"
+        "                                    int quant_scale_repo_mode=1,"
+        "                                    int tile_size=128,"
+        "                                    int rope_head_dim=64,"
+        "                                    bool return_softmax_lse=False)"
+        " -> (Tensor attention_out, Tensor softmax_max, Tensor softmax_sum)"
+    );
+    ops.impl("npu_kv_quant_sparse_flash_attention", torch::kPrivateUse1,
+             &vllm_ascend::npu_kv_quant_sparse_flash_attention);
 
     ops.def(
         "dispatch_ffn_combine(Tensor x, Tensor[] weight1, Tensor[] weight2, Tensor expert_idx,"
@@ -2481,38 +2647,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     );
     ops.impl("dispatch_ffn_combine", torch::kPrivateUse1, &vllm_ascend::dispatch_ffn_combine);
 
-    ops.def("matmul_allreduce_add_rmsnorm(Tensor x1, Tensor x2, Tensor residual, Tensor gamma, \
-        str groupTp, int tpRankSize, int tpRankId, float epsilon, bool isTransB, bool isGatherAddOut) -> (Tensor output, Tensor add_out)");
-    ops.impl("matmul_allreduce_add_rmsnorm", torch::kPrivateUse1, &vllm_ascend::matmul_allreduce_add_rmsnorm);
-
-    ops.def("get_dispatch_layout(Tensor topk_idx, int num_experts, int "
-            "num_ranks) -> (Tensor num_tokens_per_rank, Tensor "
-            "num_tokens_per_expert, Tensor is_token_in_rank_bool)");
-    ops.impl("get_dispatch_layout", torch::kPrivateUse1,
-             &vllm_ascend::get_dispatch_layout);
-
-    ops.def(
-        "dispatch_prefill(Tensor x, Tensor topk_idx, Tensor topk_weights, "
-        "Tensor num_tokens_per_rank, Tensor is_token_in_rank, Tensor "
-        "num_tokens_per_expert, int num_worst_tokens, str groupEp, int rank, "
-        "int num_ranks) -> (Tensor expandx_out, Tensor expand_idx_out, Tensor "
-        "recv_count, Tensor num_recv_tokens_per_expert)");
-    ops.impl("dispatch_prefill", torch::kPrivateUse1,
-             &vllm_ascend::dispatch_prefill);
-
-    ops.def("combine_prefill(Tensor x, Tensor topk_idx, Tensor topk_weights, "
-            "Tensor src_idx, Tensor send_head, str grouEp, int rank, int "
-            "num_ranks) -> Tensor");
-    ops.impl("combine_prefill", torch::kPrivateUse1,
-             &vllm_ascend::combine_prefill);
-
-    ops.def(
-        "npu_moe_init_routing_custom(Tensor x, Tensor expert_idx, *, Tensor? scale=None, Tensor? offset=None, int active_num=-1, "
-        "                            int expert_capacity=-1, int expert_num=-1, int drop_pad_mode=0, int expert_tokens_num_type=0, "
-        "                            bool expert_tokens_num_flag=False, int quant_mode=0, int[2] active_expert_range=[], "
-        "                            int row_idx_type=0) -> (Tensor, Tensor, Tensor, Tensor)"
-    );
-    ops.impl("npu_moe_init_routing_custom", torch::kPrivateUse1, &vllm_ascend::npu_moe_init_routing_custom);
     // vLLM-Ascend custom ops
     ops.def(
         "moe_gating_top_k(Tensor x, "
@@ -2541,22 +2675,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         );
     ops.impl("npu_add_rms_norm_bias", torch::kPrivateUse1, &vllm_ascend::npu_add_rms_norm_bias);
 
-    ops.def("npu_apply_top_k_top_p(Tensor logits, Tensor? p=None, Tensor? k=None) -> Tensor");
-    ops.impl("npu_apply_top_k_top_p", torch::kPrivateUse1, &vllm_ascend::npu_apply_top_k_top_p);
-
-    ops.def(
-        "npu_hamming_dist_top_k(Tensor q, Tensor k_comp, Tensor k_comp_rope, Tensor k,"
-        "                      Tensor seq_len, Tensor? chunk_size=None,"
-        "                      int? max_seq_len=None, int? sink=None, int? recent=None, int? support_offload=None,"
-        "                      Tensor? key_block_table=None, Tensor? mask=None, Tensor? indices=None) -> Tensor"
-    );
-    ops.impl("npu_hamming_dist_top_k", torch::kPrivateUse1, &vllm_ascend::npu_hamming_dist_top_k);
-
-    ops.def(
-        "npu_reshape_and_cache_bnsd(Tensor q, Tensor k_comp, Tensor slot_mapping, Tensor seq_len, Tensor k_out) -> Tensor"
-    );
-    ops.impl("npu_reshape_and_cache_bnsd", torch::kPrivateUse1, &vllm_ascend::npu_reshape_and_cache_bnsd);
-
     ops.def("npu_sign_bits_pack(Tensor input, int size) -> Tensor");
     ops.impl("npu_sign_bits_pack", torch::kPrivateUse1, &vllm_ascend::npu_sign_bits_pack);
 
@@ -2579,10 +2697,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                         Tensor weight, "
         "                         Tensor conv_state, "
         "                         Tensor? bias_opt, "
-        "                         int[] query_start_loc_opt, "
-        "                         int[] cache_indices_opt, "
-        "                         int[] initial_state_mode_opt, "
-        "                         int[] num_accepted_tokens_opt, "
+        "                         Tensor? query_start_loc_opt, "
+        "                         Tensor? cache_indices_opt, "
+        "                         Tensor? initial_state_mode_opt, "
+        "                         Tensor? num_accepted_tokens_opt, "
         "                         int activation_mode, "
         "                         int pad_slot_id, "
         "                         int run_mode"
@@ -2634,7 +2752,27 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("compressor", torch::kPrivateUse1, &vllm_ascend::compressor);
 
     ops.def(
-        "npu_quant_lightning_indexer("
+        "compressor_metadata("
+            "Tensor rope_cos, Tensor rope_sin, "
+            "Tensor cu_seqlens, Tensor start_pos, Tensor kv_block_table, "
+            "int kv_block_size, int slot_mapping_format, int compress_ratio, int num_compressed_tokens, "
+            "int num_reqs_actual"
+        ") -> (Tensor, Tensor, Tensor)"
+        );
+    ops.impl("compressor_metadata", torch::kPrivateUse1, &vllm_ascend::compressor_metadata);
+
+    ops.def(
+        "compressor_metadata_out("
+            "Tensor rope_cos, Tensor rope_sin, "
+            "Tensor cu_seqlens, Tensor start_pos, Tensor kv_block_table, "
+            "int kv_block_size, int slot_mapping_format, int compress_ratio, int num_reqs_actual, "
+            "Tensor(a!) compress_cos, Tensor(b!) compress_sin, Tensor(c!) slot_mapping"
+        ") -> (Tensor(a!), Tensor(b!), Tensor(c!))"
+        );
+    ops.impl("compressor_metadata_out", torch::kPrivateUse1, &vllm_ascend::compressor_metadata_out);
+
+    ops.def(
+        "npu_vllm_quant_lightning_indexer("
             "Tensor query, Tensor key, Tensor weights, "
             "Tensor query_dequant_scale, Tensor key_dequant_scale, "
             "int query_quant_mode=0, int key_quant_mode=0, "
@@ -2649,7 +2787,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
             "int cmp_ratio=1, bool return_value=False"
         ") -> (Tensor sparse_indices, Tensor sparse_values)"
         );
-    ops.impl("npu_quant_lightning_indexer", torch::kPrivateUse1, &vllm_ascend::npu_quant_lightning_indexer_npu);
+    ops.impl("npu_vllm_quant_lightning_indexer", torch::kPrivateUse1, &vllm_ascend::npu_vllm_quant_lightning_indexer_npu);
 
     ops.def(
         "npu_sparse_attn_sharedkv("
@@ -2710,7 +2848,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     ops.impl("npu_sparse_attn_sharedkv_metadata", torch::kPrivateUse1, &vllm_ascend::npu_sparse_attn_sharedkv_metadata_npu);
 
     ops.def(
-        "npu_quant_lightning_indexer_metadata("
+        "npu_vllm_quant_lightning_indexer_metadata("
             "int num_heads_q, "
             "int num_heads_k, "
             "int head_dim, "
@@ -2731,7 +2869,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
             "str device=\"npu\""
         ") -> (Tensor metadata)"
         );
-    ops.impl("npu_quant_lightning_indexer_metadata", torch::kPrivateUse1, &vllm_ascend::npu_quant_lightning_indexer_metadata_npu);
+    ops.impl("npu_vllm_quant_lightning_indexer_metadata", torch::kPrivateUse1, &vllm_ascend::npu_vllm_quant_lightning_indexer_metadata_npu);
 
     ops.def(
           "npu_hc_post("
@@ -2950,15 +3088,6 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                            int sparse_count=2048, int sparse_mode=3) -> Tensor"
     );
     ops.impl("npu_lightning_indexer_quant", torch::kPrivateUse1, &vllm_ascend::npu_lightning_indexer_quant);
-    // N-gram spec decode
-    ops.def(
-        "npu_ngram_spec_decode(Tensor(a!) token_ids, Tensor num_tokens_no_spec, "
-        "Tensor sampled_token_ids, Tensor discard_request_mask, "
-        "int vocab_size, int min_n, int max_n, int k) -> "
-        "(Tensor token_ids, Tensor next_token_ids, Tensor draft_token_ids, Tensor num_valid_draft_tokens)"
-    );
-    ops.impl("npu_ngram_spec_decode", torch::kPrivateUse1,
-             &vllm_ascend::npu_ngram_spec_decode);
 
     ops.def(
         "chunk_gated_delta_rule_fwd_h(Tensor k, Tensor w, Tensor u, Tensor? g=None, *, Tensor? gk=None, Tensor? initial_state=None, bool? output_final_state=False, int? chunk_size=None, bool? save_new_value=True, int[]? cu_seqlens=None, int[]? chunk_indices=None, bool? use_exp2=False, bool? transpose_state_layout=False) -> (Tensor h_out, Tensor v_new_out, Tensor final_state_out)"
@@ -2969,5 +3098,47 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "chunk_fwd_o(Tensor q, Tensor k, Tensor v, Tensor h, float scale, *, Tensor? g=None, Tensor? g_gamma=None, int[]? cu_seqlens=None, int[]? chunk_indices=None, int? chunk_size=None, bool? transpose_state_layout=False) -> Tensor"
     );
     ops.impl("chunk_fwd_o", torch::kPrivateUse1, &vllm_ascend::chunk_fwd_o);
+
+    ops.def(
+        "chunk_kda_fwd(Tensor q, Tensor k, Tensor v, Tensor gk, Tensor beta, float scale, int chunk_size, str layout=\"BSND\", *, Tensor? initial_state=None, bool? output_final_state=False, int[]? cu_seqlens=None, int[]? chunk_indices=None, bool? return_intermediate=False, bool? safe_gate=False, bool? transpose_state_layout=False) -> (Tensor o, Tensor final_state, Tensor g, Tensor aqk, Tensor akk, Tensor w, Tensor u, Tensor qg, Tensor kg, Tensor v_new, Tensor h, Tensor initial_state_out)"
+    );
+    ops.impl("chunk_kda_fwd", torch::kPrivateUse1, &vllm_ascend::chunk_kda_fwd);
+
+    ops.def(
+        "kda_gate_cumsum(Tensor g, int chunk_size, *, Tensor? A_log=None, Tensor? dt_bias=None, int[]? cu_seqlens=None, bool? use_gate_in_kernel=False, bool? safe_gate=False, float? lower_bound=-5.0, str layout=\"BSND\") -> Tensor"
+    );
+    ops.impl("kda_gate_cumsum", torch::kPrivateUse1, &vllm_ascend::kda_gate_cumsum);
+
+    ops.def(
+        "kda_layout_swap12(Tensor x, *, Tensor? dependency=None) -> Tensor"
+    );
+    ops.impl("kda_layout_swap12", torch::kPrivateUse1, &vllm_ascend::kda_layout_swap12);
+
+    //store_kv_block
+     ops.def(
+        "store_kv_block_metadata(Tensor slot_mapping_npu, Tensor group_len, Tensor group_key_idx, Tensor group_key_cache_idx, int block_size=0)"
+         "-> ()"
+     );
+    ops.impl("store_kv_block_metadata", torch::kPrivateUse1, &vllm_ascend::store_kv_block_metadata);
+
+    ops.def(
+        "store_kv_block(Tensor key_in, Tensor key_cache_in, Tensor group_len, Tensor group_key_idx,Tensor group_key_cache_idx, int block_size=0) -> ()"
+    );
+    ops.impl("store_kv_block", torch::kPrivateUse1, &vllm_ascend::store_kv_block);
+
+    ops.def(
+        "npu_sparse_attention_score("
+        "Tensor query, Tensor key, Tensor value, Tensor select_idx, "
+        "Tensor block_table, *, "
+        "Tensor? select_num_idx=None, "
+        "Tensor? q_dequant_scale=None, Tensor? k_dequant_scale=None, "
+        "Tensor? v_dequant_scale=None, "
+        "Tensor? actual_seq_lengths=None, Tensor? actual_seq_lengths_kv=None, "
+        "str q_input_layout=\"TND\", str kv_input_layout=\"BNSD\", "
+        "int num_key_value_heads=1, float scale_value=1.0, "
+        "int block_size=128, int top_k=16, int inner_precise=0) -> Tensor"
+    );
+    ops.impl("npu_sparse_attention_score", torch::kPrivateUse1,
+             &vllm_ascend::npu_sparse_attention_score);
 }
 #endif
