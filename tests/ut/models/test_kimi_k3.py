@@ -211,6 +211,36 @@ def test_kimi_k3_reference_router_caches_bf16_rounded_fp32_weight():
     assert all(call.args[1] is cached_weight for call in linear.call_args_list)
 
 
+def test_kimi_k3_reference_router_uses_ascend_internal_schedule():
+    moe = KimiK3MoE.__new__(KimiK3MoE)
+    nn.Module.__init__(moe)
+    moe.hidden_size = 4
+    moe.parity_tap_prefix = None
+    moe._use_internal_router_fp32 = True
+    moe.gate = MagicMock()
+    moe.experts = MagicMock(return_value=torch.zeros(2, 4, dtype=torch.bfloat16))
+    moe.experts.is_internal_router = True
+    hidden_states = torch.tensor(
+        [[1.0, -0.5, 0.25, 2.0], [-1.5, 0.75, 0.5, -0.25]],
+        dtype=torch.bfloat16,
+    )
+
+    with (
+        patch.dict(os.environ, {"VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32": "1"}),
+        patch("torch.nn.functional.linear") as linear,
+    ):
+        output = moe(hidden_states)
+
+    linear.assert_not_called()
+    moe.gate.assert_not_called()
+    internal_hidden_states = moe.experts.call_args.kwargs["hidden_states"]
+    internal_router_placeholder = moe.experts.call_args.kwargs["router_logits"]
+    assert torch.equal(internal_hidden_states, hidden_states)
+    assert internal_hidden_states.data_ptr() == hidden_states.data_ptr()
+    assert internal_router_placeholder is internal_hidden_states
+    assert output.shape == hidden_states.shape
+
+
 def test_kimi_k3_projector_registers_rotation_for_weight_loading(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -617,6 +647,51 @@ def test_kimi_k3_passes_situ_parameters_through_activation_config(monkeypatch):
     assert isinstance(activation, SituActivationConfig)
     assert activation.beta == 4.0
     assert activation.linear_beta == 25.0
+
+
+def test_kimi_k3_reference_router_is_precast_and_passed_to_fused_moe(monkeypatch):
+    class StubModule(nn.Module):
+        pass
+
+    fused_moe_kwargs = {}
+
+    def fake_replicated_linear(*args, **kwargs):
+        return StubModule()
+
+    def fake_fused_moe(**kwargs):
+        fused_moe_kwargs.update(kwargs)
+        module = StubModule()
+        module.is_internal_router = True
+        return module
+
+    monkeypatch.setattr(kimi_k3, "ReplicatedLinear", fake_replicated_linear)
+    monkeypatch.setattr(kimi_k3, "FusedMoE", fake_fused_moe)
+    config = SimpleNamespace(
+        hidden_act="situ",
+        hidden_size=32,
+        routed_expert_hidden_size=16,
+        num_shared_experts=0,
+        num_experts=8,
+        rms_norm_eps=1e-6,
+        latent_moe_use_norm=False,
+        moe_intermediate_size=12,
+        num_experts_per_token=2,
+        moe_renormalize=True,
+        use_grouped_topk=True,
+        num_expert_group=4,
+        topk_group=2,
+        moe_router_activation_func="sigmoid",
+        routed_scaling_factor=2.5,
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+    )
+
+    with patch.dict(os.environ, {"VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32": "1"}):
+        moe = KimiK3MoE(config, prefix="model.layers.1.block_sparse_moe")
+
+    assert moe._use_internal_router_fp32 is True
+    assert moe.gate.precast_fp32_weight is True
+    assert fused_moe_kwargs["gate"] is moe.gate
 
 
 def test_kimi_k3_dense_mlp_uses_callable_situ(monkeypatch):

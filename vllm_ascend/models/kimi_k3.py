@@ -774,6 +774,12 @@ class KimiK3MoE(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
+        # The Ascend MoE runner can schedule the router projection internally
+        # with the shared-expert work. Its post-load FP32 copy is made from
+        # this BF16 parameter, preserving Kimi's BF16-rounded-weight contract.
+        self._use_internal_router_fp32 = os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32") == "1"
+        if self._use_internal_router_fp32:
+            self.gate.precast_fp32_weight = True
         self.register_buffer(
             "_reference_router_weight_fp32",
             None,
@@ -848,6 +854,7 @@ class KimiK3MoE(nn.Module):
             n_shared_experts=self.num_shared_experts,
             routed_input_transform=self.routed_expert_down_proj,
             routed_output_transform=routed_output_transform,
+            gate=self.gate if self._use_internal_router_fp32 else None,
             activation=SituActivationConfig(
                 beta=config.activation_situ_beta or 1.0,
                 linear_beta=config.activation_situ_linear_beta,
@@ -859,7 +866,18 @@ class KimiK3MoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_size)
         if self.parity_tap_prefix is not None:
             _parity_tap("02_moe_input", hidden_states)
-        if os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32") == "1":
+        use_reference_router_fp32 = os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32") == "1"
+        if use_reference_router_fp32 and getattr(self, "_use_internal_router_fp32", False):
+            if not self.experts.is_internal_router:
+                raise RuntimeError("Kimi K3 internal FP32 router weight was not prepared after checkpoint loading")
+            # AscendMoERunner computes the router from the original full-width
+            # input. The placeholder is ignored when is_internal_router is
+            # true, but keeps the common MoERunner interface tensor-only.
+            output = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
+            if self.parity_tap_prefix is not None:
+                _parity_tap("02_moe_output", output)
+            return output.view(num_tokens, hidden_size)
+        if use_reference_router_fp32:
             router_weight_fp32 = self._reference_router_weight_fp32
             if router_weight_fp32 is None:
                 # The model is inference-only after checkpoint loading. Cache
