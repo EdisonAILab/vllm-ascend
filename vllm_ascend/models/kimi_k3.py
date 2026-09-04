@@ -854,12 +854,13 @@ class KimiK3MoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_size)
         if self.parity_tap_prefix is not None:
             _parity_tap("02_moe_input", hidden_states)
-        router_logits, _ = self.gate(hidden_states)
         if os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32") == "1":
             router_logits = torch.nn.functional.linear(
                 hidden_states.float(),
                 self.gate.weight.float(),
             )
+        else:
+            router_logits, _ = self.gate(hidden_states)
         if self.parity_tap_prefix is not None:
             _parity_tap("02_moe_router_logits", router_logits)
         output = self.experts(hidden_states=hidden_states, router_logits=router_logits)

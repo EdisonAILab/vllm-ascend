@@ -152,6 +152,30 @@ def test_kimi_k3_vectorized_attention_residual_uses_explicit_fp32_reductions():
     assert torch.equal(actual, expected)
 
 
+def test_kimi_k3_reference_router_skips_discarded_bf16_projection():
+    moe = KimiK3MoE.__new__(KimiK3MoE)
+    nn.Module.__init__(moe)
+    moe.hidden_size = 4
+    moe.parity_tap_prefix = None
+    moe.gate = MagicMock()
+    moe.gate.weight = torch.tensor(
+        [[0.5, -1.0, 0.25, 2.0], [-0.75, 0.5, 1.5, -0.25]],
+        dtype=torch.bfloat16,
+    )
+    moe.experts = MagicMock(return_value=torch.zeros(2, 4, dtype=torch.bfloat16))
+    hidden_states = torch.tensor(
+        [[1.0, -0.5, 0.25, 2.0], [-1.5, 0.75, 0.5, -0.25]],
+        dtype=torch.bfloat16,
+    )
+
+    with patch.dict(os.environ, {"VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32": "1"}):
+        moe(hidden_states)
+
+    moe.gate.assert_not_called()
+    expected = torch.nn.functional.linear(hidden_states.float(), moe.gate.weight.float())
+    assert torch.equal(moe.experts.call_args.kwargs["router_logits"], expected)
+
+
 def test_kimi_k3_projector_registers_rotation_for_weight_loading(
     monkeypatch: pytest.MonkeyPatch,
 ):
