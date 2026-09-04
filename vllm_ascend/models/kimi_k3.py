@@ -774,6 +774,11 @@ class KimiK3MoE(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.gate",
         )
+        self.register_buffer(
+            "_reference_router_weight_fp32",
+            None,
+            persistent=False,
+        )
         self.gate.e_score_correction_bias = nn.Parameter(torch.empty(config.num_experts))
 
         self.routed_expert_down_proj = ReplicatedLinear(
@@ -855,9 +860,16 @@ class KimiK3MoE(nn.Module):
         if self.parity_tap_prefix is not None:
             _parity_tap("02_moe_input", hidden_states)
         if os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32") == "1":
+            router_weight_fp32 = self._reference_router_weight_fp32
+            if router_weight_fp32 is None:
+                # The model is inference-only after checkpoint loading. Cache
+                # the BF16-rounded parameter in FP32 so decode does not launch
+                # the same weight conversion for every token.
+                router_weight_fp32 = self.gate.weight.detach().float()
+                self._reference_router_weight_fp32 = router_weight_fp32
             router_logits = torch.nn.functional.linear(
                 hidden_states.float(),
-                self.gate.weight.float(),
+                router_weight_fp32,
             )
         else:
             router_logits, _ = self.gate(hidden_states)

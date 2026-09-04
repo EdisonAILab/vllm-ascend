@@ -157,6 +157,7 @@ def test_kimi_k3_reference_router_skips_discarded_bf16_projection():
     nn.Module.__init__(moe)
     moe.hidden_size = 4
     moe.parity_tap_prefix = None
+    moe._reference_router_weight_fp32 = None
     moe.gate = MagicMock()
     moe.gate.weight = torch.tensor(
         [[0.5, -1.0, 0.25, 2.0], [-0.75, 0.5, 1.5, -0.25]],
@@ -174,6 +175,40 @@ def test_kimi_k3_reference_router_skips_discarded_bf16_projection():
     moe.gate.assert_not_called()
     expected = torch.nn.functional.linear(hidden_states.float(), moe.gate.weight.float())
     assert torch.equal(moe.experts.call_args.kwargs["router_logits"], expected)
+
+
+def test_kimi_k3_reference_router_caches_bf16_rounded_fp32_weight():
+    moe = KimiK3MoE.__new__(KimiK3MoE)
+    nn.Module.__init__(moe)
+    moe.hidden_size = 4
+    moe.parity_tap_prefix = None
+    moe._reference_router_weight_fp32 = None
+    moe.gate = MagicMock()
+    moe.gate.weight = MagicMock()
+    cached_weight = torch.tensor(
+        [[0.5, -1.0, 0.25, 2.0], [-0.75, 0.5, 1.5, -0.25]],
+        dtype=torch.float32,
+    )
+    moe.gate.weight.detach.return_value.float.return_value = cached_weight
+    moe.experts = MagicMock(return_value=torch.zeros(2, 4, dtype=torch.bfloat16))
+    hidden_states = torch.tensor(
+        [[1.0, -0.5, 0.25, 2.0], [-1.5, 0.75, 0.5, -0.25]],
+        dtype=torch.bfloat16,
+    )
+    router_logits = torch.zeros(2, 2, dtype=torch.float32)
+
+    with (
+        patch.dict(os.environ, {"VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32": "1"}),
+        patch("torch.nn.functional.linear", return_value=router_logits) as linear,
+    ):
+        moe(hidden_states)
+        moe(hidden_states)
+
+    moe.gate.assert_not_called()
+    moe.gate.weight.detach.assert_called_once_with()
+    assert moe._reference_router_weight_fp32 is cached_weight
+    assert linear.call_count == 2
+    assert all(call.args[1] is cached_weight for call in linear.call_args_list)
 
 
 def test_kimi_k3_projector_registers_rotation_for_weight_loading(
