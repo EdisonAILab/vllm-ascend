@@ -88,6 +88,7 @@ class MoETokenDispatchInput:
     topk_ids: torch.Tensor
     routing: MoERoutingParams
     quant: MoEQuantParams
+    activation: str | MoEActivation | SituActivationConfig = "silu"
 
 
 # dispatch carry-over state consumed by combine

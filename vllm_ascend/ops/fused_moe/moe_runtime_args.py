@@ -220,6 +220,7 @@ def build_token_dispatch_input(
         topk_ids=fused_experts_input.topk_ids if topk_ids is None else topk_ids,
         routing=fused_experts_input.routing,
         quant=fused_experts_input.quant,
+        activation=fused_experts_input.activation,
     )
 
 

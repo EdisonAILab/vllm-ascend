@@ -38,6 +38,7 @@ from vllm_ascend.lora.fused_moe import (
     postprocess_lora_indices,
     preprocess_lora_indices,
 )
+from vllm_ascend.ops.activation import SituActivationConfig
 from vllm_ascend.ops.fused_moe.comm_utils import async_all_to_all, gather_from_sequence_parallel_region
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEAllGatherCombineMetadata,
@@ -422,10 +423,18 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             first_expert_idx = 0
             last_expert_idx = self.num_experts_local
             global_num_experts = self.num_experts_local
-        reference_mxfp8_dispatch = (
-            os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_MXFP8_DISPATCH") == "1" and quant_type == QuantType.W4A8MXFP
+        is_situ_w4a8_mxfp = quant_type == QuantType.W4A8MXFP and isinstance(
+            token_dispatch_input.activation, SituActivationConfig
         )
-        routing_quant_mode = -1 if reference_mxfp8_dispatch else quant_mode
+        # The fused routing quantizer uses a different E8M0 scale-rounding
+        # policy from npu_dynamic_mx_quant. Kimi's SiTU MoE must use the same
+        # MXFP8 values as its standalone quantization path, so route in BF16
+        # first and quantize the routed rows explicitly.
+        explicit_mxfp8_dispatch = is_situ_w4a8_mxfp or (
+            os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_MXFP8_DISPATCH") == "1"
+            and quant_type == QuantType.W4A8MXFP
+        )
+        routing_quant_mode = -1 if explicit_mxfp8_dispatch else quant_mode
         sorted_hidden_states, expanded_row_idx, expert_tokens, dynamic_scale = DeviceOperator.npu_moe_init_routing(
             hidden_states,
             topk_ids,
@@ -438,7 +447,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             quant_mode=routing_quant_mode,
             act_quant_type=act_quant_type,
         )
-        if reference_mxfp8_dispatch:
+        if explicit_mxfp8_dispatch:
             sorted_hidden_states, dynamic_scale = torch_npu.npu_dynamic_mx_quant(
                 sorted_hidden_states,
                 axis=-1,
@@ -458,7 +467,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             sorted_weights.scatter_(0, expanded_row_idx.abs().long(), flat_weights)
             topk_scales = sorted_weights.unsqueeze(-1)
             combine_topk_weights = torch.ones_like(topk_weights)
-        elif os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ROUTER_WEIGHT_BEFORE_GMM2") == "1":
+        elif is_situ_w4a8_mxfp:
             sorted_indices = torch.argsort(expanded_row_idx)
             topk_scales = topk_weights.reshape(-1)[sorted_indices].unsqueeze(-1)
             combine_topk_weights = torch.ones_like(topk_weights)

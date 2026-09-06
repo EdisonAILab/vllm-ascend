@@ -232,11 +232,7 @@ def _w4a8_situ_apply_mlp(
     if externally_quantized_hidden_states is not None:
         dispose_tensor(externally_quantized_hidden_states)
 
-    weighted_situ = (
-        use_mxfp_quant
-        and topk_scales is not None
-        and os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ROUTER_WEIGHT_BEFORE_GMM2") == "1"
-    )
+    weighted_situ = use_mxfp_quant and topk_scales is not None
     if use_mxfp_quant:
         hidden_states, situ_out_scale = torch.ops._C_ascend.situ_mx_quant(
             x=gate_up_out,

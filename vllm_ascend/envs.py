@@ -90,9 +90,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_KIMI_REFERENCE_MXFP8_DISPATCH": lambda: bool(
         int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_MXFP8_DISPATCH", "0"))
     ),
-    "VLLM_ASCEND_KIMI_REFERENCE_ROUTER_WEIGHT_BEFORE_GMM2": lambda: bool(
-        int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_ROUTER_WEIGHT_BEFORE_GMM2", "0"))
-    ),
     "VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM": lambda: bool(
         int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM", "0"))
     ),

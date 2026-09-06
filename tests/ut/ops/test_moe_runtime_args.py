@@ -165,6 +165,7 @@ class TestMoERuntimeArgs(unittest.TestCase):
         self.assertIs(token_dispatch_input.topk_weights, fused_experts_input.topk_weights)
         self.assertIs(token_dispatch_input.routing, fused_experts_input.routing)
         self.assertIs(token_dispatch_input.quant, fused_experts_input.quant)
+        self.assertIs(token_dispatch_input.activation, fused_experts_input.activation)
         self.assertIs(token_dispatch_input.topk_ids, routed_topk_ids)
 
     def test_build_fused_experts_input_requires_primitive_mxfp_params_for_mxfp_quant(self):

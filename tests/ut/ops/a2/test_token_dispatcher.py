@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from tests.ut.base import TestBase
+from vllm_ascend.ops.activation import SituActivationConfig
 from vllm_ascend.ops.fused_moe.moe_runtime_args import (
     MoEAllGatherCombineMetadata,
     MoEAllToAllCombineMetadata,
@@ -59,9 +60,10 @@ def build_token_dispatch_input_fixture(
     act_quant_type: torch.dtype | None = None,
     is_per_channel_weight: bool = False,
     mc2_mask: torch.Tensor | None = None,
+    activation: str | SituActivationConfig = "silu",
 ) -> MoETokenDispatchInput:
     mxfp_spec = None
-    if quant_type in (QuantType.W8A8MXFP, QuantType.W4A4MXFP):
+    if quant_type in (QuantType.W8A8MXFP, QuantType.W4A4MXFP, QuantType.W4A8MXFP):
         mxfp_spec = MoEMxfpParams(act_quant_type=act_quant_type)
     return MoETokenDispatchInput(
         hidden_states=hidden_states,
@@ -80,6 +82,7 @@ def build_token_dispatch_input_fixture(
             mxfp=mxfp_spec,
             is_per_channel_weight=is_per_channel_weight,
         ),
+        activation=activation,
     )
 
 
@@ -443,6 +446,90 @@ def test_allgather_token_dispatch_quant_mode_without_dynamic_scale():
         assert init_kwargs["quant_mode"] == case["expected_quant_mode"]
         assert init_kwargs["act_quant_type"] == case["expected_act_quant_type"]
         assert (output.dynamic_scale is not None) == case["expect_dynamic_scale"]
+
+
+def test_allgather_situ_w4a8_mxfp_routes_weight_before_gmm2_by_default():
+    dispatcher = TokenDispatcherWithAllGather(top_k=2, num_experts=3, num_local_experts=3)
+    hidden_states = torch.randn(2, 8, dtype=torch.bfloat16)
+    topk_weights = torch.tensor([[0.7, 0.3], [0.6, 0.4]], dtype=torch.bfloat16)
+    topk_ids = torch.tensor([[0, 2], [1, 0]], dtype=torch.int32)
+    expanded_row_idx = torch.tensor([2, 0, 3, 1], dtype=torch.int32)
+    routed_hidden_states = torch.randn(4, 8)
+    quantized_hidden_states = torch.randn(4, 8)
+    quantized_scale = torch.randn(4, 1)
+    init_routing_output = (
+        routed_hidden_states,
+        expanded_row_idx,
+        torch.tensor([2, 1, 1], dtype=torch.int32),
+        torch.randn(4, 1),
+    )
+    token_dispatch_input = build_token_dispatch_input_fixture(
+        hidden_states=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        quant_type=QuantType.W4A8MXFP,
+        act_quant_type=torch.float8_e4m3fn,
+        activation=SituActivationConfig(beta=4.0, linear_beta=25.0),
+    )
+
+    with (
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_moe_init_routing",
+            return_value=init_routing_output,
+        ) as mock_init_routing,
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.torch_npu.npu_dynamic_mx_quant",
+            return_value=(quantized_hidden_states, quantized_scale),
+        ) as mock_dynamic_mx_quant,
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.maybe_normalize_mxfp_scale_layout",
+            side_effect=lambda scale: scale,
+        ),
+    ):
+        output = dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
+
+    assert mock_init_routing.call_args.kwargs["quant_mode"] == -1
+    mock_dynamic_mx_quant.assert_called_once_with(
+        routed_hidden_states,
+        axis=-1,
+        dst_type=torch.float8_e4m3fn,
+    )
+    assert output.hidden_states is quantized_hidden_states
+    assert output.dynamic_scale is quantized_scale
+    sorted_indices = torch.argsort(expanded_row_idx)
+    expected_scales = topk_weights.reshape(-1)[sorted_indices].unsqueeze(-1)
+    assert torch.equal(output.topk_scales, expected_scales)
+    assert torch.equal(output.combine_metadata.topk_weights, torch.ones_like(topk_weights))
+
+
+def test_allgather_non_situ_w4a8_mxfp_keeps_combine_weighting():
+    dispatcher = TokenDispatcherWithAllGather(top_k=2, num_experts=3, num_local_experts=3)
+    hidden_states = torch.randn(2, 8, dtype=torch.bfloat16)
+    topk_weights = torch.tensor([[0.7, 0.3], [0.6, 0.4]], dtype=torch.bfloat16)
+    topk_ids = torch.tensor([[0, 2], [1, 0]], dtype=torch.int32)
+    init_routing_output = (
+        torch.randn(4, 8),
+        torch.tensor([2, 0, 3, 1], dtype=torch.int32),
+        torch.tensor([2, 1, 1], dtype=torch.int32),
+        torch.randn(4, 1),
+    )
+    token_dispatch_input = build_token_dispatch_input_fixture(
+        hidden_states=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        quant_type=QuantType.W4A8MXFP,
+        act_quant_type=torch.float8_e4m3fn,
+    )
+
+    with patch(
+        "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_moe_init_routing",
+        return_value=init_routing_output,
+    ) as mock_init_routing:
+        output = dispatcher.token_dispatch(token_dispatch_input=token_dispatch_input)
+
+    assert mock_init_routing.call_args.kwargs["quant_mode"] == 3
+    assert output.topk_scales is None
+    assert output.combine_metadata.topk_weights is topk_weights
 
 
 def test_allgather_token_dispatch_mxfp4_keeps_prequantized_scale():

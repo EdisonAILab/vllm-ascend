@@ -90,10 +90,6 @@ class TestW4A8RuntimeFlags(unittest.TestCase):
         )
 
         with (
-            patch.dict(
-                "os.environ",
-                {"VLLM_ASCEND_KIMI_REFERENCE_ROUTER_WEIGHT_BEFORE_GMM2": "1"},
-            ),
             patch.object(moe_mlp_module.torch.ops, "_C_ascend", custom_ops),
             patch(
                 "vllm_ascend.ops.fused_moe.moe_mlp.DeviceOperator.maybe_normalize_mxfp_scale_layout",
