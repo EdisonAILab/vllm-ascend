@@ -21,6 +21,7 @@ namespace vllm_ascend {
 
 std::tuple<at::Tensor, at::Tensor> situ_mx_quant(
     const at::Tensor& x,
+    const c10::optional<at::Tensor>& topk_weight,
     double beta,
     double linear_beta,
     bool activate_left,
@@ -38,6 +39,17 @@ std::tuple<at::Tensor, at::Tensor> situ_mx_quant(
                 "situ_mx_quant: x last dim must be even, but got ", x.size(-1));
     TORCH_CHECK(x.scalar_type() == at::kBFloat16,
                 "situ_mx_quant: x must be bfloat16, but got ", x.scalar_type());
+    if (topk_weight.has_value()) {
+        TORCH_CHECK(topk_weight->scalar_type() == at::kBFloat16,
+                    "situ_mx_quant: topk_weight must be bfloat16, but got ", topk_weight->scalar_type());
+        TORCH_CHECK(topk_weight->device() == x.device(),
+                    "situ_mx_quant: topk_weight must be on the same device as x");
+        TORCH_CHECK(topk_weight->is_contiguous(),
+                    "situ_mx_quant: topk_weight must be contiguous");
+        TORCH_CHECK(topk_weight->numel() == x.numel() / x.size(-1),
+                    "situ_mx_quant: topk_weight must contain one value per input row, but got ",
+                    topk_weight->numel(), " values for ", x.numel() / x.size(-1), " rows");
+    }
     TORCH_CHECK(beta > 0.0,
                 "situ_mx_quant: beta must be greater than 0, but got ", beta);
     TORCH_CHECK(dst_type == DST_TYPE_E4M3FN || dst_type == DST_TYPE_E5M2,
@@ -57,6 +69,7 @@ std::tuple<at::Tensor, at::Tensor> situ_mx_quant(
     constexpr int64_t AXIS = -1;
     EXEC_NPU_CMD(aclnnSituMxQuant,
                  x,
+                 topk_weight,
                  beta,
                  linear_beta,
                  activate_left,

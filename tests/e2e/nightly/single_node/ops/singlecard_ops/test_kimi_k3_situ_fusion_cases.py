@@ -233,3 +233,74 @@ def test_a5_routed_situ_mx_quant_shapes_single_op(phase: str, rows: int):
     assert y.dtype == torch.float8_e4m3fn
     assert tuple(mxscale.shape) == (rows, 48, 2)
     assert mxscale.dtype == torch_npu.float8_e8m0fnu
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("rows", (1, 32, 64), ids=("decode_m1", "small_prefill_m32", "prefill_m64"))
+@torch.inference_mode()
+def test_a5_weighted_situ_mx_quant_is_byte_exact(rows: int):
+    """Fused SiTU + row weight + MXFP8 matches the decomposed reference."""
+    if not _is_ascend_950() or not hasattr(torch.ops._C_ascend, "situ_mx_quant"):
+        pytest.skip("requires an Ascend 950 device and SituMxQuant")
+
+    x = _bf16_input(rows, 1024).npu()
+    topk_weight = torch.linspace(0.125, 0.875, rows, dtype=torch.bfloat16).reshape(rows, 1).npu()
+    situ = _situ(x).to(torch.bfloat16)
+    weighted_situ = (situ * topk_weight).to(torch.bfloat16)
+    expected_y, expected_scale = torch_npu.npu_dynamic_mx_quant(
+        weighted_situ,
+        axis=-1,
+        dst_type=torch.float8_e4m3fn,
+    )
+
+    actual_y, actual_scale = torch.ops._C_ascend.situ_mx_quant(
+        x,
+        topk_weight=topk_weight,
+        beta=K3_BETA,
+        linear_beta=K3_LINEAR_BETA,
+        activate_left=True,
+        dst_type=36,
+    )
+
+    assert torch.equal(actual_y.view(torch.uint8).cpu(), expected_y.view(torch.uint8).cpu())
+    assert torch.equal(actual_scale.view(torch.uint8).cpu(), expected_scale.view(torch.uint8).cpu())
+
+
+@pytest.mark.skip_global_cleanup
+@torch.inference_mode()
+def test_a5_weighted_situ_matches_kimi_decode_division_rounding():
+    """Preserve the Kimi decode BF16 midpoint reached by true up/linear_beta division."""
+    if not _is_ascend_950() or not hasattr(torch.ops._C_ascend, "situ_mx_quant"):
+        pytest.skip("requires an Ascend 950 device and SituMxQuant")
+
+    # This is the minimal shape/value boundary captured from a live reduced-K3
+    # decode. Reciprocal multiplication rounds the target SiTU value down to
+    # -0.99609375; PyTorch's true division rounds it to BF16 -1.0.
+    x = torch.zeros((2, 512), dtype=torch.bfloat16)
+    x[1, 90] = 4.03125
+    x[1, 256 + 90] = -0.33203125
+    x[1, 91] = 10.0
+    x[1, 256 + 91] = -10.0
+    x = x.npu()
+    topk_weight = torch.full((2, 1), 0.53515625, dtype=torch.bfloat16, device=x.device)
+
+    situ = _situ(x).to(torch.bfloat16)
+    weighted_situ = (situ * topk_weight).to(torch.bfloat16)
+    expected_y, expected_scale = torch_npu.npu_dynamic_mx_quant(
+        weighted_situ,
+        axis=-1,
+        dst_type=torch.float8_e4m3fn,
+    )
+    actual_y, actual_scale = torch.ops._C_ascend.situ_mx_quant(
+        x,
+        topk_weight=topk_weight,
+        beta=K3_BETA,
+        linear_beta=K3_LINEAR_BETA,
+        activate_left=True,
+        dst_type=36,
+    )
+
+    assert situ[1, 90].item() == -1.0
+    assert expected_y.view(torch.uint8)[1, 90].item() == 209
+    assert torch.equal(actual_y.view(torch.uint8).cpu(), expected_y.view(torch.uint8).cpu())
+    assert torch.equal(actual_scale.view(torch.uint8).cpu(), expected_scale.view(torch.uint8).cpu())

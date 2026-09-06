@@ -49,6 +49,7 @@ constexpr int64_t DTYPE_36 = 36;   // FP8_E4M3FN
 constexpr int64_t BASE_DIM1 = 256; // basic block size for last axis
 
 const set<ge::DataType> INPUT_SUPPORT_DTYPE_SET = {ge::DT_BF16};
+const set<ge::DataType> TOPK_WEIGHT_SUPPORT_DTYPE_SET = {ge::DT_BF16};
 const set<ge::DataType> Y_SUPPORT_DTYPE_SET = {ge::DT_FLOAT8_E4M3FN, ge::DT_FLOAT8_E5M2};
 const set<ge::DataType> SCALE_SUPPORT_DTYPE_SET = {ge::DT_FLOAT8_E8M0};
 
@@ -146,6 +147,24 @@ ge::graphStatus SituMxQuantRegbaseTiling::ValidateInput()
                 OP_LOGE(context_->GetNodeName(), "Last dimension must be divisible by 2, but got %ld.",
                         inputInfo_.inputDim2),
                 return ge::GRAPH_FAILED);
+
+    auto topkWeightDesc = context_->GetOptionalInputDesc(1);
+    if (topkWeightDesc != nullptr) {
+        auto topkWeightShape = context_->GetOptionalInputShape(1);
+        OP_CHECK_NULL_WITH_CONTEXT(context_, topkWeightShape);
+        auto topkWeightStorageShape = topkWeightShape->GetStorageShape();
+        if (topkWeightStorageShape.GetDimNum() != 0) {
+            auto topkWeightDtype = topkWeightDesc->GetDataType();
+            OP_CHECK_IF((TOPK_WEIGHT_SUPPORT_DTYPE_SET.find(topkWeightDtype) ==
+                         TOPK_WEIGHT_SUPPORT_DTYPE_SET.end()),
+                        OP_LOGE(context_->GetNodeName(),
+                                "Input topk_weight dtype %d is not supported. Only BF16 is supported.",
+                                static_cast<int>(topkWeightDtype)),
+                        return ge::GRAPH_FAILED);
+            inputInfo_.topkWeightSize = topkWeightStorageShape.GetShapeSize();
+            inputInfo_.hasTopkWeight = true;
+        }
+    }
     return ge::GRAPH_SUCCESS;
 }
 
@@ -191,6 +210,12 @@ ge::graphStatus SituMxQuantRegbaseTiling::PreProcess()
     inputInfo_.inputDim1 = inDim1;
     outputInfo_.outputDim1 = inDim1; // same as input since only last dim is halved
 
+    OP_CHECK_IF((inputInfo_.hasTopkWeight && inputInfo_.topkWeightSize != inDim1),
+                OP_LOGE(context_->GetNodeName(),
+                        "topk_weight must contain one value per input row, but got %ld values for %ld rows.",
+                        inputInfo_.topkWeightSize, inDim1),
+                return ge::GRAPH_FAILED);
+
     OP_LOGI(context_->GetNodeName(), "3D view: dim1=%ld, dim2=%ld(2H), outputDim2=%ld(H)",
             inputInfo_.inputDim1, inputInfo_.inputDim2, outputInfo_.outputDim2);
     return ge::GRAPH_SUCCESS;
@@ -214,6 +239,11 @@ ge::graphStatus SituMxQuantRegbaseTiling::CalculateTiling()
     bytesPerIteration += scaleCount * BYTES_OF_FP8;
     // Double buffer
     bytesPerIteration *= DOUBLE_BUFFER;
+    // Optional per-row BF16 routing weight. Count one value per basic block,
+    // which is conservative when several N blocks share the same row.
+    if (inputInfo_.hasTopkWeight) {
+        bytesPerIteration += tilingResult_.basicDim1 * BYTES_OF_BF16;
+    }
     // Situ output buffer (BF16)
     bytesPerIteration += tilingResult_.basicDim1 * tilingResult_.basicDim2 * BYTES_OF_BF16;
     // maxExp + halfScale (uint16_t each)
@@ -273,11 +303,12 @@ ge::graphStatus SituMxQuantRegbaseTiling::FillTilingData()
 void SituMxQuantRegbaseTiling::SetTilingKeyAndCore()
 {
     hasLinearBeta_ = attrParam_.hasLinearBeta ? TPL_HAS_LINEAR_BETA : TPL_NO_LINEAR_BETA;
+    hasTopkWeight_ = inputInfo_.hasTopkWeight ? TPL_HAS_TOPK_WEIGHT : TPL_NO_TOPK_WEIGHT;
     dstTypeIndex_ = (attrParam_.dstType == DTYPE_36) ? TPL_DST_E4M3FN : TPL_DST_E5M2;
 
-    int64_t tilingKey = GET_TPL_TILING_KEY(hasLinearBeta_, dstTypeIndex_);
-    OP_LOGI(context_->GetNodeName(), "hasLinearBeta=%lu, dstTypeIndex=%lu, tilingKey=%ld",
-            hasLinearBeta_, dstTypeIndex_, tilingKey);
+    int64_t tilingKey = GET_TPL_TILING_KEY(hasLinearBeta_, hasTopkWeight_, dstTypeIndex_);
+    OP_LOGI(context_->GetNodeName(), "hasLinearBeta=%lu, hasTopkWeight=%lu, dstTypeIndex=%lu, tilingKey=%ld",
+            hasLinearBeta_, hasTopkWeight_, dstTypeIndex_, tilingKey);
     context_->SetTilingKey(tilingKey);
     context_->SetBlockDim(tilingData_->usedCoreNum);
 }

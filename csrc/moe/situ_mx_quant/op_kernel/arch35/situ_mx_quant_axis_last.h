@@ -23,12 +23,12 @@
 namespace SituMxQuant {
 using namespace AscendC;
 
-template <typename T, typename U, bool hasLinearBeta>
+template <typename T, typename U, bool hasLinearBeta, bool hasTopkWeight>
 class SituMxQuantAxisLast {
 public:
     __aicore__ inline SituMxQuantAxisLast(){};
 
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR y, GM_ADDR mxscale, GM_ADDR workspace,
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR topkWeight, GM_ADDR y, GM_ADDR mxscale, GM_ADDR workspace,
                                 const SituMxQuantTilingData* __restrict tilingData, AscendC::TPipe* pipe);
     __aicore__ inline void Process();
 
@@ -40,6 +40,7 @@ private:
 
 private:
     GlobalTensor<T> xGm_;
+    GlobalTensor<T> topkWeightGm_;
     GlobalTensor<uint8_t> yGm_;
     GlobalTensor<uint8_t> scaleGm_;
     const SituMxQuantTilingData* tiling_;
@@ -47,19 +48,19 @@ private:
     int32_t blockIdx_ = 0;
 
     AscendC::TQue<AscendC::QuePosition::VECIN, 1> inQuex_;
+    AscendC::TQue<AscendC::QuePosition::VECIN, 1> topkWeightQue_;
     AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQuey_;
     AscendC::TQue<AscendC::QuePosition::VECOUT, 1> outQueScale_;
 
     TBuf<QuePosition::VECCALC> situBuffer_;
     TBuf<QuePosition::VECCALC> maxExpBuffer_;
     TBuf<QuePosition::VECCALC> halfScaleBuffer_;
+    LocalTensor<T> topkWeightLocal_;
 
     int64_t realCoreNum_ = 0;
     int64_t activateLeft_ = 0;
     float beta_ = 1.0f;
-    float invBeta_ = 1.0f;
     float linearBeta_ = 0.0f;
-    float invLinearBeta_ = 0.0f;
 
     int64_t dimM_ = 0;
     int64_t dim2N_ = 0;
@@ -77,9 +78,9 @@ private:
     int64_t outputScaleRowBytes_ = 0;
 };
 
-template <typename T, typename U, bool hasLinearBeta>
-__aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta>::Init(
-    GM_ADDR x, GM_ADDR y, GM_ADDR mxscale, GM_ADDR workspace,
+template <typename T, typename U, bool hasLinearBeta, bool hasTopkWeight>
+__aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta, hasTopkWeight>::Init(
+    GM_ADDR x, GM_ADDR topkWeight, GM_ADDR y, GM_ADDR mxscale, GM_ADDR workspace,
     const SituMxQuantTilingData* __restrict tilingData, AscendC::TPipe* pipe)
 {
 #if (__NPU_ARCH__ == 3510)
@@ -89,6 +90,9 @@ __aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta>::Init(
     pipe_ = pipe;
     blockIdx_ = GetBlockIdx();
     xGm_.SetGlobalBuffer((__gm__ T*)x);
+    if constexpr (hasTopkWeight) {
+        topkWeightGm_.SetGlobalBuffer((__gm__ T*)topkWeight);
+    }
     yGm_.SetGlobalBuffer((__gm__ uint8_t*)y);
     scaleGm_.SetGlobalBuffer((__gm__ uint8_t*)mxscale);
 
@@ -103,15 +107,16 @@ __aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta>::Init(
 
     activateLeft_ = tiling_->activateLeft;
     beta_ = tiling_->beta;
-    invBeta_ = 1.0f / beta_;
     linearBeta_ = tiling_->linearBeta;
-    if constexpr (hasLinearBeta) {
-        invLinearBeta_ = 1.0f / linearBeta_;
-    }
 
     // Initialize pipe buffers
     int32_t factorSize = factorDim0Size_ * factorDim1Size_;
     pipe_->InitBuffer(inQuex_, CONST_2, factorSize * X_ONCE_NUM * sizeof(T));
+    if constexpr (hasTopkWeight) {
+        int32_t topkWeightUbSize = factorDim0Size_ * sizeof(T);
+        topkWeightUbSize = ((topkWeightUbSize + ONE_BLOCK_UB - 1) / ONE_BLOCK_UB) * ONE_BLOCK_UB;
+        pipe_->InitBuffer(topkWeightQue_, 1, topkWeightUbSize);
+    }
     pipe_->InitBuffer(outQuey_, CONST_2, (factorSize * QUANT_ONCE_NUM) * sizeof(uint8_t));
     int32_t scaleUbSize = factorSize * SCALE_ONCE_NUM;
     scaleUbSize = ((scaleUbSize + CONST_64 - 1) / CONST_64) * CONST_64;
@@ -159,8 +164,8 @@ __aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta>::Init(
     }
 }
 
-template <typename T, typename U, bool hasLinearBeta>
-__aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta>::Process()
+template <typename T, typename U, bool hasLinearBeta, bool hasTopkWeight>
+__aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta, hasTopkWeight>::Process()
 {
     if (blockIdx_ >= realCoreNum_) {
         return;
@@ -170,6 +175,14 @@ __aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta>::Process()
     for (int64_t mGroup = 0; mGroup < loopTimesPerBatch_; mGroup++) {
         int64_t dim0Size = (mGroup == loopTimesPerBatch_ - 1) ? tailPerBatch_ : factorDim0Size_;
         int64_t rowOffset = mStart_ + mGroup * factorDim0Size_;
+        if constexpr (hasTopkWeight) {
+            topkWeightLocal_ = topkWeightQue_.AllocTensor<T>();
+            DataCopyExtParams topkWeightCopyParams = {1, static_cast<uint32_t>(dim0Size * sizeof(T)), 0, 0, 0};
+            DataCopyPadExtParams<T> topkWeightPadParams = {false, 0, 0, 0};
+            DataCopyPad(topkWeightLocal_, topkWeightGm_[rowOffset], topkWeightCopyParams, topkWeightPadParams);
+            topkWeightQue_.EnQue(topkWeightLocal_);
+            topkWeightLocal_ = topkWeightQue_.DeQue<T>();
+        }
         for (int64_t nLoop = 0; nLoop < loopTimesN_; nLoop++) {
             int64_t colOffset = nStart_ + nLoop * factorDim1Size_;
             bool isTailDim1 = (nLoop == loopTimesN_ - 1);
@@ -179,11 +192,14 @@ __aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta>::Process()
             Compute(dim0Size, dim1SizeNow, dim1AlignSizeNow);
             CopyOut(rowOffset, colOffset, dim0Size, dim1SizeNow, dim1AlignSizeNow);
         }
+        if constexpr (hasTopkWeight) {
+            topkWeightQue_.FreeTensor(topkWeightLocal_);
+        }
     }
 }
 
-template <typename T, typename U, bool hasLinearBeta>
-__aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta>::Compute(
+template <typename T, typename U, bool hasLinearBeta, bool hasTopkWeight>
+__aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta, hasTopkWeight>::Compute(
     int64_t dim0OnceSize, int64_t dim1OnceSize, int64_t dim1AlignSize)
 {
     LocalTensor<T> xlocal = inQuex_.DeQue<T>();
@@ -205,7 +221,11 @@ __aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta>::Compute(
 
     // Step 1: Situ activation
     ComputeVfSitu<T, hasLinearBeta>(gateUbAddr, upUbAddr, situUbAddr, dim0OnceSize, dim1OnceSize, dim1AlignSize,
-                                    beta_, invBeta_, linearBeta_, invLinearBeta_);
+                                    beta_, linearBeta_);
+    if constexpr (hasTopkWeight) {
+        auto topkWeightUbAddr = (__ubuf__ T*)topkWeightLocal_.GetPhyAddr();
+        ComputeVfRowWeight<T>(situUbAddr, topkWeightUbAddr, dim0OnceSize, dim1OnceSize, dim1AlignSize);
+    }
     inQuex_.FreeTensor(xlocal);
 
     // Step 2: MxQuant - extract max exponent per 32-element block
@@ -228,8 +248,8 @@ __aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta>::Compute(
     outQuey_.EnQue(outLocal);
 }
 
-template <typename T, typename U, bool hasLinearBeta>
-__aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta>::CopyIn(
+template <typename T, typename U, bool hasLinearBeta, bool hasTopkWeight>
+__aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta, hasTopkWeight>::CopyIn(
     int64_t rowOffset, int64_t colBlockStart, int64_t dim0OnceSize, int64_t dim1OnceSize)
 {
     LocalTensor<T> xlocal = inQuex_.AllocTensor<T>();
@@ -247,8 +267,8 @@ __aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta>::CopyIn(
     inQuex_.EnQue(xlocal);
 }
 
-template <typename T, typename U, bool hasLinearBeta>
-__aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta>::CopyOut(
+template <typename T, typename U, bool hasLinearBeta, bool hasTopkWeight>
+__aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta, hasTopkWeight>::CopyOut(
     int64_t rowOffset, int64_t colBlockStart, int64_t dim0OnceSize, int64_t dim1OnceSize, int64_t dim1OnceSizeAlgin)
 {
     LocalTensor<uint8_t> mxScaleLocal = outQueScale_.DeQue<uint8_t>();

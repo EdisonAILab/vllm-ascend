@@ -23,8 +23,9 @@
 using namespace AscendC;
 using namespace SituMxQuantOp;
 
-template <uint64_t hasLinearBeta, uint64_t dstTypeIndex>
-__global__ __aicore__ void situ_mx_quant(GM_ADDR x, GM_ADDR y, GM_ADDR mxscale, GM_ADDR workspace, GM_ADDR tiling)
+template <uint64_t hasLinearBeta, uint64_t hasTopkWeight, uint64_t dstTypeIndex>
+__global__ __aicore__ void situ_mx_quant(
+    GM_ADDR x, GM_ADDR topkWeight, GM_ADDR y, GM_ADDR mxscale, GM_ADDR workspace, GM_ADDR tiling)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     REGISTER_TILING_DEFAULT(SituMxQuantTilingData);
@@ -37,13 +38,15 @@ __global__ __aicore__ void situ_mx_quant(GM_ADDR x, GM_ADDR y, GM_ADDR mxscale, 
 
     if constexpr (dstTypeIndex == TPL_DST_E4M3FN) {
         constexpr bool useLinearBeta = (hasLinearBeta == TPL_HAS_LINEAR_BETA);
-        SituMxQuant::SituMxQuantAxisLast<bfloat16_t, fp8_e4m3fn_t, useLinearBeta> op;
-        op.Init(x, y, mxscale, usrWorkspace, &tilingData, &pipe);
+        constexpr bool useTopkWeight = (hasTopkWeight == TPL_HAS_TOPK_WEIGHT);
+        SituMxQuant::SituMxQuantAxisLast<bfloat16_t, fp8_e4m3fn_t, useLinearBeta, useTopkWeight> op;
+        op.Init(x, topkWeight, y, mxscale, usrWorkspace, &tilingData, &pipe);
         op.Process();
     } else {
         constexpr bool useLinearBeta = (hasLinearBeta == TPL_HAS_LINEAR_BETA);
-        SituMxQuant::SituMxQuantAxisLast<bfloat16_t, fp8_e5m2_t, useLinearBeta> op;
-        op.Init(x, y, mxscale, usrWorkspace, &tilingData, &pipe);
+        constexpr bool useTopkWeight = (hasTopkWeight == TPL_HAS_TOPK_WEIGHT);
+        SituMxQuant::SituMxQuantAxisLast<bfloat16_t, fp8_e5m2_t, useLinearBeta, useTopkWeight> op;
+        op.Init(x, topkWeight, y, mxscale, usrWorkspace, &tilingData, &pipe);
         op.Process();
     }
 

@@ -239,6 +239,45 @@ __aicore__ inline void ComputeDataF8Last(__ubuf__ T* srcAddr, __ubuf__ uint16_t*
     }
 }
 
+// Apply one BF16 routing weight per row after SiTU has rounded to BF16 and
+// before MX quantization. The BF16 -> FP32 -> multiply -> BF16 sequence matches
+// PyTorch's BF16 tensor multiplication boundary used by the parity reference.
+template <typename T>
+__aicore__ inline void ComputeVfRowWeight(__local_mem__ T* situUbAddr, __local_mem__ T* topkWeightUbAddr,
+                                          int64_t dim0OnceSize, int64_t dim1OnceSize, int64_t dim1AlignSize)
+{
+    uint16_t rowCount = static_cast<uint16_t>(dim0OnceSize);
+    uint16_t loopCount = CeilDivision(dim1OnceSize, static_cast<int64_t>(VF_LEN_FP32));
+    __VEC_SCOPE__
+    {
+        AscendC::MicroAPI::RegTensor<T> situT;
+        AscendC::MicroAPI::RegTensor<T> weightT;
+        AscendC::MicroAPI::RegTensor<T> weightedT;
+        AscendC::MicroAPI::RegTensor<float> situF;
+        AscendC::MicroAPI::RegTensor<float> weightF;
+        AscendC::MicroAPI::RegTensor<float> weightedF;
+        AscendC::MicroAPI::MaskReg mask =
+            AscendC::MicroAPI::CreateMask<float, AscendC::MicroAPI::MaskPattern::ALL>();
+        for (uint16_t row = 0; row < rowCount; row++) {
+            AscendC::MicroAPI::DataCopy<T, AscendC::MicroAPI::LoadDist::DIST_BRC_B16>(
+                weightT, topkWeightUbAddr + row);
+            AscendC::MicroAPI::Cast<float, T, CAST_ZERO>(weightF, weightT, mask);
+            uint32_t remaining = dim1OnceSize;
+            for (uint16_t col = 0; col < loopCount; col++) {
+                mask = AscendC::MicroAPI::UpdateMask<float>(remaining);
+                uint32_t offset = row * dim1AlignSize + col * VF_LEN_FP32;
+                AscendC::MicroAPI::DataCopy<T, AscendC::MicroAPI::LoadDist::DIST_UNPACK_B16>(
+                    situT, situUbAddr + offset);
+                AscendC::MicroAPI::Cast<float, T, CAST_ZERO>(situF, situT, mask);
+                AscendC::MicroAPI::Mul(weightedF, situF, weightF, mask);
+                AscendC::MicroAPI::Cast<T, float, CAST_FP32_TO_BF16>(weightedT, weightedF, mask);
+                AscendC::MicroAPI::DataCopy<T, AscendC::MicroAPI::StoreDist::DIST_PACK_B32>(
+                    situUbAddr + offset, weightedT, mask);
+            }
+        }
+    }
+}
+
 // ===================================================================
 // Situ activation: beta * tanh(gate / beta) * sigmoid(gate) * up
 //                  (+ optional linear_beta * tanh(up / linear_beta) on up)
@@ -247,8 +286,7 @@ __aicore__ inline void ComputeDataF8Last(__ubuf__ T* srcAddr, __ubuf__ uint16_t*
 template <typename T, bool hasLinearBeta>
 __aicore__ inline void ComputeVfSitu(__local_mem__ T* gateUbAddr, __local_mem__ T* upUbAddr,
                                      __local_mem__ T* situUbAddr, int64_t dim0OnceSize, int64_t dim1OnceSize,
-                                     int64_t dim1AlignSize, float beta, float invBeta, float linearBeta,
-                                     float invLinearBeta)
+                                     int64_t dim1AlignSize, float beta, float linearBeta)
 {
     uint16_t dim0VfTimes = dim0OnceSize;
     uint16_t dim1VfTimes = dim1OnceSize / VF_LEN_FP32;
@@ -333,7 +371,8 @@ __aicore__ inline void ComputeVfSitu(__local_mem__ T* gateUbAddr, __local_mem__ 
                 // Two-path tanh(gate/beta) — adapted from tanh.h reference:
                 //   small |x|: degree-7 polynomial (Horner)
                 //   large |x|: sigmoid decomposition on |x|, sign restore
-                AscendC::MicroAPI::Muls(gateDivBeta, gateF, invBeta, mask); // x = gate/beta
+                AscendC::MicroAPI::Duplicate(x2, beta);
+                AscendC::MicroAPI::Div(gateDivBeta, gateF, x2, mask); // x = gate/beta
 
                 // --- Polynomial path (all x, used for |x| < 0.6) ---
                 // tanh(x) ≈ x * (1 + c1*x² + c2*x⁴ + c3*x⁶ + c4*x⁸)
@@ -370,14 +409,21 @@ __aicore__ inline void ComputeVfSitu(__local_mem__ T* gateUbAddr, __local_mem__ 
                 AscendC::MicroAPI::Adds(expReg, expReg, scalarOne, mask);
                 AscendC::MicroAPI::Div(polyReg, oneReg, expReg, mask);       // sigmoid(gate)
 
-                // situ_a = beta * tanh * sigmoid
-                AscendC::MicroAPI::Mul(polyReg, negGate, polyReg, mask);     // tanh * sigmoid
-                AscendC::MicroAPI::Muls(polyReg, polyReg, beta, mask);       // * beta
+                // Preserve the PyTorch/Megatron left-to-right evaluation order:
+                // (beta * tanh) * sigmoid. Reassociating this as
+                // (tanh * sigmoid) * beta can move an FP32 result across a
+                // BF16 rounding midpoint before MX quantization.
+                AscendC::MicroAPI::Muls(negGate, negGate, beta, mask);       // beta * tanh
+                AscendC::MicroAPI::Mul(polyReg, negGate, polyReg, mask);     // * sigmoid
 
                 // Optional: up = linear_beta * tanh(up / linear_beta)
                 // Uses sigmoidReg/negGate as work registers to preserve polyReg (situ_a)
                 if constexpr (hasLinearBeta) {
-                    AscendC::MicroAPI::Muls(upF, upF, invLinearBeta, mask); // x = up/lb
+                    // Match PyTorch's true division. Multiplying by the
+                    // rounded FP32 reciprocal of linear_beta can differ by
+                    // one ULP and cross the following BF16 midpoint.
+                    AscendC::MicroAPI::Duplicate(x2, linearBeta);
+                    AscendC::MicroAPI::Div(upF, upF, x2, mask); // x = up/lb
 
                     // Poly path → sigmoidReg (FMA Horner)
                     AscendC::MicroAPI::Mul(x2, upF, upF, mask);
@@ -426,7 +472,8 @@ __aicore__ inline void ComputeVfSitu(__local_mem__ T* gateUbAddr, __local_mem__ 
                 AscendC::MicroAPI::Cast<float, T, CAST_ZERO>(upF, vregUp, mask1);
 
                 // Two-path tanh(gate/beta) — tail path
-                AscendC::MicroAPI::Muls(gateDivBeta, gateF, invBeta, mask1);
+                AscendC::MicroAPI::Duplicate(x2, beta);
+                AscendC::MicroAPI::Div(gateDivBeta, gateF, x2, mask1);
 
                 // Poly path → sigmoidReg (FMA Horner)
                 AscendC::MicroAPI::Mul(x2, gateDivBeta, gateDivBeta, mask1);
@@ -459,13 +506,14 @@ __aicore__ inline void ComputeVfSitu(__local_mem__ T* gateUbAddr, __local_mem__ 
                 AscendC::MicroAPI::Adds(expReg, expReg, scalarOne, mask1);
                 AscendC::MicroAPI::Div(polyReg, oneReg, expReg, mask1);
 
-                // situ_a = beta * tanh * sigmoid
+                // Match (beta * tanh) * sigmoid in the reference path.
+                AscendC::MicroAPI::Muls(negGate, negGate, beta, mask1);
                 AscendC::MicroAPI::Mul(polyReg, negGate, polyReg, mask1);
-                AscendC::MicroAPI::Muls(polyReg, polyReg, beta, mask1);
 
                 // Optional: up = linear_beta * tanh(up / linear_beta)
                 if constexpr (hasLinearBeta) {
-                    AscendC::MicroAPI::Muls(upF, upF, invLinearBeta, mask1);
+                    AscendC::MicroAPI::Duplicate(x2, linearBeta);
+                    AscendC::MicroAPI::Div(upF, upF, x2, mask1);
 
                     AscendC::MicroAPI::Mul(x2, upF, upF, mask1);
                     AscendC::MicroAPI::Muls(sigmoidReg, x2, tanhC4, mask1);

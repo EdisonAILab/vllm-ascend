@@ -1881,6 +1881,7 @@ std::tuple<at::Tensor, at::Tensor> dequant_situ_quant_meta(
 
 std::tuple<at::Tensor, at::Tensor> situ_mx_quant_meta(
     const at::Tensor& x,
+    const c10::optional<at::Tensor>& topk_weight,
     double beta,
     double linear_beta,
     bool activate_left,
@@ -1896,6 +1897,12 @@ std::tuple<at::Tensor, at::Tensor> situ_mx_quant_meta(
                 x.dim());
     TORCH_CHECK(x.scalar_type() == at::kBFloat16,
                 "situ_mx_quant: x must be bfloat16, but got ", x.scalar_type());
+    if (topk_weight.has_value()) {
+        TORCH_CHECK(topk_weight->scalar_type() == at::kBFloat16,
+                    "situ_mx_quant: topk_weight must be bfloat16, but got ", topk_weight->scalar_type());
+        TORCH_CHECK(topk_weight->device() == x.device(),
+                    "situ_mx_quant: topk_weight must be on the same device as x");
+    }
     TORCH_CHECK(beta > 0.0,
                 "situ_mx_quant: beta must be greater than 0, but got ", beta);
     TORCH_CHECK(dst_type == DST_TYPE_E4M3FN || dst_type == DST_TYPE_E5M2,

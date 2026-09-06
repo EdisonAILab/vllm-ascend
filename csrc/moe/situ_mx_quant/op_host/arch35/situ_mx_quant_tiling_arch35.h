@@ -41,6 +41,8 @@ struct SituMxQuantInputInfo {
     int64_t inputDim0{1};   // batch dim (collapsed)
     int64_t inputDim1{1};   // row dim (collapsed)
     int64_t inputDim2{0};   // 2H (input last dim)
+    int64_t topkWeightSize{0};
+    bool hasTopkWeight{false};
 };
 
 // ==================== Output Info ====================
@@ -96,6 +98,7 @@ private:
     SituMxQuantTilingResult tilingResult_;
 
     uint64_t hasLinearBeta_ = 0;
+    uint64_t hasTopkWeight_ = 0;
     uint64_t dstTypeIndex_ = 0;
 
     gert::TilingContext* context_ = nullptr;

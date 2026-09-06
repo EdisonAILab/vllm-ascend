@@ -21,6 +21,9 @@
 #define TPL_NO_LINEAR_BETA 0
 #define TPL_HAS_LINEAR_BETA 1
 
+#define TPL_NO_TOPK_WEIGHT 0
+#define TPL_HAS_TOPK_WEIGHT 1
+
 #define TPL_DST_E4M3FN 0
 #define TPL_DST_E5M2 1
 
@@ -28,10 +31,13 @@ namespace SituMxQuantOp {
 ASCENDC_TPL_ARGS_DECL(SituMxQuant,
                       ASCENDC_TPL_UINT_DECL(hasLinearBeta, 2, ASCENDC_TPL_UI_LIST, TPL_NO_LINEAR_BETA,
                                             TPL_HAS_LINEAR_BETA),
+                      ASCENDC_TPL_UINT_DECL(hasTopkWeight, 2, ASCENDC_TPL_UI_LIST, TPL_NO_TOPK_WEIGHT,
+                                            TPL_HAS_TOPK_WEIGHT),
                       ASCENDC_TPL_UINT_DECL(dstTypeIndex, 2, ASCENDC_TPL_UI_LIST, TPL_DST_E4M3FN, TPL_DST_E5M2));
 
 ASCENDC_TPL_SEL(ASCENDC_TPL_ARGS_SEL(
     ASCENDC_TPL_UINT_SEL(hasLinearBeta, ASCENDC_TPL_UI_LIST, TPL_NO_LINEAR_BETA, TPL_HAS_LINEAR_BETA),
+    ASCENDC_TPL_UINT_SEL(hasTopkWeight, ASCENDC_TPL_UI_LIST, TPL_NO_TOPK_WEIGHT, TPL_HAS_TOPK_WEIGHT),
     ASCENDC_TPL_UINT_SEL(dstTypeIndex, ASCENDC_TPL_UI_LIST, TPL_DST_E4M3FN, TPL_DST_E5M2)));
 } // namespace SituMxQuantOp
 

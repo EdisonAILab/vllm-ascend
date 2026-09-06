@@ -76,6 +76,74 @@ class TestW4A8RuntimeFlags(unittest.TestCase):
             MoEQuantParams(quant_type=QuantType.W8A8, is_per_channel_weight=True).use_w4a8_per_channel_gmm_swiglu
         )
 
+    def test_mxfp_situ_passes_routing_weight_to_fused_quant(self):
+        hidden_states = torch.ones(2, 4, dtype=torch.float8_e4m3fn)
+        dynamic_scale = torch.ones(2, 1, dtype=torch.float32)
+        gate_up_out = torch.randn(2, 8, dtype=torch.bfloat16)
+        topk_scales = torch.tensor([[0.25], [0.75]], dtype=torch.bfloat16)
+        quantized_situ = torch.ones(2, 4, dtype=torch.float8_e4m3fn)
+        situ_scale = torch.ones(2, 1, 2, dtype=torch.float32)
+        down_out = torch.randn(2, 4, dtype=torch.bfloat16)
+        event = object()
+        custom_ops = SimpleNamespace(
+            situ_mx_quant=MagicMock(return_value=(quantized_situ, situ_scale)),
+        )
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"VLLM_ASCEND_KIMI_REFERENCE_ROUTER_WEIGHT_BEFORE_GMM2": "1"},
+            ),
+            patch.object(moe_mlp_module.torch.ops, "_C_ascend", custom_ops),
+            patch(
+                "vllm_ascend.ops.fused_moe.moe_mlp.DeviceOperator.maybe_normalize_mxfp_scale_layout",
+                return_value=dynamic_scale,
+            ),
+            patch(
+                "vllm_ascend.ops.fused_moe.moe_mlp.torch_npu.npu_grouped_matmul",
+                return_value=[gate_up_out],
+                create=True,
+            ),
+            patch(
+                "vllm_ascend.ops.fused_moe.moe_mlp.DeviceOperator.npu_grouped_matmul_gmm2",
+                return_value=down_out,
+            ) as mock_gmm2,
+            patch("vllm_ascend.ops.fused_moe.moe_mlp.dispose_tensor"),
+            patch(
+                "vllm_ascend.ops.fused_moe.moe_mlp.torch.npu.current_stream",
+                return_value=MagicMock(record_event=MagicMock(return_value=event)),
+            ),
+        ):
+            output, before_gmm2_evt = moe_mlp_module._w4a8_situ_apply_mlp(
+                hidden_states=hidden_states,
+                w1=[torch.ones(1, 4, 8)],
+                w1_scale=[torch.ones(1)],
+                w2=[torch.ones(1, 4, 4)],
+                w2_scale=[torch.ones(1)],
+                group_list=torch.tensor([2]),
+                group_list_type=1,
+                dynamic_scale=dynamic_scale,
+                topk_scales=topk_scales,
+                w1_scale_bias=None,
+                w2_scale_bias=None,
+                activation=SituActivationConfig(beta=4.0, linear_beta=25.0),
+                act_quant_type=torch.float8_e4m3fn,
+                weight_quant_type=None,
+                scale_type=None,
+                per_token_scale_type=None,
+                use_bf16=True,
+                use_mxfp_quant=True,
+                is_per_channel_weight=False,
+            )
+
+        self.assertIs(output, down_out)
+        self.assertIs(before_gmm2_evt, event)
+        situ_call = custom_ops.situ_mx_quant.call_args.kwargs
+        self.assertIs(situ_call["x"], gate_up_out)
+        self.assertIs(situ_call["topk_weight"], topk_scales)
+        self.assertIs(mock_gmm2.call_args.kwargs["hidden_states"], quantized_situ)
+        self.assertIs(mock_gmm2.call_args.kwargs["per_token_scale"], situ_scale)
+
 
 class TestUnifiedApplyMlpRequest(unittest.TestCase):
     def test_unquant_apply_mlp_wraps_tensor_weights_for_grouped_matmul(self):
