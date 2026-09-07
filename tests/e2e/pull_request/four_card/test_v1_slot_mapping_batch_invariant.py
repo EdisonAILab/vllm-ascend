@@ -36,12 +36,11 @@ BATCH_PROMPTS = [
 
 
 @pytest.fixture(autouse=True)
-def enable_native_batch_invariance(monkeypatch: pytest.MonkeyPatch):
+def enable_batch_invariance(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     monkeypatch.setenv("VLLM_TP_FIXED_ORDER_ALLREDUCE", "1")
     monkeypatch.setenv("VLLM_MXFP8_DENSE_BI_DECOMPOSE", "1")
     monkeypatch.setenv("VLLM_MXFP8_GROUPED_BI_DECOMPOSE", "1")
-    monkeypatch.setenv("VLLM_BI_CPU_SLOT_MAPPING", "0")
     monkeypatch.setenv("VLLM_BI_FIA_DECOMPOSE", "0")
     monkeypatch.setenv("VLLM_BI_CONTIGUOUS_KV", "0")
     monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
@@ -88,7 +87,7 @@ def _first_difference(left: list[Any], right: list[Any]) -> int | None:
     return min(len(left), len(right)) if len(left) != len(right) else None
 
 
-def test_tp4_native_slot_mapping_is_batch_invariant(tmp_path: Path):
+def test_tp4_slot_mapping_is_batch_invariant(tmp_path: Path):
     singleton = _run_cell([TARGET_PROMPT], 0, tmp_path / "singleton.json")
     batched = _run_cell(BATCH_PROMPTS, 2, tmp_path / "batch4.json")
 
@@ -99,7 +98,7 @@ def test_tp4_native_slot_mapping_is_batch_invariant(tmp_path: Path):
     first_token_diff = _first_difference(singleton_ids, batched_ids)
     first_logprob_diff = _first_difference(singleton_logprobs, batched_logprobs)
     assert first_token_diff is None and first_logprob_diff is None, (
-        "TP4 native slot mapping is not batch-invariant: "
+        "TP4 slot mapping is not batch-invariant: "
         f"first token divergence={first_token_diff}, "
         f"first top-5 logprob divergence={first_logprob_diff}"
     )

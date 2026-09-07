@@ -34,6 +34,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
@@ -1243,10 +1244,11 @@ class NPUModelRunner(GPUModelRunner):
         if self._needs_seq_lens_cpu_sync and async_spec_decode_active:
             self._correct_optimistic_seq_lens_cpu(num_reqs)
 
-        self.input_batch.block_table.compute_slot_mapping(
-            num_reqs,
-            self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
+        self._compute_slot_mapping(
+            num_reqs=num_reqs,
+            total_num_scheduled_tokens=total_num_scheduled_tokens,
+            req_indices=req_indices,
+            positions_np=positions_np,
         )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
@@ -1315,6 +1317,35 @@ class NPUModelRunner(GPUModelRunner):
             logits_indices,
             spec_decode_metadata,
             total_num_scheduled_tokens,
+        )
+
+    def _compute_slot_mapping(
+        self,
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+        req_indices: np.ndarray,
+        positions_np: np.ndarray,
+    ) -> None:
+        if envs.VLLM_BATCH_INVARIANT:
+            if self.use_async_spec_decode:
+                # Async speculative decode corrects positions on the NPU after
+                # the CPU positions were built. Synchronize only this mode so
+                # deterministic mapping never consumes optimistic positions.
+                positions_np = (
+                    self.positions[:total_num_scheduled_tokens]
+                    .to("cpu")
+                    .numpy()
+                )
+            self.input_batch.block_table.compute_slot_mapping_draft(
+                req_indices,
+                positions_np,
+            )
+            return
+
+        self.input_batch.block_table.compute_slot_mapping(
+            num_reqs,
+            self.query_start_loc.gpu[: num_reqs + 1],
+            self.positions[:total_num_scheduled_tokens],
         )
 
     def _build_attn_state(self, num_reqs, num_scheduled_tokens, num_valid_tokens):
