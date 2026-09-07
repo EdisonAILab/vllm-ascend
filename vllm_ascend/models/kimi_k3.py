@@ -1152,6 +1152,69 @@ def _reference_mla_forward_prefill(
     return torch.stack(outputs).reshape(-1, impl.num_heads * impl.v_head_dim)
 
 
+def _decomposed_mla_forward_prefill(
+    impl,
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    value: torch.Tensor,
+    kv_c_and_k_pe_cache: tuple[torch.Tensor, ...],
+    attn_metadata,
+) -> torch.Tensor:
+    """Run reduced Kimi prefill with vectorized FP32 attention reductions."""
+    del kv_c_and_k_pe_cache
+    prefill_meta = attn_metadata.prefill
+    assert prefill_meta is not None
+    outputs = []
+    start = 0
+    for end_value in prefill_meta.actual_seq_lengths_q:
+        end = int(end_value)
+        sequence_length = end - start
+        if sequence_length == 0:
+            continue
+        q_nope_sequence = q_nope[start:end].float()
+        q_pe_sequence = q_pe[start:end].float()
+        k_nope_sequence = k_nope[start:end].float()
+        k_pe_sequence = k_pe[start:end].float()
+        value_sequence = value[start:end].float()
+        scores = torch.einsum(
+            "thd,shd->hts",
+            q_nope_sequence,
+            k_nope_sequence,
+        )
+        scores.add_(
+            torch.einsum(
+                "thd,shd->hts",
+                q_pe_sequence,
+                k_pe_sequence,
+            )
+        )
+        causal_mask = torch.triu(
+            torch.ones(
+                (sequence_length, sequence_length),
+                dtype=torch.bool,
+                device=q_nope.device,
+            ),
+            diagonal=1,
+        )
+        probabilities = torch.softmax(
+            scores.masked_fill(causal_mask.unsqueeze(0), float("-inf")) * impl.scale,
+            dim=-1,
+        )
+        outputs.append(
+            torch.einsum(
+                "hts,shd->thd",
+                probabilities,
+                value_sequence,
+            ).to(q_nope.dtype)
+        )
+        start = end
+    if start != q_nope.shape[0]:
+        raise ValueError("Kimi MLA prefill cumulative sequence lengths do not cover all rows")
+    return torch.cat(outputs).reshape(-1, impl.num_heads * impl.v_head_dim)
+
+
 class KimiK3MLAAttention(nn.Module):
     """Q-LoRA MLA with a position-independent q/k slice and output gate."""
 
@@ -1279,11 +1342,15 @@ class KimiK3MLAAttention(nn.Module):
         )
         if mla_impl.kimi_reduced_shape_decode:
             mla_impl.kimi_reduced_shape_rope_dim = _KIMI_MLA_KERNEL_ROPE_DIM
-        if os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_MLA_DECODE") == "1":
+        reference_mla = os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_MLA_DECODE") == "1"
+        decomposed_mla = os.environ.get("VLLM_ASCEND_KIMI_DECOMPOSED_MLA_ATTENTION") == "1"
+        if reference_mla or decomposed_mla:
             # The A5 fused MLA prolog requires the production 512-wide KV
             # latent.  Keep the normal paged cache, but route this deliberately
-            # reduced 128-wide fixture through explicit Kimi projections and
-            # attention math.
+            # reduced 128-wide fixture through architecture-preserving explicit
+            # Kimi projections and attention math.  The decomposed path batches
+            # prefill reductions while the reference path retains its rowwise
+            # oracle implementation.
             mla_impl.enable_mlapo = False
             if "layers.3.self_attn" in prefix:
                 mla_impl.kimi_parity_layer = 4
@@ -1291,12 +1358,19 @@ class KimiK3MLAAttention(nn.Module):
                 _reference_mla_preprocess_decode,
                 mla_impl,
             )
-            mla_impl._forward_prefill = MethodType(
-                _reference_mla_forward_prefill,
-                mla_impl,
+            prefill_forward = (
+                _decomposed_mla_forward_prefill
+                if decomposed_mla
+                else _reference_mla_forward_prefill
             )
+            mla_impl._forward_prefill = MethodType(prefill_forward, mla_impl)
             mla_impl._forward_decode = MethodType(
                 _reference_mla_forward_decode,
+                mla_impl,
+            )
+        elif os.environ.get("VLLM_ASCEND_KIMI_DECOMPOSED_MLA_PREFILL") == "1":
+            mla_impl._forward_prefill = MethodType(
+                _decomposed_mla_forward_prefill,
                 mla_impl,
             )
 

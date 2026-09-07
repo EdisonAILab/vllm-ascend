@@ -20,8 +20,10 @@ from vllm_ascend.models.kimi_k3 import (
     KimiK3VisionEncoderLayer,
     _apply_attention_residual,
     _configure_kimi_mlapo_shape,
+    _decomposed_mla_forward_prefill,
     _KimiReferenceRMSNorm,
     _move_module_to_device,
+    _reference_mla_forward_prefill,
     _resolve_packed_expert_weight_name,
     _routed_latent_quant_config,
     get_spec_layer_idx_from_weight_name,
@@ -132,6 +134,40 @@ def test_kimi_k3_reference_rms_norm_casts_before_weight():
     expected = norm.weight * normalized.to(torch.bfloat16)
 
     assert torch.equal(norm(hidden_states), expected)
+
+
+def test_kimi_k3_decomposed_mla_prefill_matches_rowwise_reference():
+    generator = torch.Generator().manual_seed(20260907)
+    q_nope = torch.randn(7, 2, 4, generator=generator, dtype=torch.bfloat16)
+    q_pe = torch.randn(7, 2, 2, generator=generator, dtype=torch.bfloat16)
+    k_nope = torch.randn(7, 2, 4, generator=generator, dtype=torch.bfloat16)
+    k_pe = torch.randn(7, 2, 2, generator=generator, dtype=torch.bfloat16)
+    value = torch.randn(7, 2, 3, generator=generator, dtype=torch.bfloat16)
+    impl = SimpleNamespace(num_heads=2, v_head_dim=3, scale=6**-0.5)
+    metadata = SimpleNamespace(prefill=SimpleNamespace(actual_seq_lengths_q=[3, 7]))
+
+    expected = _reference_mla_forward_prefill(
+        impl,
+        q_nope,
+        q_pe,
+        k_nope,
+        k_pe,
+        value,
+        (),
+        metadata,
+    )
+    actual = _decomposed_mla_forward_prefill(
+        impl,
+        q_nope,
+        q_pe,
+        k_nope,
+        k_pe,
+        value,
+        (),
+        metadata,
+    )
+
+    assert torch.equal(actual, expected)
 
 
 def test_kimi_k3_vectorized_attention_residual_uses_explicit_fp32_reductions():
