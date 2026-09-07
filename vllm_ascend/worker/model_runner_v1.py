@@ -33,6 +33,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CompilationMode, CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
@@ -1084,15 +1085,15 @@ class NPUModelRunner(GPUModelRunner):
             num_scheduled_tokens[:num_reqs], self.arange_np[:num_reqs],
             self.use_compress,
             self.kv_cache_config.kv_cache_groups)
-        # For non-PCP, compute slot_mapping on GPU. PCP slot_mapping was
-        # already computed on GPU before PCP split the positions.
+        # PCP slot_mapping was already computed before PCP split the positions.
         if self.pcp_size <= 1:
-            self.input_batch.block_table.compute_slot_mapping(
-                num_reqs,
-                self.query_start_loc.gpu[: num_reqs + 1],
-                self.positions[:total_num_scheduled_tokens],
-                positions_compressed_list,
-                req_indices_compressed_list,
+            self._compute_slot_mapping(
+                num_reqs=num_reqs,
+                total_num_scheduled_tokens=total_num_scheduled_tokens,
+                req_indices=req_indices,
+                positions_np=positions_np,
+                positions_compressed_list=positions_compressed_list,
+                req_indices_compressed_list=req_indices_compressed_list,
             )
 
         if self.use_async_spec_decode and (self.uses_mrope or self.uses_xdrope_dim > 0):
@@ -1183,6 +1184,41 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata,
             total_num_scheduled_tokens,
             num_scheduled_tokens_compressed_list
+        )
+
+    def _compute_slot_mapping(
+        self,
+        num_reqs: int,
+        total_num_scheduled_tokens: int,
+        req_indices: np.ndarray,
+        positions_np: np.ndarray,
+        positions_compressed_list: list[np.ndarray] | None,
+        req_indices_compressed_list: list[np.ndarray] | None,
+    ) -> None:
+        if envs.VLLM_BATCH_INVARIANT:
+            if self.use_async_spec_decode:
+                # Async speculative decode corrects positions on the NPU after
+                # the CPU positions were built. Synchronize only this mode so
+                # deterministic mapping never consumes optimistic positions.
+                positions_np = (
+                    self.positions[:total_num_scheduled_tokens]
+                    .to("cpu")
+                    .numpy()
+                )
+            self.input_batch.block_table.compute_slot_mapping_draft(
+                req_indices,
+                positions_np,
+                positions_compressed_list,
+                req_indices_compressed_list,
+            )
+            return
+
+        self.input_batch.block_table.compute_slot_mapping(
+            num_reqs,
+            self.query_start_loc.gpu[: num_reqs + 1],
+            self.positions[:total_num_scheduled_tokens],
+            positions_compressed_list,
+            req_indices_compressed_list,
         )
 
     def _preprocess(
