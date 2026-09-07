@@ -1792,7 +1792,33 @@ class AscendMLAImpl(MLAAttentionImpl):
         else:
             # The output layout is set to NBSD to eliminate the need for a
             # transpose operation after attention.
-            if self.enable_kv_nz:
+            if getattr(self, "kimi_reduced_shape_decode", False):
+                # CANN handles reduced Kimi latent ranks through its
+                # prefill-style MLA tiling, which accepts BNSD but not the
+                # decode-only BNSD_NBSD layout used by the production rank.
+                input_layout = "BNSD"
+                q_nope = q_nope.view(num_tokens, self.num_heads, 1, -1).contiguous()
+                q_pe = q_pe.view(num_tokens, self.num_heads, 1, -1)
+                kernel_rope_dim = self.kimi_reduced_shape_rope_dim
+                rope_padding = kernel_rope_dim - q_pe.shape[-1]
+                if rope_padding < 0:
+                    raise ValueError(
+                        "reduced Kimi MLA rope dimension exceeds the kernel "
+                        f"contract: {q_pe.shape[-1]} > {kernel_rope_dim}"
+                    )
+                if rope_padding:
+                    q_pe = F.pad(q_pe, (0, rope_padding))
+                    k_pe = F.pad(k_pe, (0, rope_padding))
+                if self.head_padding > 0:
+                    q_pe = F.pad(q_pe, (0, 0, 0, 0, 0, self.head_padding), "constant", 0)
+                    q_nope = F.pad(q_nope, (0, 0, 0, 0, 0, self.head_padding), "constant", 0)
+                attn_output_shape = (
+                    num_tokens,
+                    self.num_heads_padded,
+                    1,
+                    self.kv_lora_rank,
+                )
+            elif self.enable_kv_nz:
                 # Input shape: [num_tokens, seq_len, num_heads, dim]
                 input_layout = "BSND_NBSD"
                 q_nope = q_nope.view(num_tokens, 1, self.num_heads, -1).contiguous()
@@ -1983,7 +2009,14 @@ class AscendMLAImpl(MLAAttentionImpl):
                 .permute(1, 0, 2)
                 .contiguous()
             )
-        if self.head_padding > 0:
+        if getattr(self, "kimi_reduced_shape_decode", False):
+            attn_output = (
+                attn_output[:, : self.num_heads]
+                .squeeze(2)
+                .transpose(0, 1)
+                .contiguous()
+            )
+        elif self.head_padding > 0:
             attn_output = attn_output[: self.num_heads]
         return self._v_up_proj(attn_output)
 

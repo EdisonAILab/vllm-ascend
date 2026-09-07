@@ -21,8 +21,6 @@ Use the following settings with `enforce_eager=True`:
 ```bash
 export VLLM_ASCEND_KIMI_REFERENCE_SHORT_CONV=0
 export VLLM_ASCEND_KIMI_UNFUSED_SHORT_CONV_ACTIVATION=1
-export VLLM_ASCEND_KIMI_REFERENCE_KDA_CORE=0
-export VLLM_ASCEND_KIMI_NATIVE_KDA_CORE=1
 export VLLM_ASCEND_KIMI_NATIVE_STATE_OPS=1
 export VLLM_ASCEND_KIMI_KDA_NATIVE_NORM_GATE=1
 export VLLM_ASCEND_KIMI_GATE_LOWER_BOUND=-5.0
@@ -31,8 +29,8 @@ export VLLM_ASCEND_KIMI_VECTORIZED_ATTN_RES=1
 export VLLM_ASCEND_KIMI_NATIVE_ATTN_RES=1
 export VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32=1
 export VLLM_ASCEND_KIMI_REFERENCE_ROUTING=0
-export VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM=1
-export VLLM_ASCEND_KIMI_DECOMPOSED_ROUTED_RMS_NORM=0
+export VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM=0
+export VLLM_ASCEND_KIMI_DECOMPOSED_ROUTED_RMS_NORM=1
 export VLLM_ASCEND_KIMI_REFERENCE_MLA_RMS_NORM=1
 export VLLM_ASCEND_KIMI_DECOMPOSED_MLA_RMS_NORM=0
 export VLLM_ASCEND_KIMI_REFERENCE_MLA_DECODE=1
@@ -41,20 +39,36 @@ export VLLM_ASCEND_NATIVE_SLOT_MAPPING=1
 export VLLM_ASCEND_SKIP_UNUSED_PENALTY_WARMUP=1
 ```
 
-The accepted profile keeps production MoE routing and the production causal
-convolution/cache update, but runs SiLU separately. It keeps explicit FP32
-RMSNorm reductions, router arithmetic, KDA recurrence, MLA decode, and AttnRes
-reductions where the optimized kernels did not satisfy the byte-exact
+The accepted profile keeps production MoE routing, production KDA recurrence,
+and the production causal convolution/cache update, but runs SiLU separately.
+It keeps explicit FP32 RMSNorm reductions, router arithmetic, MLA decode, and
+AttnRes reductions where the optimized kernels did not satisfy the byte-exact
 contract. For W4A8 SiTU, the normal dispatch boundary quantizes the sorted
 BF16 tokens with `npu_dynamic_mx_quant`, and routing weights are applied before
 the second dynamic MXFP8 quantization and grouped GEMM. The fused routing
 quantizer's E4M3 modes 3 and 17 use a different E8M0 scale-rounding policy and
 were rejected by the serialized-logprob gate.
 
-The rejected decomposed native RMSNorm variants remain available only for
-diagnosis. They passed a short gate but differed at decode step 883, so both
-`VLLM_ASCEND_KIMI_DECOMPOSED_*_RMS_NORM` variables must remain disabled for
-byte-exact runs.
+No KDA core selector is required. The production AscendC KDA operator passed
+the 1,024-row byte-exact gate with both diagnostic KDA environment variables
+unset. `VLLM_ASCEND_KIMI_NATIVE_KDA_CORE=1` selects the explicit Python
+recurrence used during localization; it is not the production path.
+
+For deliberately reduced Kimi checkpoints, the fixed-shape MLAPO prolog is
+disabled automatically when `kv_lora_rank` is not 512. The standard MLA
+preprocess path pads the reduced RoPE slice to the 64-wide CANN contract and
+uses the supported `BNSD` layout. This makes the production fused-attention
+kernel runnable for diagnosis, but that kernel did not pass the byte-exact
+gate; keep `VLLM_ASCEND_KIMI_REFERENCE_MLA_DECODE=1` in correctness runs.
+
+The decomposed routed-expert RMSNorm passed the complete 1,024-row gate. It
+uses the native NPU reduction and applies the learned weight only after the
+normalized value reaches BF16, matching the Megatron boundary. The same
+decomposition is not interchangeable at the narrower MLA Q/KV ranks: it
+passed 8 rows but differed at decode call 883. Keep
+`VLLM_ASCEND_KIMI_DECOMPOSED_MLA_RMS_NORM=0` and the explicit MLA reference
+reduction enabled for byte-exact runs. The fully fused native RMSNorm path was
+rejected at the 8-row gate for both sites.
 
 ## Result
 

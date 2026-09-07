@@ -2550,6 +2550,52 @@ class TestAscendMLAImpl(TestBase):
         self.assertEqual(result.shape[1], N)
         self.assertEqual(result.shape[2], HD)
 
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch("torch_npu.npu_fused_infer_attention_score_v2")
+    def test_forward_decode_reduced_kimi_uses_bnsd_layout(
+        self,
+        mock_npu_fused_infer_attention_score_v2,
+        mock_get_forward_context,
+    ):
+        batch_size = 2
+        block_size = 16
+        self.impl.speculative_config = None
+        self.impl.enable_kv_nz = False
+        self.impl.kimi_reduced_shape_decode = True
+        self.impl.kimi_reduced_shape_rope_dim = 64
+        self.impl._v_up_proj = MagicMock(
+            return_value=torch.randn(batch_size, self.impl.num_heads * self.impl.v_head_dim)
+        )
+        q_nope = torch.randn(batch_size, self.impl.num_heads, self.impl.kv_lora_rank)
+        q_pe = torch.randn(batch_size, self.impl.num_heads, self.impl.qk_rope_head_dim)
+        k_nope = torch.randn(block_size, self.impl.num_kv_heads, self.impl.kv_lora_rank)
+        k_pe = torch.randn(block_size, self.impl.num_kv_heads, self.impl.qk_rope_head_dim)
+        attn_metadata = MagicMock()
+        attn_metadata.attn_state = AscendAttentionState.DecodeOnly
+        attn_metadata.decode = MagicMock()
+        attn_metadata.decode.block_table = torch.zeros(batch_size, 1, dtype=torch.int32)
+        attn_metadata.decode.seq_lens_list = [1, 1]
+        kernel_output = torch.randn(
+            batch_size,
+            self.impl.num_heads_padded,
+            1,
+            self.impl.kv_lora_rank,
+        )
+        mock_npu_fused_infer_attention_score_v2.return_value = [kernel_output, None]
+        mock_get_forward_context.return_value = MagicMock(capturing=False)
+
+        self.impl._forward_decode(q_nope, q_pe, k_nope, k_pe, block_size, attn_metadata)
+
+        call_kwargs = mock_npu_fused_infer_attention_score_v2.call_args.kwargs
+        self.assertEqual(call_kwargs["input_layout"], "BNSD")
+        self.assertEqual(call_kwargs["query_rope"].shape[-1], 64)
+        self.assertEqual(call_kwargs["key_rope"].shape[-1], 64)
+        projected_input = self.impl._v_up_proj.call_args.args[0]
+        torch.testing.assert_close(
+            projected_input,
+            kernel_output.squeeze(2).transpose(0, 1).contiguous(),
+        )
+
     @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     @patch("torch_npu.npu_fused_infer_attention_score_v2")

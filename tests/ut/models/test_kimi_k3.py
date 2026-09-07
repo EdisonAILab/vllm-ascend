@@ -19,6 +19,7 @@ from vllm_ascend.models.kimi_k3 import (
     KimiK3TextModel,
     KimiK3VisionEncoderLayer,
     _apply_attention_residual,
+    _configure_kimi_mlapo_shape,
     _KimiReferenceRMSNorm,
     _move_module_to_device,
     _resolve_packed_expert_weight_name,
@@ -43,6 +44,28 @@ def test_kimi_k3_model_declares_checkpoint_packing_contract():
         "experts.0.w3",
         "experts.0.w2",
     ]
+
+
+@pytest.mark.parametrize(
+    ("enabled", "kv_lora_rank", "expected_enabled", "expected_fallback"),
+    [
+        (True, 128, False, True),
+        (True, 512, True, False),
+        (False, 128, False, False),
+    ],
+)
+def test_kimi_mlapo_reduced_shape_fallback(
+    enabled: bool,
+    kv_lora_rank: int,
+    expected_enabled: bool,
+    expected_fallback: bool,
+):
+    mla_impl = SimpleNamespace(enable_mlapo=enabled)
+
+    actual = _configure_kimi_mlapo_shape(mla_impl, kv_lora_rank)
+
+    assert actual is expected_fallback
+    assert mla_impl.enable_mlapo is expected_enabled
 
 
 def test_kimi_k3_loads_qkv_checkpoint_shards_into_fused_linear():

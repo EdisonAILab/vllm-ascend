@@ -127,6 +127,24 @@ if HAS_TRITON:
     apply_attn_res = triton_apply_attn_res
 
 
+_KIMI_MLAPO_KV_LORA_RANK = 512
+_KIMI_MLA_KERNEL_ROPE_DIM = 64
+
+
+def _configure_kimi_mlapo_shape(mla_impl: Any, kv_lora_rank: int) -> bool:
+    """Fall back from the fixed-shape A5 MLAPO prolog for reduced Kimi models."""
+    if not mla_impl.enable_mlapo or kv_lora_rank == _KIMI_MLAPO_KV_LORA_RANK:
+        return False
+    mla_impl.enable_mlapo = False
+    logger.warning_once(
+        "Kimi MLAPO requires kv_lora_rank=%d; using the standard MLA "
+        "preprocess path for reduced kv_lora_rank=%d.",
+        _KIMI_MLAPO_KV_LORA_RANK,
+        kv_lora_rank,
+    )
+    return True
+
+
 def _parity_tap(name: str, tensor: torch.Tensor) -> None:
     """Persist opt-in prefill tensors without changing the production path."""
     output_dir = os.environ.get("KIMI_PARITY_TAP_DIR")
@@ -1254,12 +1272,18 @@ class KimiK3MLAAttention(nn.Module):
             quant_config,
             prefix,
         )
+        mla_impl = self.mla_attn.mla_attn.impl
+        mla_impl.kimi_reduced_shape_decode = _configure_kimi_mlapo_shape(
+            mla_impl,
+            kv_lora_rank,
+        )
+        if mla_impl.kimi_reduced_shape_decode:
+            mla_impl.kimi_reduced_shape_rope_dim = _KIMI_MLA_KERNEL_ROPE_DIM
         if os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_MLA_DECODE") == "1":
             # The A5 fused MLA prolog requires the production 512-wide KV
             # latent.  Keep the normal paged cache, but route this deliberately
             # reduced 128-wide fixture through explicit Kimi projections and
             # attention math.
-            mla_impl = self.mla_attn.mla_attn.impl
             mla_impl.enable_mlapo = False
             if "layers.3.self_attn" in prefix:
                 mla_impl.kimi_parity_layer = 4
