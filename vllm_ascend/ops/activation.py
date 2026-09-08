@@ -15,6 +15,8 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -54,11 +56,27 @@ def situ_and_mul(
     if x.shape[-1] % 2 != 0:
         raise ValueError(f"SiTU expects an even last dimension, got {x.shape[-1]}.")
 
-    gate, up = x.to(torch.float32).chunk(2, dim=-1)
+    minimum_rows = int(os.environ.get("VLLM_ASCEND_KIMI_SITU_MIN_ROWS", "0"))
+    row_count = math.prod(x.shape[:-1])
+    padded = 0 < row_count < minimum_rows
+    work = x
+    if padded:
+        flat = x.reshape(row_count, x.shape[-1])
+        padding = torch.zeros(
+            (minimum_rows - row_count, flat.shape[1]),
+            dtype=flat.dtype,
+            device=flat.device,
+        )
+        work = torch.cat((flat, padding), dim=0)
+
+    gate, up = work.to(torch.float32).chunk(2, dim=-1)
     gate = config.beta * torch.tanh(gate / config.beta) * torch.sigmoid(gate)
     if config.linear_beta is not None:
         up = config.linear_beta * torch.tanh(up / config.linear_beta)
-    return (gate * up).to(x.dtype)
+    output = (gate * up).to(x.dtype)
+    if padded:
+        output = output[:row_count].reshape(*x.shape[:-1], x.shape[-1] // 2)
+    return output
 
 
 class AscendSituAndMul(nn.Module):

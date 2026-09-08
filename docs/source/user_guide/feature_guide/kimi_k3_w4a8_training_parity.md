@@ -23,6 +23,7 @@ export VLLM_ASCEND_KIMI_REFERENCE_SHORT_CONV=0
 export VLLM_ASCEND_KIMI_UNFUSED_SHORT_CONV_ACTIVATION=1
 export VLLM_ASCEND_KIMI_NATIVE_STATE_OPS=1
 export VLLM_ASCEND_KIMI_KDA_NATIVE_NORM_GATE=1
+export VLLM_ASCEND_KIMI_SITU_MIN_ROWS=2
 export VLLM_ASCEND_KIMI_GATE_LOWER_BOUND=-5.0
 export VLLM_ASCEND_KIMI_REFERENCE_ATTN_RES=1
 export VLLM_ASCEND_KIMI_VECTORIZED_ATTN_RES=1
@@ -41,6 +42,11 @@ export VLLM_ASCEND_SKIP_UNUSED_PENALTY_WARMUP=1
 
 The accepted profile keeps production MoE routing, production KDA recurrence,
 and the production causal convolution/cache update, but runs SiLU separately.
+Dense SiTU pads a one-row decode calculation to two rows and slices the result
+back when `VLLM_ASCEND_KIMI_SITU_MIN_ROWS=2`. This pins the NPU elementwise
+kernel geometry: without it, an independent forced-prefix case first differed
+at row 17 because one BF16 SiTU element changed between one- and two-request
+decode batches. Inputs and the preceding W4A8 gate/up GEMM were byte-identical.
 It keeps explicit FP32 RMSNorm reductions, router arithmetic, MLA decode, and
 AttnRes reductions where the optimized kernels did not satisfy the byte-exact
 contract. For W4A8 SiTU, the normal dispatch boundary quantizes the sorted

@@ -28,7 +28,11 @@ from vllm_ascend.models.kimi_k3 import (
     _routed_latent_quant_config,
     get_spec_layer_idx_from_weight_name,
 )
-from vllm_ascend.ops.activation import AscendSituAndMul, SituActivationConfig
+from vllm_ascend.ops.activation import (
+    AscendSituAndMul,
+    SituActivationConfig,
+    situ_and_mul,
+)
 from vllm_ascend.transformers_utils.configs.kimi_k3 import (
     KimiK3Config,
     KimiK3VisionConfig,
@@ -119,6 +123,36 @@ def test_kimi_k3_quantizes_packed_latent_projections(
 
 def test_kimi_k3_unquantized_model_keeps_latent_projections_unquantized():
     assert _routed_latent_quant_config(None) is None
+
+
+def test_kimi_k3_situ_min_rows_pads_singleton_without_exposing_padding():
+    hidden_states = torch.tensor(
+        [[0.25, -0.5, 0.75, -1.0]],
+        dtype=torch.bfloat16,
+    )
+    tanh_shapes = []
+    native_tanh = torch.tanh
+
+    def record_tanh_shape(inputs: torch.Tensor) -> torch.Tensor:
+        tanh_shapes.append(tuple(inputs.shape))
+        return native_tanh(inputs)
+
+    with (
+        patch.dict(os.environ, {"VLLM_ASCEND_KIMI_SITU_MIN_ROWS": "2"}),
+        patch("vllm_ascend.ops.activation.torch.tanh", side_effect=record_tanh_shape),
+    ):
+        output = situ_and_mul(hidden_states, beta=4.0, linear_beta=25.0)
+
+    assert output.shape == (1, 2)
+    assert tanh_shapes == [(2, 2), (2, 2)]
+
+
+def test_kimi_k3_situ_min_rows_leaves_two_rows_unpadded():
+    hidden_states = torch.zeros((2, 4), dtype=torch.bfloat16)
+    with patch.dict(os.environ, {"VLLM_ASCEND_KIMI_SITU_MIN_ROWS": "2"}):
+        output = situ_and_mul(hidden_states, beta=4.0, linear_beta=25.0)
+
+    assert output.shape == (2, 2)
 
 
 def test_kimi_k3_reference_rms_norm_casts_before_weight():
