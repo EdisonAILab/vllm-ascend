@@ -28,7 +28,8 @@ class SituMxQuantAxisLast {
 public:
     __aicore__ inline SituMxQuantAxisLast(){};
 
-    __aicore__ inline void Init(GM_ADDR x, GM_ADDR topkWeight, GM_ADDR y, GM_ADDR mxscale, GM_ADDR workspace,
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR topkWeight, GM_ADDR y, GM_ADDR mxscale, GM_ADDR situ,
+                                GM_ADDR workspace,
                                 const SituMxQuantTilingData* __restrict tilingData, AscendC::TPipe* pipe);
     __aicore__ inline void Process();
 
@@ -43,6 +44,7 @@ private:
     GlobalTensor<T> topkWeightGm_;
     GlobalTensor<uint8_t> yGm_;
     GlobalTensor<uint8_t> scaleGm_;
+    GlobalTensor<T> situGm_;
     const SituMxQuantTilingData* tiling_;
     AscendC::TPipe* pipe_;
     int32_t blockIdx_ = 0;
@@ -80,7 +82,7 @@ private:
 
 template <typename T, typename U, bool hasLinearBeta, bool hasTopkWeight>
 __aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta, hasTopkWeight>::Init(
-    GM_ADDR x, GM_ADDR topkWeight, GM_ADDR y, GM_ADDR mxscale, GM_ADDR workspace,
+    GM_ADDR x, GM_ADDR topkWeight, GM_ADDR y, GM_ADDR mxscale, GM_ADDR situ, GM_ADDR workspace,
     const SituMxQuantTilingData* __restrict tilingData, AscendC::TPipe* pipe)
 {
 #if (__NPU_ARCH__ == 3510)
@@ -95,6 +97,7 @@ __aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta, hasTopkWeight>::
     }
     yGm_.SetGlobalBuffer((__gm__ uint8_t*)y);
     scaleGm_.SetGlobalBuffer((__gm__ uint8_t*)mxscale);
+    situGm_.SetGlobalBuffer((__gm__ T*)situ);
 
     dimM_ = tiling_->inputDim1;
     dimN_ = tiling_->inputDim2;
@@ -273,6 +276,17 @@ __aicore__ inline void SituMxQuantAxisLast<T, U, hasLinearBeta, hasTopkWeight>::
 {
     LocalTensor<uint8_t> mxScaleLocal = outQueScale_.DeQue<uint8_t>();
     LocalTensor<uint8_t> outLocal = outQuey_.DeQue<uint8_t>();
+
+    // Export the pre-quantization BF16 activation for dense MLP consumers.
+    LocalTensor<T> situLocal = situBuffer_.Get<T>();
+    DataCopyExtParams copyOutParamSitu = {0, 0, 0, 0, 0};
+    copyOutParamSitu.blockCount = dim0OnceSize;
+    copyOutParamSitu.blockLen = dim1OnceSize * sizeof(T);
+    copyOutParamSitu.srcStride =
+        (dim1OnceSizeAlgin - dim1OnceSize) * sizeof(T) / ONE_BLOCK_UB;
+    copyOutParamSitu.dstStride = (dimN_ - dim1OnceSize) * sizeof(T);
+    int64_t offsetSitu = rowOffset * dimN_ + colBlockStart * 256;
+    DataCopyPad(situGm_[offsetSitu], situLocal, copyOutParamSitu);
 
     // Copy FP8 output
     DataCopyExtParams copyOutParamData = {0, 0, 0, 0, 0};

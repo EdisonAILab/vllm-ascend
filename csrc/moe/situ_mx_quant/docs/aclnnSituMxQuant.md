@@ -9,9 +9,11 @@ SituMxQuant 算子执行 Situ 激活，随后进行动态 MX (Microscaling) 量�
 ```text
 situ_a = beta * tanh(gate / beta) * sigmoid(gate)
 situOut = situ_a * up  (+ optional linear_beta * tanh(up / linear_beta) on up)
-shared_exp = floor(log2(max(|situOut_i|))) - emax
+weightedSitu = situOut * topk_weight  (when topk_weight is present)
+shared_exp = floor(log2(max(|weightedSitu_i|))) - emax
 mxscale = 2^shared_exp  (E8M0)
-y = cast_to_fp8(situOut / mxscale)
+y = cast_to_fp8(weightedSitu / mxscale)
+situ = weightedSitu  (BF16, before MX quantization)
 ```
 
 ## 接口定义
@@ -29,8 +31,10 @@ aclnnStatus aclnnSituMxQuant(
 ```cpp
 REG_OP(SituMxQuant)
     .INPUT(x, TensorType({DT_BF16}))
+    .OPTIONAL_INPUT(topk_weight, TensorType({DT_BF16}))
     .OUTPUT(y, TensorType({DT_FLOAT8_E4M3FN, DT_FLOAT8_E5M2}))
     .OUTPUT(mxscale, TensorType({DT_FLOAT8_E8M0}))
+    .OUTPUT(situ, TensorType({DT_BF16}))
     .ATTR(beta, Float, 1.0f)
     .ATTR(linear_beta, Float, 0.0f)
     .ATTR(activate_left, Bool, false)
@@ -44,8 +48,10 @@ REG_OP(SituMxQuant)
 | 参数 | 输入/输出 | 类型 | 说明 |
 |------|-----------|------|------|
 | x | 输入 | bfloat16 | 输入张量，shape 为 [N..., 2H]，最后一维必须为偶数 |
+| topk_weight | 可选输入 | bfloat16 | 每行一个路由权重；为空时不加权 |
 | y | 输出 | float8_e4m3fn / float8_e5m2 | 量化输出，shape 为 [N..., H] |
 | mxscale | 输出 | float8_e8m0 | MX scale，shape 为 [N..., ceil(H/64), 2] |
+| situ | 输出 | bfloat16 | 量化前 SiTU 结果，shape 为 [N..., H] |
 
 ## 属性说明
 
@@ -77,7 +83,10 @@ REG_OP(SituMxQuant)
 ```cpp
 // 1. 创建 op executor
 aclOpExecutor* executor;
-aclnnSituMxQuantGetWorkspaceSize(x, y, mxscale, beta, linearBeta, activateLeft, axis, dstType, &workspaceSize, &executor);
+aclnnSituMxQuantGetWorkspaceSize(x, topkWeight, beta, linearBeta,
+                                 activateLeft, axis, dstType,
+                                 y, mxscale, situ,
+                                 &workspaceSize, &executor);
 void* workspace = nullptr;
 if (workspaceSize > 0) {
     aclrtMalloc(&workspace, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST);

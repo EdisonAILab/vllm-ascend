@@ -1924,6 +1924,29 @@ std::tuple<at::Tensor, at::Tensor> situ_mx_quant_meta(
     return {y, mxscale};
 }
 
+at::Tensor situ_activation_meta(
+    const at::Tensor& x,
+    double beta,
+    double linear_beta,
+    bool activate_left)
+{
+    TORCH_CHECK(x.dim() >= 1,
+                "situ_activation: x must be at least 1-dimensional, but got ",
+                x.dim());
+    TORCH_CHECK(x.sym_size(-1) % 2 == 0,
+                "situ_activation: x last dimension must be even");
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16,
+                "situ_activation: x must be bfloat16, but got ", x.scalar_type());
+    TORCH_CHECK(beta > 0.0,
+                "situ_activation: beta must be greater than 0, but got ", beta);
+    (void)linear_beta;
+    (void)activate_left;
+
+    c10::SymDimVector output_shape(x.sym_sizes().begin(), x.sym_sizes().end());
+    output_shape.back() = output_shape.back() / 2;
+    return at::empty_symint(output_shape, x.options().dtype(at::kBFloat16));
+}
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -1960,6 +1983,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("recurrent_kda", &vllm_ascend::meta::recurrent_kda_meta);
     ops.impl("dequant_situ_quant", &vllm_ascend::meta::dequant_situ_quant_meta);
     ops.impl("situ_mx_quant", &vllm_ascend::meta::situ_mx_quant_meta);
+    ops.impl("situ_activation", &vllm_ascend::meta::situ_activation_meta);
     // Launch host print from device
     ops.impl("device_print", &vllm_ascend::meta::device_print_meta);
     // launch host print from device for tensors

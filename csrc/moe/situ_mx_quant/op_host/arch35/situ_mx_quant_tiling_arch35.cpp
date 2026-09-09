@@ -187,6 +187,10 @@ ge::graphStatus SituMxQuantRegbaseTiling::ValidateOutput()
                         static_cast<int>(mxscaleDtype)),
                 return ge::GRAPH_FAILED);
     outputInfo_.mxscaleDtype = mxscaleDtype;
+    auto situDtype = context_->GetOutputDesc(2)->GetDataType();
+    OP_CHECK_IF((situDtype != ge::DT_BF16),
+                OP_LOGE(context_->GetNodeName(), "Output situ dtype %d is not BF16.", static_cast<int>(situDtype)),
+                return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 

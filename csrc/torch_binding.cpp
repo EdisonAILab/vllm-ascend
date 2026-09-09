@@ -2488,6 +2488,13 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "              int dst_type=36) -> (Tensor y, Tensor mxscale)");
     ops.impl("situ_mx_quant", torch::kPrivateUse1, &vllm_ascend::situ_mx_quant);
 
+    ops.def(
+        "situ_activation(Tensor x, "
+        "                float beta=1.0, "
+        "                float linear_beta=0.0, "
+        "                bool activate_left=False) -> Tensor");
+    ops.impl("situ_activation", torch::kPrivateUse1, &vllm_ascend::situ_activation);
+
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
     // Direct kernel custom ops
     ops.def("bgmv_shrink(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y, float scale) -> ()");

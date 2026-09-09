@@ -25,7 +25,7 @@ using namespace SituMxQuantOp;
 
 template <uint64_t hasLinearBeta, uint64_t hasTopkWeight, uint64_t dstTypeIndex>
 __global__ __aicore__ void situ_mx_quant(
-    GM_ADDR x, GM_ADDR topkWeight, GM_ADDR y, GM_ADDR mxscale, GM_ADDR workspace, GM_ADDR tiling)
+    GM_ADDR x, GM_ADDR topkWeight, GM_ADDR y, GM_ADDR mxscale, GM_ADDR situ, GM_ADDR workspace, GM_ADDR tiling)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
     REGISTER_TILING_DEFAULT(SituMxQuantTilingData);
@@ -40,13 +40,13 @@ __global__ __aicore__ void situ_mx_quant(
         constexpr bool useLinearBeta = (hasLinearBeta == TPL_HAS_LINEAR_BETA);
         constexpr bool useTopkWeight = (hasTopkWeight == TPL_HAS_TOPK_WEIGHT);
         SituMxQuant::SituMxQuantAxisLast<bfloat16_t, fp8_e4m3fn_t, useLinearBeta, useTopkWeight> op;
-        op.Init(x, topkWeight, y, mxscale, usrWorkspace, &tilingData, &pipe);
+        op.Init(x, topkWeight, y, mxscale, situ, usrWorkspace, &tilingData, &pipe);
         op.Process();
     } else {
         constexpr bool useLinearBeta = (hasLinearBeta == TPL_HAS_LINEAR_BETA);
         constexpr bool useTopkWeight = (hasTopkWeight == TPL_HAS_TOPK_WEIGHT);
         SituMxQuant::SituMxQuantAxisLast<bfloat16_t, fp8_e5m2_t, useLinearBeta, useTopkWeight> op;
-        op.Init(x, topkWeight, y, mxscale, usrWorkspace, &tilingData, &pipe);
+        op.Init(x, topkWeight, y, mxscale, situ, usrWorkspace, &tilingData, &pipe);
         op.Process();
     }
 

@@ -115,6 +115,33 @@ def _zero_padded_spec_output(
     )
 
 
+def _select_decode_conv_state(
+    conv_state: torch.Tensor,
+    conv_cache_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Select decode convolution state without data-dependent output shapes.
+
+    FULL graph capture pads ``conv_cache_indices`` with ``PAD_SLOT_ID``. Boolean
+    indexing compacts those entries via ``nonzero``, whose output shape depends
+    on the input values and is not graph-capturable on Ascend. Gather every
+    static row through a safe index instead, then explicitly zero padded rows.
+    Valid rows keep their original ordering and values.
+    """
+    flat_indices = conv_cache_indices.reshape(-1)
+    valid_indices = flat_indices != PAD_SLOT_ID
+    safe_indices = torch.where(
+        valid_indices,
+        flat_indices,
+        torch.zeros_like(flat_indices),
+    ).to(dtype=torch.long)
+    selected_state = conv_state.index_select(0, safe_indices).clone()
+    state_mask = valid_indices.reshape(
+        valid_indices.shape[0],
+        *((1,) * (selected_state.ndim - 1)),
+    )
+    return torch.where(state_mask, selected_state, 0.0)
+
+
 def uses_kimi_k3_global_inputs_embeds(vllm_config: VllmConfig) -> bool:
     model_config = vllm_config.model_config
     if model_config.enable_prompt_embeds:
@@ -241,6 +268,12 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         # static so Dynamo does not need to infer the layout from tensor shapes.
         self.is_vl_first_layer = bool(uses_kimi_k3_global_inputs_embeds(vllm_config) and parse_layer_idx(prefix) == 0)
 
+        # Resolve diagnostic routing once during construction. Calling
+        # ``parse_layer_idx`` from ``forward`` introduces an untraceable regex
+        # operation even when parity taps are disabled for graph execution.
+        self._parity_tap_layer_zero = bool(
+            os.environ.get("KIMI_PARITY_TAP_DIR") and parse_layer_idx(prefix) == 0
+        )
         # The checkpoint stores three fp32 convolution weights as [C, 1, W],
         # while the AscendC kernel consumes one activation-dtype [W, 3 * C]
         # tensor. Keep the derived kernel-format weight on q_conv1d so it uses
@@ -262,7 +295,7 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         return AscendGDNAttentionBackend
 
     def _tap(self, suffix: str, tensor: torch.Tensor) -> None:
-        if parse_layer_idx(self.prefix) == 0:
+        if self._parity_tap_layer_zero:
             _parity_tap(f"01_kda_{suffix}", tensor)
 
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -530,6 +563,81 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         )
         return gate.unsqueeze(0)
 
+    def _run_native_kda_graph_decode(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        raw_gate: torch.Tensor,
+        beta: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        state_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Graph-safe reduced KDA for zero-or-one-token decode sequences.
+
+        Decode metadata contains one sequence entry per static graph row. A
+        live row has length one and padded rows have length zero. Keep the
+        per-row recurrence used by the eager oracle, but select token/state
+        rows and update the cache entirely on device so capture never performs
+        ``item()``, ``tolist()``, or a device-to-host copy.
+        """
+        q_float = q.float()
+        k_float = k.float()
+        q_float *= torch.rsqrt(q_float.square().sum(-1, keepdim=True) + 1e-6)
+        k_float *= torch.rsqrt(k_float.square().sum(-1, keepdim=True) + 1e-6)
+        gate = self._recurrent_gate(raw_gate).float()
+        output = torch.zeros_like(v)
+        scale = self.head_dim**-0.5
+        flat_state_indices = state_indices.reshape(-1)
+        for sequence_idx in range(flat_state_indices.shape[0]):
+            sequence_length = cu_seqlens[sequence_idx + 1] - cu_seqlens[sequence_idx]
+            active_sequence = sequence_length > 0
+            state_idx = flat_state_indices[sequence_idx]
+            valid_state = state_idx != PAD_SLOT_ID
+            safe_state_idx = torch.where(
+                valid_state,
+                state_idx,
+                torch.zeros_like(state_idx),
+            ).to(dtype=torch.long).reshape(1)
+
+            selected_state = recurrent_state.index_select(0, safe_state_idx)[0]
+            state_kv = selected_state.float().transpose(-1, -2)
+            q_row = q_float[0, sequence_idx]
+            k_row = k_float[0, sequence_idx]
+            v_row = v[0, sequence_idx].float()
+            gate_row = gate[0, sequence_idx]
+            beta_row = beta[0, sequence_idx].float()
+
+            state_kv *= gate_row.exp().unsqueeze(-1)
+            residual = v_row - torch.einsum("hk,hkv->hv", k_row, state_kv)
+            state_kv += torch.einsum(
+                "hk,hv->hkv",
+                beta_row.unsqueeze(-1) * k_row,
+                residual,
+            )
+            output_row = torch.einsum("hk,hkv->hv", q_row * scale, state_kv).to(output.dtype)
+            output[0, sequence_idx].copy_(
+                torch.where(
+                    active_sequence & valid_state,
+                    output_row,
+                    torch.zeros_like(output_row),
+                )
+            )
+            updated_state = state_kv.transpose(-1, -2).to(recurrent_state.dtype)
+            preserved_state = recurrent_state.index_select(0, safe_state_idx)[0]
+            state_to_write = torch.where(
+                active_sequence & valid_state,
+                updated_state,
+                preserved_state,
+            )
+            recurrent_state.index_copy_(
+                0,
+                safe_state_idx,
+                state_to_write.unsqueeze(0),
+            )
+        return output
+
     def _run_native_kda(
         self,
         q: torch.Tensor,
@@ -543,6 +651,17 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         has_initial_state: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Reference KDA math for reduced shapes unsupported by AscendC."""
+        if has_initial_state is None and isinstance(cu_seqlens, torch.Tensor):
+            return self._run_native_kda_graph_decode(
+                q,
+                k,
+                v,
+                raw_gate,
+                beta,
+                recurrent_state,
+                cu_seqlens,
+                state_indices,
+            )
         q_float = q.float()
         k_float = k.float()
         q_float *= torch.rsqrt(q_float.square().sum(-1, keepdim=True) + 1e-6)
@@ -890,11 +1009,10 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
                 assert decode_meta is not None
                 conv_cache_indices = decode_meta.causal_conv1d.cache_indices
                 self._tap("conv_cache_indices", conv_cache_indices)
-                valid_conv_cache_indices = conv_cache_indices.reshape(-1)
-                valid_conv_cache_indices = valid_conv_cache_indices[valid_conv_cache_indices != PAD_SLOT_ID].to(
-                    dtype=torch.long
+                selected_conv_state = _select_decode_conv_state(
+                    conv_state,
+                    conv_cache_indices,
                 )
-                selected_conv_state = conv_state.index_select(0, valid_conv_cache_indices).clone()
                 self._tap(
                     "conv_state_before",
                     selected_conv_state,

@@ -19,7 +19,7 @@
 
 namespace vllm_ascend {
 
-std::tuple<at::Tensor, at::Tensor> situ_mx_quant(
+std::tuple<at::Tensor, at::Tensor, at::Tensor> run_situ_mx_quant(
     const at::Tensor& x,
     const c10::optional<at::Tensor>& topk_weight,
     double beta,
@@ -65,6 +65,7 @@ std::tuple<at::Tensor, at::Tensor> situ_mx_quant(
     auto y_dtype = dst_type == DST_TYPE_E5M2 ? at::kFloat8_e5m2 : at::kFloat8_e4m3fn;
     at::Tensor y = at::empty(y_shape, x.options().dtype(y_dtype));
     at::Tensor mxscale = at::empty(mxscale_shape, x.options().dtype(at::kFloat8_e8m0fnu));
+    at::Tensor situ = at::empty(y_shape, x.options().dtype(at::kBFloat16));
 
     constexpr int64_t AXIS = -1;
     EXEC_NPU_CMD(aclnnSituMxQuant,
@@ -76,8 +77,34 @@ std::tuple<at::Tensor, at::Tensor> situ_mx_quant(
                  AXIS,
                  dst_type,
                  y,
-                 mxscale);
-    return {y, mxscale};
+                 mxscale,
+                 situ);
+    return {y, mxscale, situ};
+}
+
+std::tuple<at::Tensor, at::Tensor> situ_mx_quant(
+    const at::Tensor& x,
+    const c10::optional<at::Tensor>& topk_weight,
+    double beta,
+    double linear_beta,
+    bool activate_left,
+    int64_t dst_type)
+{
+    auto outputs = run_situ_mx_quant(
+        x, topk_weight, beta, linear_beta, activate_left, dst_type);
+    return {std::get<0>(outputs), std::get<1>(outputs)};
+}
+
+at::Tensor situ_activation(
+    const at::Tensor& x,
+    double beta,
+    double linear_beta,
+    bool activate_left)
+{
+    constexpr int64_t DST_TYPE_E4M3FN = 36;
+    auto outputs = run_situ_mx_quant(
+        x, c10::nullopt, beta, linear_beta, activate_left, DST_TYPE_E4M3FN);
+    return std::get<2>(outputs);
 }
 
 }  // namespace vllm_ascend

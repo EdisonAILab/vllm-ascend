@@ -28,6 +28,7 @@ constexpr int64_t UNKNOWN_RANK_DIM = -2;
 constexpr size_t INDEX_INPUT_X = 0;
 constexpr size_t INDEX_OUTPUT_Y = 0;
 constexpr size_t INDEX_OUTPUT_MXSCALE = 1;
+constexpr size_t INDEX_OUTPUT_SITU = 2;
 
 constexpr size_t INDEX_ATTR_BETA = 0;
 constexpr size_t INDEX_ATTR_LINEAR_BETA = 1;
@@ -54,6 +55,9 @@ graphStatus InferShapeForSituMxQuant(gert::InferShapeContext* context)
     gert::Shape* mxscaleShape = context->GetOutputShape(INDEX_OUTPUT_MXSCALE);
     OP_CHECK_NULL_WITH_CONTEXT(context, mxscaleShape);
 
+    gert::Shape* situShape = context->GetOutputShape(INDEX_OUTPUT_SITU);
+    OP_CHECK_NULL_WITH_CONTEXT(context, situShape);
+
     OP_CHECK_IF(xShape->GetDimNum() < 1 || xShape->GetDimNum() > MAX_DIM_NUM,
                 OP_LOGE(context->GetNodeName(), "Input x rank[%lu] should be in [1, 7].", xShape->GetDimNum()),
                 return ge::GRAPH_FAILED);
@@ -62,6 +66,7 @@ graphStatus InferShapeForSituMxQuant(gert::InferShapeContext* context)
         OP_LOGD(context->GetNodeName(), "x shape is UnknownRank, set y, mxscale shape to (-2, )");
         *yShape = *xShape;
         *mxscaleShape = *xShape;
+        *situShape = *xShape;
         return ge::GRAPH_SUCCESS;
     }
 
@@ -92,6 +97,7 @@ graphStatus InferShapeForSituMxQuant(gert::InferShapeContext* context)
     if (xShape->GetDim(lastDimIdx) != UNKNOWN_DIM_VALUE_) {
         yShape->SetDim(lastDimIdx, xShape->GetDim(lastDimIdx) / SPLIT_NUM);
     }
+    *situShape = *yShape;
 
     // Step 2: Compute mxscale shape
     // mxscale.shape = y.shape
@@ -128,6 +134,7 @@ ge::graphStatus InferDataTypeForSituMxQuant(gert::InferDataTypeContext* context)
         return ge::GRAPH_FAILED);
     context->SetOutputDataType(INDEX_OUTPUT_Y, outDtype);
     context->SetOutputDataType(INDEX_OUTPUT_MXSCALE, ge::DT_FLOAT8_E8M0);
+    context->SetOutputDataType(INDEX_OUTPUT_SITU, ge::DT_BF16);
     OP_LOGI(context->GetNodeName(), "End to do InferDataTypeForSituMxQuant");
     return ge::GRAPH_SUCCESS;
 }

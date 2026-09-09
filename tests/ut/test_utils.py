@@ -122,6 +122,17 @@ class TestUtils(TestBase):
             mock_import_module.side_effect = ImportError("import error")
             self.assertFalse(utils.enable_custom_op())
 
+    def test_prepend_env_path_moves_existing_entry_to_front(self):
+        with mock.patch.dict(
+            os.environ,
+            {"ASCEND_CUSTOM_OPP_PATH": "/old/vendor:/wheel/vendor:/other/vendor"},
+        ):
+            utils._prepend_env_path("ASCEND_CUSTOM_OPP_PATH", "/wheel/vendor")
+            self.assertEqual(
+                os.environ["ASCEND_CUSTOM_OPP_PATH"],
+                "/wheel/vendor:/old/vendor:/other/vendor",
+            )
+
     def test_find_hccl_library(self):
         with mock.patch.dict(os.environ, {"HCCL_SO_PATH": "/path/to/hccl/libhccl.so"}):
             self.assertEqual(utils.find_hccl_library(), "/path/to/hccl/libhccl.so")

@@ -20,9 +20,11 @@ from vllm_ascend.models.kimi_k3 import (
     KimiK3VisionEncoderLayer,
     _apply_attention_residual,
     _configure_kimi_mlapo_shape,
+    _decomposed_mla_forward_decode,
     _decomposed_mla_forward_prefill,
     _KimiReferenceRMSNorm,
     _move_module_to_device,
+    _reference_mla_forward_decode,
     _reference_mla_forward_prefill,
     _resolve_packed_expert_weight_name,
     _routed_latent_quant_config,
@@ -202,6 +204,165 @@ def test_kimi_k3_decomposed_mla_prefill_matches_rowwise_reference():
     )
 
     assert torch.equal(actual, expected)
+
+
+class _ElementwiseKVProjection:
+    def __call__(self, inputs: torch.Tensor) -> tuple[torch.Tensor, None]:
+        first = inputs[..., :1]
+        second = inputs[..., 1:2]
+        return (
+            torch.cat(
+                (
+                    first,
+                    second,
+                    first + second,
+                    first - second,
+                    first * 0.5,
+                    second * 0.5,
+                    -first,
+                    -second,
+                    first * 2.0,
+                    second * 2.0,
+                ),
+                dim=-1,
+            ),
+            None,
+        )
+
+
+def _make_reduced_mla_decode_fixture():
+    generator = torch.Generator().manual_seed(20260909)
+    impl = SimpleNamespace(
+        num_kv_heads=1,
+        num_heads=2,
+        kv_lora_rank=2,
+        qk_nope_head_dim=2,
+        qk_rope_head_dim=1,
+        v_head_dim=3,
+        scale=3**-0.5,
+        kv_b_proj=_ElementwiseKVProjection(),
+    )
+    block_size = 4
+    k_latent_cache = torch.randn(
+        3,
+        1,
+        block_size,
+        impl.kv_lora_rank,
+        generator=generator,
+        dtype=torch.bfloat16,
+    )
+    k_pe_cache = torch.randn(
+        3,
+        1,
+        block_size,
+        impl.qk_rope_head_dim,
+        generator=generator,
+        dtype=torch.bfloat16,
+    )
+    q_nope = torch.randn(
+        2,
+        impl.num_heads,
+        impl.qk_nope_head_dim,
+        generator=generator,
+        dtype=torch.bfloat16,
+    )
+    q_pe = torch.randn(
+        2,
+        impl.num_heads,
+        impl.qk_rope_head_dim,
+        generator=generator,
+        dtype=torch.bfloat16,
+    )
+    block_table = torch.tensor([[2, 0], [1, 2]], dtype=torch.int32)
+    return impl, q_nope, q_pe, k_latent_cache, k_pe_cache, block_size, block_table
+
+
+def test_kimi_k3_decomposed_mla_decode_matches_rowwise_reference():
+    (
+        impl,
+        q_nope,
+        q_pe,
+        k_latent_cache,
+        k_pe_cache,
+        block_size,
+        block_table,
+    ) = _make_reduced_mla_decode_fixture()
+    sequence_lengths = [3, 6]
+    metadata = SimpleNamespace(
+        decode=SimpleNamespace(
+            block_table=block_table,
+            seq_lens_list=sequence_lengths,
+            seq_lens_device=torch.tensor(sequence_lengths, dtype=torch.int32),
+        )
+    )
+
+    expected = _reference_mla_forward_decode(
+        impl,
+        q_nope,
+        q_pe,
+        k_latent_cache,
+        k_pe_cache,
+        block_size,
+        metadata,
+    )
+    actual = _decomposed_mla_forward_decode(
+        impl,
+        q_nope,
+        q_pe,
+        k_latent_cache,
+        k_pe_cache,
+        block_size,
+        metadata,
+    )
+
+    assert torch.equal(actual, expected)
+
+
+def test_kimi_k3_decomposed_mla_decode_zeros_padded_graph_row():
+    (
+        impl,
+        q_nope,
+        q_pe,
+        k_latent_cache,
+        k_pe_cache,
+        block_size,
+        block_table,
+    ) = _make_reduced_mla_decode_fixture()
+    graph_metadata = SimpleNamespace(
+        decode=SimpleNamespace(
+            block_table=block_table,
+            seq_lens_list=[5, 0],
+            seq_lens_device=torch.tensor([5, 0], dtype=torch.int32),
+        )
+    )
+    reference_metadata = SimpleNamespace(
+        decode=SimpleNamespace(
+            block_table=block_table[:1],
+            seq_lens_list=[5],
+        )
+    )
+
+    expected = _reference_mla_forward_decode(
+        impl,
+        q_nope[:1],
+        q_pe[:1],
+        k_latent_cache,
+        k_pe_cache,
+        block_size,
+        reference_metadata,
+    )
+    actual = _decomposed_mla_forward_decode(
+        impl,
+        q_nope,
+        q_pe,
+        k_latent_cache,
+        k_pe_cache,
+        block_size,
+        graph_metadata,
+    )
+
+    assert torch.equal(actual[:1], expected)
+    assert torch.equal(actual[1:], torch.zeros_like(actual[1:]))
 
 
 def test_kimi_k3_vectorized_attention_residual_uses_explicit_fp32_reductions():

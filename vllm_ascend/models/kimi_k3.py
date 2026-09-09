@@ -1106,6 +1106,107 @@ def _reference_mla_forward_decode(
     return torch.stack(outputs).reshape(-1, impl.num_heads * impl.v_head_dim)
 
 
+def _decomposed_mla_forward_decode(
+    impl,
+    q_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    k_latent_cache: torch.Tensor,
+    k_pe_cache: torch.Tensor,
+    block_size: int,
+    attn_metadata,
+    dequant_scale_q_nope=None,
+) -> torch.Tensor:
+    """Run reduced MLA decode from replay-updated device metadata.
+
+    FULL graph capture cannot use ``decode.seq_lens_list`` because that Python
+    list is frozen at capture time. Materialize the fixed paged-cache capacity,
+    then select the attention result for the device-side sequence length. Each
+    candidate keeps the same softmax extent as the eager rowwise reference so
+    the selected result remains byte exact for the reduced correctness path.
+    """
+    del dequant_scale_q_nope
+    decode_meta = attn_metadata.decode
+    assert decode_meta is not None
+    k_latent_cache = k_latent_cache.view(
+        -1,
+        impl.num_kv_heads,
+        block_size,
+        impl.kv_lora_rank,
+    )
+    k_pe_cache = k_pe_cache.view(
+        -1,
+        impl.num_kv_heads,
+        block_size,
+        impl.qk_rope_head_dim,
+    )
+    cache_capacity = decode_meta.block_table.shape[1] * block_size
+    positions = torch.arange(
+        cache_capacity,
+        device=q_nope.device,
+        dtype=torch.long,
+    )
+    logical_blocks = torch.div(positions, block_size, rounding_mode="floor")
+    block_offsets = positions.remainder(block_size)
+    outputs = []
+    for request_index in range(q_nope.shape[0]):
+        physical_blocks = decode_meta.block_table[request_index].to(torch.long)[logical_blocks]
+        k_latent = k_latent_cache[
+            physical_blocks,
+            0,
+            block_offsets,
+        ]
+        k_pe = k_pe_cache[
+            physical_blocks,
+            0,
+            block_offsets,
+        ]
+        key_value = impl.kv_b_proj(k_latent)[0].view(
+            -1,
+            impl.num_heads,
+            impl.qk_nope_head_dim + impl.v_head_dim,
+        )
+        k_nope, value = key_value.split(
+            [impl.qk_nope_head_dim, impl.v_head_dim],
+            dim=-1,
+        )
+        k_pe = k_pe.unsqueeze(1).expand(-1, impl.num_heads, -1)
+        scores = torch.einsum(
+            "hd,shd->hs",
+            q_nope[request_index].float(),
+            k_nope.float(),
+        )
+        scores.add_(
+            torch.einsum(
+                "hd,shd->hs",
+                q_pe[request_index].float(),
+                k_pe.float(),
+            )
+        )
+        sequence_length = decode_meta.seq_lens_device[request_index]
+        output = torch.zeros(
+            (impl.num_heads, impl.v_head_dim),
+            dtype=q_nope.dtype,
+            device=q_nope.device,
+        )
+        for candidate_length in range(1, cache_capacity + 1):
+            probabilities = torch.softmax(
+                scores[:, :candidate_length] * impl.scale,
+                dim=-1,
+            )
+            candidate = torch.einsum(
+                "hs,shd->hd",
+                probabilities,
+                value[:candidate_length].float(),
+            ).to(q_nope.dtype)
+            output = torch.where(
+                sequence_length == candidate_length,
+                candidate,
+                output,
+            )
+        outputs.append(output)
+    return torch.stack(outputs).reshape(-1, impl.num_heads * impl.v_head_dim)
+
+
 def _reference_mla_forward_prefill(
     impl,
     q_nope: torch.Tensor,
@@ -1364,10 +1465,12 @@ class KimiK3MLAAttention(nn.Module):
                 else _reference_mla_forward_prefill
             )
             mla_impl._forward_prefill = MethodType(prefill_forward, mla_impl)
-            mla_impl._forward_decode = MethodType(
-                _reference_mla_forward_decode,
-                mla_impl,
+            decode_forward = (
+                _decomposed_mla_forward_decode
+                if decomposed_mla
+                else _reference_mla_forward_decode
             )
+            mla_impl._forward_decode = MethodType(decode_forward, mla_impl)
         elif os.environ.get("VLLM_ASCEND_KIMI_DECOMPOSED_MLA_PREFILL") == "1":
             mla_impl._forward_prefill = MethodType(
                 _decomposed_mla_forward_prefill,
@@ -1613,7 +1716,6 @@ class KimiK3DecoderLayer(nn.Module):
                 block_residual,
             )
         prefix_sum = attention_output if prefix_sum is None else prefix_sum + attention_output
-
         hidden_states = _apply_attention_residual(
             prefix_sum,
             block_residual,

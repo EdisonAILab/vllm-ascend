@@ -4,7 +4,7 @@
 
 SituMxQuant 算子将 Situ 激活函数与动态 MX (Microscaling) 量化融合为一个算子。
 
-计算流水线：**Situ 激活 → MxQuant**
+计算流水线：**Situ 激活（同时导出 BF16 结果）→ 可选行权重 → MxQuant**
 
 ### Situ 激活
 
@@ -16,6 +16,8 @@ situ_a = beta * tanh(gate / beta) * sigmoid(gate)
 if linear_beta > 0:
     up = linear_beta * tanh(up / linear_beta)
 situOut = situ_a * up
+if topk_weight is not None:
+    situOut = situOut * topk_weight
 ```
 
 ### MxQuant (OCP 算法)
@@ -32,8 +34,10 @@ y = cast_to_fp8(V_i / mxscale)
 | 参数 | 输入/输出 | 数据类型 | Shape | 说明 |
 |------|-----------|----------|-------|------|
 | x | 输入 | BF16 | [N..., 2H] | bfloat16，最后一维为偶数 |
+| topk_weight | 可选输入 | BF16 | [N..., 1] | 每行路由权重；为空时不加权 |
 | y | 输出 | FP8_E4M3FN / FP8_E5M2 | [N..., H] | FP8 量化输出 |
 | mxscale | 输出 | FP8_E8M0 | [N..., ceil(H/64), 2] | MX scale (E8M0) |
+| situ | 输出 | BF16 | [N..., H] | 量化前的 SiTU 结果；若提供路由权重则为加权结果 |
 
 ## 属性
 

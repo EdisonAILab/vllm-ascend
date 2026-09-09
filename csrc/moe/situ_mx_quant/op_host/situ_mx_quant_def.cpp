@@ -50,6 +50,14 @@ public:
             .Format({ge::FORMAT_ND, ge::FORMAT_ND})
             .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
 
+        // Preserve the BF16 SiTU result for dense, unquantized consumers.
+        // Quantized callers keep using y/mxscale and may ignore this output.
+        this->Output("situ")
+            .ParamType(REQUIRED)
+            .DataType({ge::DT_BF16, ge::DT_BF16})
+            .Format({ge::FORMAT_ND, ge::FORMAT_ND})
+            .UnknownShapeFormat({ge::FORMAT_ND, ge::FORMAT_ND});
+
         this->Attr("beta").AttrType(OPTIONAL).Float(1.0f);
         this->Attr("linear_beta").AttrType(OPTIONAL).Float(0.0f);
         this->Attr("activate_left").AttrType(OPTIONAL).Bool(false);

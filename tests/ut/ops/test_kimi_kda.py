@@ -28,11 +28,13 @@ from vllm.model_executor.model_loader.reload import (
     record_metadata_for_reloading,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 from vllm_ascend.ops.kimi_kda import (
     _PACKED_CONV_WEIGHT_NAME,
     AscendKimiGatedDeltaNetAttention,
     _load_a_log,
+    _select_decode_conv_state,
     _zero_padded_spec_output,
 )
 
@@ -172,6 +174,40 @@ def test_zero_padded_spec_output_supports_multiple_real_and_dummy_rows():
     assert masked.device == output.device
 
 
+def test_select_decode_conv_state_preserves_valid_rows():
+    conv_state = torch.arange(5 * 2 * 3, dtype=torch.float32).reshape(5, 2, 3)
+    cache_indices = torch.tensor([[4], [1], [3]], dtype=torch.int32)
+
+    selected = _select_decode_conv_state(conv_state, cache_indices)
+
+    torch.testing.assert_close(selected, conv_state[[4, 1, 3]])
+    assert selected.shape == (3, 2, 3)
+
+
+def test_select_decode_conv_state_keeps_mixed_padding_shape_and_zeros():
+    conv_state = torch.arange(4 * 2 * 3, dtype=torch.float32).reshape(4, 2, 3)
+    cache_indices = torch.tensor([[2], [PAD_SLOT_ID], [0], [PAD_SLOT_ID]], dtype=torch.int32)
+
+    selected = _select_decode_conv_state(conv_state, cache_indices)
+
+    assert selected.shape == (4, 2, 3)
+    torch.testing.assert_close(selected[0], conv_state[2])
+    torch.testing.assert_close(selected[2], conv_state[0])
+    assert torch.equal(selected[1], torch.zeros_like(selected[1]))
+    assert torch.equal(selected[3], torch.zeros_like(selected[3]))
+
+
+def test_select_decode_conv_state_supports_all_padding():
+    conv_state = torch.randn(3, 2, 4, dtype=torch.bfloat16)
+    cache_indices = torch.full((2, 1), PAD_SLOT_ID, dtype=torch.int32)
+
+    selected = _select_decode_conv_state(conv_state, cache_indices)
+
+    assert selected.shape == (2, 2, 4)
+    assert selected.dtype == conv_state.dtype
+    assert torch.equal(selected, torch.zeros_like(selected))
+
+
 def test_output_norm_gate_uses_kda_fused_triton_kernel():
     attention = AscendKimiGatedDeltaNetAttention.__new__(AscendKimiGatedDeltaNetAttention)
     nn.Module.__init__(attention)
@@ -270,6 +306,95 @@ def test_reduced_kda_reference_updates_state_with_explicit_fp32_recurrence():
         recurrent_state,
         torch.tensor([[[[2.0, 0.0], [3.0, 0.0]]]]),
     )
+
+
+def _make_native_kda_attention() -> AscendKimiGatedDeltaNetAttention:
+    attention = AscendKimiGatedDeltaNetAttention.__new__(AscendKimiGatedDeltaNetAttention)
+    nn.Module.__init__(attention)
+    attention.head_dim = 2
+    attention.gate_lower_bound = -5.0
+    attention.A_log = nn.Parameter(torch.zeros(1, 1, 1, 1))
+    attention.dt_bias = nn.Parameter(torch.zeros(1, 2))
+    return attention
+
+
+def test_reduced_kda_graph_decode_matches_eager_rows_and_state():
+    torch.manual_seed(20260909)
+    attention = _make_native_kda_attention()
+    q = torch.randn(1, 2, 1, 2)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    raw_gate = torch.randn_like(q)
+    beta = torch.rand(1, 2, 1)
+    initial_state = torch.randn(4, 1, 2, 2)
+    state_indices = torch.tensor([3, 1], dtype=torch.int32)
+    cu_seqlens = torch.tensor([0, 1, 2], dtype=torch.int32)
+    eager_state = initial_state.clone()
+    graph_state = initial_state.clone()
+
+    with patch.dict(os.environ, {"VLLM_ASCEND_KIMI_NATIVE_STATE_OPS": "1"}):
+        eager_output = attention._run_native_kda(
+            q.clone(),
+            k.clone(),
+            v,
+            raw_gate,
+            beta,
+            eager_state,
+            cu_seqlens.tolist(),
+            state_indices,
+        )
+        graph_output = attention._run_native_kda_graph_decode(
+            q.clone(),
+            k.clone(),
+            v,
+            raw_gate,
+            beta,
+            graph_state,
+            cu_seqlens,
+            state_indices,
+        )
+
+    torch.testing.assert_close(graph_state, eager_state, rtol=0, atol=0)
+    torch.testing.assert_close(graph_output, eager_output, rtol=0, atol=0)
+
+
+def test_reduced_kda_graph_decode_ignores_padded_sequence_and_state():
+    torch.manual_seed(20260910)
+    attention = _make_native_kda_attention()
+    q = torch.randn(1, 2, 1, 2)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    raw_gate = torch.randn_like(q)
+    beta = torch.rand(1, 2, 1)
+    initial_state = torch.randn(4, 1, 2, 2)
+    graph_state = initial_state.clone()
+    reference_state = initial_state.clone()
+
+    with patch.dict(os.environ, {"VLLM_ASCEND_KIMI_NATIVE_STATE_OPS": "1"}):
+        graph_output = attention._run_native_kda_graph_decode(
+            q.clone(),
+            k.clone(),
+            v,
+            raw_gate,
+            beta,
+            graph_state,
+            torch.tensor([0, 1, 1], dtype=torch.int32),
+            torch.tensor([2, PAD_SLOT_ID], dtype=torch.int32),
+        )
+        reference_output = attention._run_native_kda(
+            q[:, :1].clone(),
+            k[:, :1].clone(),
+            v[:, :1],
+            raw_gate[:, :1],
+            beta[:, :1],
+            reference_state,
+            [0, 1],
+            torch.tensor([2], dtype=torch.int32),
+        )
+
+    torch.testing.assert_close(graph_state, reference_state, rtol=0, atol=0)
+    torch.testing.assert_close(graph_output[:, :1], reference_output, rtol=0, atol=0)
+    assert torch.equal(graph_output[:, 1:], torch.zeros_like(graph_output[:, 1:]))
 
 
 def test_conv_post_load_processing_packs_kernel_layout_in_place():

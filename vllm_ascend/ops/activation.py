@@ -69,11 +69,24 @@ def situ_and_mul(
         )
         work = torch.cat((flat, padding), dim=0)
 
-    gate, up = work.to(torch.float32).chunk(2, dim=-1)
-    gate = config.beta * torch.tanh(gate / config.beta) * torch.sigmoid(gate)
-    if config.linear_beta is not None:
-        up = config.linear_beta * torch.tanh(up / config.linear_beta)
-    output = (gate * up).to(x.dtype)
+    use_native_situ = (
+        minimum_rows > 0
+        and work.device.type != "cpu"
+        and hasattr(torch.ops._C_ascend, "situ_activation")
+    )
+    if use_native_situ:
+        output = torch.ops._C_ascend.situ_activation(
+            work,
+            beta=config.beta,
+            linear_beta=config.linear_beta or 0.0,
+            activate_left=True,
+        )
+    else:
+        gate, up = work.to(torch.float32).chunk(2, dim=-1)
+        gate = config.beta * torch.tanh(gate / config.beta) * torch.sigmoid(gate)
+        if config.linear_beta is not None:
+            up = config.linear_beta * torch.tanh(up / config.linear_beta)
+        output = (gate * up).to(x.dtype)
     if padded:
         output = output[:row_count].reshape(*x.shape[:-1], x.shape[-1] // 2)
     return output

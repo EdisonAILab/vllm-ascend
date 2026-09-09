@@ -302,10 +302,9 @@ def _round_up(x: int, align: int):
 
 def _prepend_env_path(env_name: str, path: str) -> None:
     current_value = os.environ.get(env_name, "")
-    path_entries = [entry for entry in current_value.split(":") if entry]
-    if path not in path_entries:
-        path_entries.insert(0, path)
-        os.environ[env_name] = ":".join(path_entries)
+    path_entries = [entry for entry in current_value.split(":") if entry and entry != path]
+    path_entries.insert(0, path)
+    os.environ[env_name] = ":".join(path_entries)
 
 
 def bootstrap_custom_op_env(*, include_vendor_lib: bool = False) -> None:

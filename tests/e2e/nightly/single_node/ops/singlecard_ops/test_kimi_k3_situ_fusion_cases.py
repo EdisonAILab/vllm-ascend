@@ -176,6 +176,46 @@ def _is_ascend_950() -> bool:
 
 
 @pytest.mark.skip_global_cleanup
+@torch.inference_mode()
+def test_a5_situ_activation_is_byte_exact_under_graph_replay():
+    """Dense SiTU keeps the eager BF16 boundary under NPUGraph replay."""
+    if not _is_ascend_950() or not hasattr(torch.ops._C_ascend, "situ_activation"):
+        pytest.skip("requires an Ascend 950 device and SituMxQuant")
+
+    hidden_width = 2048
+    x = _bf16_input(2, hidden_width * 2)
+    # Boundaries captured from reduced-K3 decode cases B and A, respectively.
+    x[0, 913] = -1.6171875
+    x[0, hidden_width + 913] = -1.890625
+    x[1, 1043] = 0.25390625
+    x[1, hidden_width + 1043] = 0.439453125
+    x = x.npu()
+
+    expected = _situ(x).to(torch.bfloat16)
+    eager = torch.ops._C_ascend.situ_activation(
+        x,
+        beta=K3_BETA,
+        linear_beta=K3_LINEAR_BETA,
+        activate_left=True,
+    )
+    torch.npu.synchronize()
+    assert torch.equal(eager.view(torch.int16).cpu(), expected.view(torch.int16).cpu())
+
+    graph_input = x.clone()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        graph_output = torch.ops._C_ascend.situ_activation(
+            graph_input,
+            beta=K3_BETA,
+            linear_beta=K3_LINEAR_BETA,
+            activate_left=True,
+        )
+    graph.replay()
+    torch.npu.synchronize()
+    assert torch.equal(graph_output.view(torch.int16).cpu(), expected.view(torch.int16).cpu())
+
+
+@pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize(
     ("tp_size", "input_width"),
     K3_SHARED_TP_CASES,
@@ -208,7 +248,7 @@ def test_a5_shared_situ_mx_quant_shapes_single_op(
     assert tuple(y.shape) == (rows, output_width)
     assert y.dtype == torch.float8_e4m3fn
     assert tuple(mxscale.shape) == (rows, math.ceil(output_width / 64), 2)
-    assert mxscale.dtype == torch_npu.float8_e8m0fnu
+    assert mxscale.dtype == torch.float8_e8m0fnu
 
 
 @pytest.mark.skip_global_cleanup
@@ -232,7 +272,7 @@ def test_a5_routed_situ_mx_quant_shapes_single_op(phase: str, rows: int):
     assert tuple(y.shape) == (rows, 3072)
     assert y.dtype == torch.float8_e4m3fn
     assert tuple(mxscale.shape) == (rows, 48, 2)
-    assert mxscale.dtype == torch_npu.float8_e8m0fnu
+    assert mxscale.dtype == torch.float8_e8m0fnu
 
 
 @pytest.mark.skip_global_cleanup
