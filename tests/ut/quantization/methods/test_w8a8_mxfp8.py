@@ -222,6 +222,80 @@ class TestMXFP8BatchInvariantHelpers(TestBase):
             expected,
         )
 
+    @patch("vllm_ascend.quantization.methods.w8a8_mxfp8.torch_npu")
+    @patch(
+        "vllm_ascend.quantization.methods.w8a8_mxfp8."
+        "_NATIVE_NPU_GROUPED_MATMUL"
+    )
+    @patch(
+        "vllm_ascend.quantization.methods.w8a8_mxfp8."
+        "_grouped_weights_bf16_native"
+    )
+    @patch(
+        "vllm_ascend.quantization.methods.w8a8_mxfp8._dequant_activation"
+    )
+    def test_graph_gmm1_keeps_group_list_on_device(
+        self, mock_dequant, mock_weights, mock_gmm, mock_torch_npu
+    ):
+        x = torch.zeros(4, 8, dtype=torch.uint8)
+        group_list = torch.tensor([0, 2, 4], dtype=torch.int64)
+        values_bf16 = torch.randn(4, 8, dtype=torch.bfloat16)
+        weights_bf16 = torch.randn(3, 8, 16, dtype=torch.bfloat16)
+        hidden = torch.randn(4, 16, dtype=torch.bfloat16)
+        mock_dequant.return_value = values_bf16
+        mock_weights.return_value = weights_bf16
+        mock_gmm.return_value = [hidden]
+        mock_torch_npu.npu_swiglu.return_value = hidden[:, :8]
+        expected = (torch.empty(4, 8), torch.empty(4, 1))
+        mock_torch_npu.npu_dynamic_mx_quant.return_value = expected
+
+        result = w8a8_mxfp8._grouped_gmm1_graph_bi(
+            x=x,
+            weights=torch.empty(3, 8, 16),
+            scales=torch.empty(3, 1, 16),
+            x_scale=torch.empty(4, 1),
+            group_list=group_list,
+        )
+
+        self.assertIs(result, expected)
+        self.assertIs(mock_gmm.call_args.kwargs["group_list"], group_list)
+        self.assertEqual(mock_gmm.call_args.kwargs["group_list_type"], 0)
+
+    @patch(
+        "vllm_ascend.quantization.methods.w8a8_mxfp8."
+        "_NATIVE_NPU_GROUPED_MATMUL"
+    )
+    @patch(
+        "vllm_ascend.quantization.methods.w8a8_mxfp8."
+        "_grouped_weights_bf16_native"
+    )
+    @patch(
+        "vllm_ascend.quantization.methods.w8a8_mxfp8._dequant_activation"
+    )
+    def test_graph_gmm2_preserves_count_group_list(
+        self, mock_dequant, mock_weights, mock_gmm
+    ):
+        group_list = torch.tensor([1, 0, 3], dtype=torch.int64)
+        expected = [torch.randn(4, 8, dtype=torch.bfloat16)]
+        mock_dequant.return_value = torch.randn(4, 16, dtype=torch.bfloat16)
+        mock_weights.return_value = torch.randn(3, 16, 8, dtype=torch.bfloat16)
+        mock_gmm.return_value = expected
+
+        result = w8a8_mxfp8._grouped_gmm2_graph_bi(
+            values=torch.empty(4, 16),
+            weights=torch.empty(3, 16, 8),
+            scales=torch.empty(3, 1, 8),
+            token_scale=torch.empty(4, 1),
+            bias=None,
+            group_list=group_list,
+            group_list_type=1,
+            output_dtype=torch.bfloat16,
+        )
+
+        self.assertIs(result, expected)
+        self.assertIs(mock_gmm.call_args.kwargs["group_list"], group_list)
+        self.assertEqual(mock_gmm.call_args.kwargs["group_list_type"], 1)
+
     def test_grouped_scale_transform_and_restore_are_lossless(self):
         method = object.__new__(AscendW8A8MXFP8DynamicFusedMoEMethod)
         for scale_groups in (3, 4):
