@@ -773,7 +773,7 @@ class TestAscendMLAImpl(TestBase):
             self.impl.pcp_size = 1
             assert out.shape == (NUM_TOKENS, num_heads, self.impl.kv_lora_rank)
 
-    @patch("torch.ops.npu.npu_fused_infer_attention_score")
+    @patch("torch_npu.npu_fused_infer_attention_score")
     def test_attention_with_optional_kv_select_with_dcp_pcp(self, mock_npu_fia):
         num_heads = self.impl.num_heads
         v_head_dim = self.impl.v_head_dim
@@ -838,7 +838,7 @@ class TestAscendMLAImpl(TestBase):
 
                 mock_npu_fia.reset_mock()
 
-    @patch("torch.ops.npu.npu_fused_infer_attention_score")
+    @patch("torch_npu.npu_fused_infer_attention_score")
     def test_attention_with_optional_kv_select_trigger_chunked(self, mock_npu_fia):
         num_heads = self.impl.num_heads
         v_head_dim = self.impl.v_head_dim

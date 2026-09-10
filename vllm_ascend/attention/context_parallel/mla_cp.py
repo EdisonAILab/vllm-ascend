@@ -583,7 +583,7 @@ class AscendMlaCPImpl(AscendMLAImpl):
             value_attn = torch.index_select(value, 0, kv_attn_idx)
             k_pe_attn = torch.index_select(k_pe, 0, kv_attn_idx)
 
-        attn_out, attn_lse = torch.ops.npu.npu_fused_infer_attention_score(
+        attn_out, attn_lse = torch_npu.npu_fused_infer_attention_score(
             q_nope,
             k_nope_attn,
             value_attn,

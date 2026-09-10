@@ -421,7 +421,7 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
     ) -> torch.Tensor:
         # nomask Attention
         if k_nomask is not None:
-            attn_out_nomask, attn_lse_nomask = torch.ops.npu.npu_fused_infer_attention_score(
+            attn_out_nomask, attn_lse_nomask = torch_npu.npu_fused_infer_attention_score(
                 q,
                 k_nomask,
                 v_nomask,
@@ -439,7 +439,7 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
             )
 
         # mask Attention
-        attn_out_mask, attn_lse_mask = torch.ops.npu.npu_fused_infer_attention_score(
+        attn_out_mask, attn_lse_mask = torch_npu.npu_fused_infer_attention_score(
             q,
             k_mask,
             v_mask,
@@ -712,7 +712,7 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
                 ),
             )
 
-        prefix_chunk_output, prefix_chunk_lse = torch.ops.npu.npu_fused_infer_attention_score(
+        prefix_chunk_output, prefix_chunk_lse = torch_npu.npu_fused_infer_attention_score(
             query,
             key,
             value,
@@ -959,7 +959,7 @@ class AscendAttentionCPImpl(AscendAttentionBackendImpl):
                 output_head, lse_head = self._forward_prefill_cp_attn(data_head, True, attn_metadata)
             else:
                 # Scenario of Enabling DCP Individually
-                attn_output_prefill, attn_lse_prefill = torch.ops.npu.npu_fused_infer_attention_score(
+                attn_output_prefill, attn_lse_prefill = torch_npu.npu_fused_infer_attention_score(
                     prefill_query,
                     key,
                     value,

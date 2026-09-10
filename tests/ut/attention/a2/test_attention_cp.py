@@ -139,7 +139,7 @@ class TestAscendAttentionCPImpl(TestBase):
         self.assertEqual(output.shape[1], 8)
         self.assertEqual(output.shape[2], 128)
 
-    @patch("torch.ops.npu.npu_fused_infer_attention_score")
+    @patch("torch_npu.npu_fused_infer_attention_score")
     @patch_distributed_groups(dcp_size=2, pcp_size=2, needs_mocks=False)
     def test_compute_prefill_context(self, mock_npu_attention):
         block_num = 100
@@ -353,7 +353,7 @@ class TestUpdateNpuAttnOutLse(TestBase):
         attn_metadata.decode_meta = None
         return attn_metadata
 
-    @patch("torch.ops.npu.npu_fused_infer_attention_score")
+    @patch("torch_npu.npu_fused_infer_attention_score")
     def test_attention_with_nomask_none(self, mock_npu_attention):
         # Mock input data
         q = torch.randn(self.q_total_tokens, self.impl.num_heads, self.impl.head_size)
@@ -398,7 +398,7 @@ class TestUpdateNpuAttnOutLse(TestBase):
         self.assertEqual(output.shape, (96, 8, 64))
         self.assertEqual(attn_lse.shape, (96, 8, 1))
 
-    @patch("torch.ops.npu.npu_fused_infer_attention_score")
+    @patch("torch_npu.npu_fused_infer_attention_score")
     @patch("vllm_ascend.attention.context_parallel.attention_cp._update_out_and_lse")
     def test_attention_with_nomask_and_mask_chunk(self, mock_update_out_and_lse, mock_npu_fused_infer_attention_score):
         # Mock input data
@@ -438,7 +438,7 @@ class TestUpdateNpuAttnOutLse(TestBase):
         self.assertIsNotNone(output)
         self.assertIsNotNone(attn_lse)
 
-    @patch("torch.ops.npu.npu_fused_infer_attention_score")
+    @patch("torch_npu.npu_fused_infer_attention_score")
     @patch("vllm_ascend.attention.context_parallel.attention_cp._npu_attn_out_lse_update")
     def test_attention_with_nomask_and_mask_nochunk(
         self, mock_npu_attn_out_lse_update, mock_npu_fused_infer_attention_score
