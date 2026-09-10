@@ -67,6 +67,44 @@ class TestDSparkAuxCaptureMode(unittest.TestCase):
         self.assertFalse(runner._draft_uses_qwen3_gqa_dspark())
 
 
+class TestKimiSingletonGraphDispatch(unittest.TestCase):
+    def _build_runner(self, model_type: str, computed_tokens: int):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type))
+        runner.input_batch = SimpleNamespace(num_computed_tokens_cpu=np.array([computed_tokens], dtype=np.int32))
+        return runner
+
+    def test_initial_kimi_singleton_skips_full_graph(self):
+        runner = self._build_runner("kimi_k3", computed_tokens=0)
+
+        self.assertTrue(
+            runner._is_kimi_single_token_initial_step(
+                num_tokens=1,
+                num_reqs=1,
+                force_uniform_decode=None,
+            )
+        )
+
+    def test_kimi_decode_and_capture_dummy_keep_graph_dispatch(self):
+        decode_runner = self._build_runner("kimi_k3", computed_tokens=1)
+        capture_runner = self._build_runner("kimi_k3", computed_tokens=0)
+
+        self.assertFalse(decode_runner._is_kimi_single_token_initial_step(1, 1, None))
+        self.assertFalse(capture_runner._is_kimi_single_token_initial_step(1, 1, False))
+        self.assertFalse(capture_runner._is_kimi_single_token_initial_step(1, 1, True))
+
+    def test_kimi_multi_token_or_multi_request_keeps_graph_dispatch(self):
+        runner = self._build_runner("kimi_k3", computed_tokens=0)
+
+        self.assertFalse(runner._is_kimi_single_token_initial_step(2, 1, None))
+        self.assertFalse(runner._is_kimi_single_token_initial_step(2, 2, None))
+
+    def test_non_kimi_singleton_keeps_graph_dispatch(self):
+        runner = self._build_runner("qwen3", computed_tokens=0)
+
+        self.assertFalse(runner._is_kimi_single_token_initial_step(1, 1, None))
+
+
 class TestNPUModelRunnerKVCache(unittest.TestCase):
     def _build_runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)

@@ -2759,6 +2759,21 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens, intermediate_tensors, sync_self
         )
 
+    def _is_kimi_single_token_initial_step(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        force_uniform_decode: bool | None,
+    ) -> bool:
+        """Return whether Kimi's initial singleton MLA step must skip full graph."""
+        return bool(
+            getattr(self.model_config.hf_config, "model_type", None) == "kimi_k3"
+            and force_uniform_decode is None
+            and num_tokens == 1
+            and num_reqs == 1
+            and int(self.input_batch.num_computed_tokens_cpu[0]) == 0
+        )
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -2795,6 +2810,23 @@ class NPUModelRunner(GPUModelRunner):
             else len(self.input_batch.lora_id_to_lora_request)
         )
         has_lora = num_active_loras > 0 if force_has_lora is None else force_has_lora
+
+        # A one-token initial Kimi K3 prompt is classified as uniform decode,
+        # but its MLA path writes and reads the first paged-KV row in the same
+        # full ACL graph. On 950DT that replay can observe the capture-time
+        # cache contents. Execute only this first step outside the full graph;
+        # later decode steps retain normal graph dispatch.
+        kimi_single_token_initial_step = self._is_kimi_single_token_initial_step(
+            num_tokens,
+            num_reqs,
+            force_uniform_decode,
+        )
+        if kimi_single_token_initial_step:
+            logger.info(
+                "KIMI_SINGLE_TOKEN_INITIAL_EAGER model=kimi_k3 "
+                "reason=full_graph_paged_kv_read_after_write"
+            )
+        force_eager = force_eager or kimi_single_token_initial_step
 
         # ruff: noqa: E731
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
