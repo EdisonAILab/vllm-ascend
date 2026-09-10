@@ -64,6 +64,20 @@ else:
 _CUSTOM_OP_REGISTERED = False
 
 
+def _configure_fixed_order_all_reduce_split(compilation_config) -> None:
+    """Keep the deterministic TP reduction outside PIECEWISE ACL graphs."""
+    if os.environ.get("VLLM_TP_FIXED_ORDER_ALLREDUCE") != "1":
+        return
+
+    op_name = "vllm::fixed_order_all_reduce_"
+    if op_name not in compilation_config.splitting_ops:
+        compilation_config.splitting_ops.append(op_name)
+        logger.info(
+            "Fixed-order TP reduction: executing %s outside PIECEWISE ACL graphs.",
+            op_name,
+        )
+
+
 def config_deprecated_logging():
     """Configure deprecated logging format, when used deprecated codes
     in vllm-ascend.
@@ -482,6 +496,7 @@ class NPUPlatform(Platform):
             # If splitting ops does not contain the vllm::mla forward value, this configuration issue will
             # not be detected in advance assert.
             compilation_config.splitting_ops.extend(["vllm::mla_forward"])
+            _configure_fixed_order_all_reduce_split(compilation_config)
             update_aclgraph_sizes(vllm_config)
             ascend_config.ascend_compilation_config.enable_npugraph_ex = False
         elif compilation_config.cudagraph_mode.has_full_cudagraphs():
