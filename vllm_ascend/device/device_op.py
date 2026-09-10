@@ -61,6 +61,42 @@ def _training_parity_moe_gating_top_k(
     return topk_weights, topk_ids.to(torch.int32), out
 
 
+def _gather_paged_kv_cache(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> None:
+    """Gather normal-layout paged KV cache entries without internal formats."""
+    num_tokens = key.shape[0]
+    request_ids = torch.arange(
+        seq_lens.numel(), device=seq_lens.device, dtype=torch.int32
+    )
+    request_ids = torch.repeat_interleave(
+        request_ids, seq_lens, output_size=num_tokens
+    )
+    request_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
+    token_offsets = torch.arange(
+        num_tokens, device=seq_lens.device, dtype=torch.int32
+    ) - torch.repeat_interleave(request_starts, seq_lens, output_size=num_tokens)
+    cache_positions = (
+        torch.repeat_interleave(seq_offsets, seq_lens, output_size=num_tokens)
+        + token_offsets
+    )
+    block_size = key_cache.shape[1]
+    block_offsets = torch.remainder(cache_positions, block_size)
+    logical_blocks = torch.div(cache_positions, block_size, rounding_mode="floor")
+    physical_blocks = block_tables[
+        request_ids.to(torch.long), logical_blocks.to(torch.long)
+    ]
+    cache_indices = (physical_blocks.to(torch.long), block_offsets.to(torch.long))
+    key.copy_(key_cache[cache_indices])
+    value.copy_(value_cache[cache_indices])
+
+
 class BaseDeviceAdaptor:
     @classmethod
     def reshape_and_cache(cls, key, value, key_cache, value_cache, slot_mapping):
@@ -702,14 +738,14 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
 
     @staticmethod
     def kv_cache_load(cache_kv_c, cache_k_pe, block_table, context_seq_len_npu, seq_offset, key, value):
-        torch_npu.npu_gather_pa_kv_cache(
+        _gather_paged_kv_cache(
             cache_kv_c,
             cache_k_pe,
             block_table,
             context_seq_len_npu.contiguous(),
-            seq_offset=seq_offset,
-            key=key,
-            value=value,
+            seq_offset,
+            key,
+            value,
         )
 
     @staticmethod

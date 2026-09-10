@@ -209,6 +209,7 @@ class BlockTable:
             slot_mapping = block_numbers * self.block_size + block_offsets
             # Write final slots, use -1 for not-local
             self.slot_mapping.np[: req_indices.shape[0]] = np.where(mask, slot_mapping, -1)
+            self.slot_mapping.copy_to_gpu(req_indices.shape[0])
         else:
             assert self.kernel_sizes is not None
             assert self.block_size == self.kernel_sizes[0]
