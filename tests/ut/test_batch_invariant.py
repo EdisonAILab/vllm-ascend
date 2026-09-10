@@ -15,7 +15,7 @@
 #
 # type: ignore
 import os
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -85,6 +85,103 @@ class TestBatchInvariant:
         custom_sum.assert_not_called()
         assert result is expected
 
+    def test_reduce_sum_uses_ascendc_for_last_dimension(self):
+        x = MagicMock()
+        x.device.type = "npu"
+        x.dtype = torch.float32
+        x.dim.return_value = 3
+        custom_ops = MagicMock()
+        with patch.object(batch_invariant.torch.ops, "batch_invariant_ops", custom_ops):
+            batch_invariant.reduce_sum(x, dim=2, keepdim=True)
+
+        custom_ops.npu_reduce_sum_batch_invariant.assert_called_once_with(x, -1, True)
+
+    def test_reduce_sum_moves_non_last_dimension_to_tail(self):
+        x = MagicMock()
+        x.device.type = "npu"
+        x.dtype = torch.float32
+        x.dim.return_value = 3
+        moved = MagicMock()
+        packed = moved.contiguous.return_value
+        packed.shape = (3, 4, 2)
+        rows = packed.flatten.return_value
+        flat_result = MagicMock()
+        reduced = flat_result.reshape.return_value
+        custom_ops = MagicMock()
+        custom_ops.npu_reduce_sum_batch_invariant.return_value = flat_result
+        with (
+            patch.object(batch_invariant.torch, "movedim", return_value=moved) as move_dim,
+            patch.object(batch_invariant.torch.ops, "batch_invariant_ops", custom_ops),
+        ):
+            result = batch_invariant.reduce_sum(x, dim=0)
+
+        move_dim.assert_called_once_with(x, 0, -1)
+        moved.contiguous.assert_called_once_with()
+        packed.flatten.assert_called_once_with(0, -2)
+        custom_ops.npu_reduce_sum_batch_invariant.assert_called_once_with(rows, -1, False)
+        flat_result.reshape.assert_called_once_with((3, 4))
+        assert result is reduced
+
+    def test_reduce_sum_restores_kept_non_last_dimension(self):
+        x = MagicMock()
+        x.device.type = "npu"
+        x.dtype = torch.float32
+        x.dim.return_value = 4
+        moved = MagicMock()
+        packed = moved.contiguous.return_value
+        packed.shape = (2, 4, 5, 3)
+        rows = packed.flatten.return_value
+        flat_result = MagicMock()
+        reduced = flat_result.reshape.return_value
+        kept = reduced.unsqueeze.return_value
+        restored = MagicMock()
+        custom_ops = MagicMock()
+        custom_ops.npu_reduce_sum_batch_invariant.return_value = flat_result
+        with (
+            patch.object(batch_invariant.torch, "movedim", side_effect=[moved, restored]) as move_dim,
+            patch.object(batch_invariant.torch.ops, "batch_invariant_ops", custom_ops),
+        ):
+            result = batch_invariant.reduce_sum(x, dim=-2, keepdim=True)
+
+        assert move_dim.call_args_list == [call(x, 2, -1), call(kept, -1, 2)]
+        packed.flatten.assert_called_once_with(0, -2)
+        custom_ops.npu_reduce_sum_batch_invariant.assert_called_once_with(rows, -1, False)
+        flat_result.reshape.assert_called_once_with((2, 4, 5))
+        reduced.unsqueeze.assert_called_once_with(-1)
+        assert result is restored
+
+    def test_reduce_sum_uses_native_without_dimension(self):
+        x = MagicMock()
+        x.device.type = "npu"
+        with patch.object(batch_invariant, "torch_sum") as native_sum:
+            batch_invariant.reduce_sum(x)
+
+        native_sum.assert_called_once_with(x, None, False)
+
+    def test_reduce_sum_uses_native_for_multiple_dimensions(self):
+        x = MagicMock()
+        x.device.type = "npu"
+        with patch.object(batch_invariant, "torch_sum") as native_sum:
+            batch_invariant.reduce_sum(x, dim=(0, 2), keepdim=True)
+
+        native_sum.assert_called_once_with(x, (0, 2), True)
+
+    def test_reduce_sum_uses_native_for_dtype_override(self):
+        x = MagicMock()
+        x.device.type = "npu"
+        with patch.object(batch_invariant, "torch_sum") as native_sum:
+            batch_invariant.reduce_sum(x, dim=1, dtype=torch.float32)
+
+        native_sum.assert_called_once_with(x, 1, False, dtype=torch.float32)
+
+    def test_reduce_sum_uses_native_for_cpu(self):
+        x = MagicMock()
+        x.device.type = "cpu"
+        with patch.object(batch_invariant, "torch_sum") as native_sum:
+            batch_invariant.reduce_sum(x, dim=0)
+
+        native_sum.assert_called_once_with(x, 0, False)
+
     def test_override_envs_for_invariance(self):
         """Test Config and environment variable override"""
         mock_config = MagicMock()
@@ -118,6 +215,7 @@ class TestBatchInvariant:
         mock_library.impl.assert_any_call(
             "aten::matmul", batch_invariant.torch.ops.batch_invariant_ops.npu_matmul_batch_invariant, "NPU"
         )
+        assert all(call.args[0] != "aten::sum" for call in mock_library.impl.call_args_list)
 
         # Verify torch_npu function patching
         assert (
