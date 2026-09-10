@@ -75,6 +75,20 @@ _CUSTOM_OP_REGISTERED = False
 MAX_CAPTURE_SIZES_FOR_950 = 4
 
 
+def _configure_fixed_order_all_reduce_split(compilation_config) -> None:
+    """Keep the deterministic TP reduction outside PIECEWISE ACL graphs."""
+    if os.environ.get("VLLM_TP_FIXED_ORDER_ALLREDUCE") != "1":
+        return
+
+    op_name = "vllm::fixed_order_all_reduce_"
+    if op_name not in compilation_config.splitting_ops:
+        compilation_config.splitting_ops.append(op_name)
+        logger.info(
+            "Fixed-order TP reduction: executing %s outside PIECEWISE ACL graphs.",
+            op_name,
+        )
+
+
 def config_deprecated_logging():
     """Configure deprecated logging format, when used deprecated codes
     in vllm-ascend.
@@ -576,6 +590,7 @@ class NPUPlatform(Platform):
                     "vllm::dsa_forward",
                 ]
             )
+            _configure_fixed_order_all_reduce_split(compilation_config)
             # TODO(2026/7/15): Delete the reduced gear after the new driver is released.
             if get_ascend_device_type() == AscendDeviceType.A5:
                 prune_capture_sizes_for_950(vllm_config)
