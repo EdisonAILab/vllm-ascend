@@ -65,15 +65,46 @@ def add_rms_norm(
 _SUPPORTED_DTYPES = (torch.float16, torch.float32, torch.bfloat16)
 
 
-def reduce_sum(x: torch.Tensor, dim: int | None = None, keepdim: bool = False) -> torch.Tensor:
-    """npu_reduce_sum_batch_invariant requires dim to be specified, but torch.sum
-    doesn't require it, so we set dim to -1 by default if dim is None and x.dim()==1.
-    """
+def reduce_sum(
+    x: torch.Tensor,
+    dim: int | tuple[int, ...] | None = None,
+    keepdim: bool = False,
+    *,
+    dtype: torch.dtype | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run single-axis NPU reductions through the last-axis-only BI kernel."""
+    native_kwargs = {}
+    if dtype is not None:
+        native_kwargs["dtype"] = dtype
+    if out is not None:
+        native_kwargs["out"] = out
+
     dim = -1 if dim is None and x.dim() == 1 else dim
-    if x.device.type == "npu" and dim is not None and x.dtype in _SUPPORTED_DTYPES:
-        return torch.ops.batch_invariant_ops.npu_reduce_sum_batch_invariant(x, dim, keepdim)
-    # CPU tensors and unsupported dtypes/dimensions use the saved native torch.sum.
-    return torch_sum(x, dim, keepdim)
+    if (
+        x.device.type != "npu"
+        or x.dtype not in _SUPPORTED_DTYPES
+        or not isinstance(dim, int)
+        or native_kwargs
+    ):
+        return torch_sum(x, dim, keepdim, **native_kwargs)
+
+    ndim = x.dim()
+    normalized_dim = dim + ndim if dim < 0 else dim
+    if normalized_dim < 0 or normalized_dim >= ndim:
+        return torch_sum(x, dim, keepdim, **native_kwargs)
+
+    if normalized_dim == ndim - 1:
+        return torch.ops.batch_invariant_ops.npu_reduce_sum_batch_invariant(x, -1, keepdim)
+
+    moved = torch.movedim(x, normalized_dim, -1).contiguous()
+    outer_shape = moved.shape[:-1]
+    rows = moved.flatten(0, -2)
+    result = torch.ops.batch_invariant_ops.npu_reduce_sum_batch_invariant(rows, -1, False)
+    result = result.reshape(outer_shape)
+    if keepdim:
+        result = torch.movedim(result.unsqueeze(-1), -1, normalized_dim)
+    return result
 
 
 def override_envs_for_invariance():
