@@ -39,12 +39,15 @@ from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
 
-
 _DENSE_BI_DECOMPOSE = os.environ.get("VLLM_MXFP8_DENSE_BI_DECOMPOSE") == "1"
 _GROUPED_BI_DECOMPOSE = os.environ.get("VLLM_MXFP8_GROUPED_BI_DECOMPOSE") == "1"
+_GROUPED_BI_GRAPH_NATIVE = (
+    os.environ.get("VLLM_MXFP8_GROUPED_BI_GRAPH_NATIVE") == "1"
+)
 _DENSE_BI_NOTICE_PRINTED = False
 _GROUPED_BI_NOTICE_PRINTED = False
 _GROUPED_WEIGHT_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
+_NATIVE_NPU_GROUPED_MATMUL = torch_npu.npu_grouped_matmul
 
 
 def _e8m0_to_f32(scale: torch.Tensor) -> torch.Tensor:
@@ -150,6 +153,84 @@ def _grouped_weight_bf16(
     return cached
 
 
+def _grouped_weights_bf16_native(
+    weight: torch.Tensor,
+    packed_scale: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    """Replace grouped FP8 storage with BF16 once for graph-safe GMM."""
+    if weight.dtype == torch.bfloat16:
+        return weight
+
+    converted = torch.empty(
+        weight.shape,
+        dtype=torch.bfloat16,
+        device=weight.device,
+    )
+    for expert in range(weight.shape[0]):
+        converted[expert] = _dequant_weight(
+            weight[expert], packed_scale[expert], group_size
+        ).to(torch.bfloat16)
+    weight.data = converted
+    return weight
+
+
+def _grouped_gmm2_graph_bi(
+    *,
+    values: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    token_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    group_list: torch.Tensor,
+    group_list_type: int | None,
+    output_dtype: torch.dtype | None,
+) -> list[torch.Tensor]:
+    values_bf16 = _dequant_activation(values, token_scale, group_size=32).to(
+        torch.bfloat16
+    )
+    weights_bf16 = _grouped_weights_bf16_native(weights, scales, 32)
+    call_kwargs = {
+        "x": [values_bf16],
+        "weight": [weights_bf16],
+        "split_item": 2,
+        "group_list_type": group_list_type,
+        "group_type": 0,
+        "group_list": group_list,
+        "output_dtype": output_dtype or torch.bfloat16,
+    }
+    if bias is not None:
+        call_kwargs["bias"] = [bias]
+    return _NATIVE_NPU_GROUPED_MATMUL(**call_kwargs)
+
+
+def _grouped_gmm1_graph_bi(
+    *,
+    x: torch.Tensor,
+    weights: torch.Tensor,
+    scales: torch.Tensor,
+    x_scale: torch.Tensor,
+    group_list: torch.Tensor,
+):
+    values_bf16 = _dequant_activation(x, x_scale, group_size=32).to(
+        torch.bfloat16
+    )
+    weights_bf16 = _grouped_weights_bf16_native(weights, scales, 32)
+    hidden = _NATIVE_NPU_GROUPED_MATMUL(
+        x=[values_bf16],
+        weight=[weights_bf16],
+        split_item=2,
+        group_list_type=0,
+        group_type=0,
+        group_list=group_list,
+        output_dtype=torch.bfloat16,
+    )[0]
+    activated = torch_npu.npu_swiglu(hidden)
+    return torch_npu.npu_dynamic_mx_quant(
+        activated, dst_type=torch.float8_e4m3fn
+    )
+
+
 def _grouped_gmm2_bi(
     *,
     x,
@@ -171,6 +252,18 @@ def _grouped_gmm2_bi(
         if isinstance(per_token_scale, (list, tuple))
         else per_token_scale
     )
+    if _GROUPED_BI_GRAPH_NATIVE:
+        return _grouped_gmm2_graph_bi(
+            values=values,
+            weights=weights,
+            scales=scales,
+            token_scale=token_scale,
+            bias=bias,
+            group_list=group_list,
+            group_list_type=group_list_type,
+            output_dtype=output_dtype,
+        )
+
     experts, _, columns = weights.shape
     offsets = _group_offsets(group_list, group_list_type, values.shape[0])
     values_bf16 = _dequant_activation(values, token_scale, group_size=32).to(
@@ -206,6 +299,15 @@ def _grouped_gmm1_bi(
         if isinstance(weight_scale, (list, tuple))
         else weight_scale
     )
+    if _GROUPED_BI_GRAPH_NATIVE:
+        return _grouped_gmm1_graph_bi(
+            x=x,
+            weights=weights,
+            scales=scales,
+            x_scale=x_scale,
+            group_list=group_list,
+        )
+
     experts, _, columns = weights.shape
     offsets = _group_offsets(group_list, 0, x.shape[0])
     values_bf16 = _dequant_activation(x, x_scale, group_size=32).to(
@@ -237,10 +339,12 @@ def _install_grouped_bi_decompose() -> None:
     torch_npu.npu_grouped_matmul = _grouped_gmm2_bi
     torch_npu.npu_grouped_matmul_swiglu_quant_v2 = _grouped_gmm1_bi
     if not _GROUPED_BI_NOTICE_PRINTED:
-        print(
-            "[BI_MXFP8_GROUPED] per-expert bf16 fixed-order matmul enabled",
-            flush=True,
+        implementation = (
+            "dequantized bf16 graph-safe grouped matmul"
+            if _GROUPED_BI_GRAPH_NATIVE
+            else "per-expert bf16 fixed-order matmul"
         )
+        print(f"[BI_MXFP8_GROUPED] {implementation} enabled", flush=True)
         _GROUPED_BI_NOTICE_PRINTED = True
 
 
