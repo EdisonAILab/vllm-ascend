@@ -16,10 +16,12 @@
 # limitations under the License.
 #
 
+import vllm.envs as envs
 from torch import fx as fx
 from vllm.compilation.passes.inductor_pass import get_pass_context
 from vllm.compilation.passes.vllm_inductor_pass import VllmInductorPass
 from vllm.config import VllmConfig
+from vllm.logger import logger
 
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
@@ -62,10 +64,12 @@ class GraphFusionPassManager:
 
             self.passes.append(AddRMSNormQuantFusionPass(config))
 
-        if self.ascend_compilation_config.fuse_qknorm_rope:
+        if self.ascend_compilation_config.fuse_qknorm_rope and not envs.VLLM_BATCH_INVARIANT:
             from .passes.qknorm_rope_fusion_pass import QKNormRopeFusionPass
 
             self.passes.append(QKNormRopeFusionPass(config))
+        elif self.ascend_compilation_config.fuse_qknorm_rope:
+            logger.info("Batch-invariant mode: disabling QK-Norm/RoPE graph fusion.")
 
         if self.ascend_compilation_config.fuse_muls_add and profile.supports(HardwareCapability.GRAPH_MULS_ADD_FUSION):
             from .passes.muls_add_pass import MulsAddFusionPass
