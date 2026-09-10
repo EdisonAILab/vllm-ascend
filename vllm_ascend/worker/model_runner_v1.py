@@ -2759,19 +2759,25 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens, intermediate_tensors, sync_self
         )
 
-    def _is_kimi_single_token_initial_step(
+    def _has_kimi_initial_token_graph_hazard(
         self,
         num_tokens: int,
         num_reqs: int,
+        num_scheduled_tokens_np: np.ndarray,
         force_uniform_decode: bool | None,
     ) -> bool:
-        """Return whether Kimi's initial singleton MLA step must skip full graph."""
-        return bool(
-            getattr(self.model_config.hf_config, "model_type", None) == "kimi_k3"
-            and force_uniform_decode is None
-            and num_tokens == 1
-            and num_reqs == 1
-            and int(self.input_batch.num_computed_tokens_cpu[0]) == 0
+        """Return whether an initial Kimi token must skip full graph."""
+        from vllm_ascend.worker.kimi_graph_dispatch import (
+            has_kimi_initial_token_graph_hazard,
+        )
+
+        return has_kimi_initial_token_graph_hazard(
+            model_type=getattr(self.model_config.hf_config, "model_type", None),
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            num_scheduled_tokens=num_scheduled_tokens_np,
+            num_computed_tokens=self.input_batch.num_computed_tokens_cpu,
+            force_uniform_decode=force_uniform_decode,
         )
 
     def _determine_batch_execution_and_padding(
@@ -2816,17 +2822,26 @@ class NPUModelRunner(GPUModelRunner):
         # full ACL graph. On 950DT that replay can observe the capture-time
         # cache contents. Execute only this first step outside the full graph;
         # later decode steps retain normal graph dispatch.
-        kimi_single_token_initial_step = self._is_kimi_single_token_initial_step(
+        kimi_initial_token_graph_hazard = self._has_kimi_initial_token_graph_hazard(
             num_tokens,
             num_reqs,
+            num_scheduled_tokens_np,
             force_uniform_decode,
         )
-        if kimi_single_token_initial_step:
+        if kimi_initial_token_graph_hazard:
+            initial_reqs = int(
+                np.count_nonzero(
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs] == 0
+                )
+            )
             logger.info(
                 "KIMI_SINGLE_TOKEN_INITIAL_EAGER model=kimi_k3 "
-                "reason=full_graph_paged_kv_read_after_write"
+                "reason=full_graph_paged_kv_read_after_write "
+                "initial_reqs=%d total_reqs=%d",
+                initial_reqs,
+                num_reqs,
             )
-        force_eager = force_eager or kimi_single_token_initial_step
+        force_eager = force_eager or kimi_initial_token_graph_hazard
 
         # ruff: noqa: E731
         def dispatch_cudagraph(num_tokens, disable_full=False, valid_modes=None):
