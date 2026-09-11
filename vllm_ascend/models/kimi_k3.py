@@ -990,7 +990,7 @@ class KimiK3MoE(nn.Module):
 
 
 class _KimiReferenceRMSNorm(nn.Module):
-    """Opt-in Kimi RMSNorm with the Megatron FP32 accumulation contract."""
+    """Kimi RMSNorm with the Megatron FP32 accumulation contract."""
 
     def __init__(self, hidden_size: int, eps: float) -> None:
         super().__init__()
@@ -1052,6 +1052,28 @@ class _KimiDecomposedRMSNorm(_KimiReferenceRMSNorm):
                         )
             self.kimi_call_index += 1
         return output
+
+
+def _kimi_mla_rms_norm_type() -> type[nn.Module]:
+    """Select the reduced MLA norm without changing other model families.
+
+    The native decomposed reduction was sufficient for the eight-layer smoke,
+    but its rounding accumulates into different full-vocabulary logprobs after
+    the MLA pattern is repeated at sixteen layers.  Megatron's FP32 variance,
+    BF16-normalized-value, then weight-multiply contract remains graph-safe and
+    is therefore the reduced W4A8 default.  Explicit overrides still win.
+    """
+    if kimi_runtime_flag(
+        "VLLM_ASCEND_KIMI_REFERENCE_MLA_RMS_NORM",
+        reduced_default=True,
+    ):
+        return _KimiReferenceRMSNorm
+    if kimi_runtime_flag(
+        "VLLM_ASCEND_KIMI_DECOMPOSED_MLA_RMS_NORM",
+        reduced_default=False,
+    ):
+        return _KimiDecomposedRMSNorm
+    return RMSNorm
 
 
 def _reference_mla_preprocess_decode(
@@ -1535,18 +1557,7 @@ class KimiK3MLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fused_qkv_a_proj",
         )
-        if kimi_runtime_flag(
-            "VLLM_ASCEND_KIMI_REFERENCE_MLA_RMS_NORM",
-            reduced_default=False,
-        ):
-            norm_type = _KimiReferenceRMSNorm
-        elif kimi_runtime_flag(
-            "VLLM_ASCEND_KIMI_DECOMPOSED_MLA_RMS_NORM",
-            reduced_default=True,
-        ):
-            norm_type = _KimiDecomposedRMSNorm
-        else:
-            norm_type = RMSNorm
+        norm_type = _kimi_mla_rms_norm_type()
         self.q_a_layernorm = norm_type(q_lora_rank, eps=config.rms_norm_eps)
         if isinstance(self.q_a_layernorm, _KimiDecomposedRMSNorm):
             self.q_a_layernorm.kimi_parity_name = f"{prefix}.q_a_layernorm"
