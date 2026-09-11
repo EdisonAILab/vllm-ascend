@@ -105,6 +105,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.processor import cached_get_image_processor
 from vllm.triton_utils import HAS_TRITON
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.activation import AscendSituAndMul, SituActivationConfig
@@ -129,6 +130,59 @@ if HAS_TRITON:
 
 _KIMI_MLAPO_KV_LORA_RANK = 512
 _KIMI_MLA_KERNEL_ROPE_DIM = 64
+
+
+def _kimi_reference_rowwise_attention_residual_impl(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    projection_weight: torch.Tensor,
+    norm_weight: torch.Tensor,
+    variance_epsilon: float,
+) -> torch.Tensor:
+    """Preserve Megatron's token-by-token FP32 reduction schedule.
+
+    This implementation is intentionally row-wise. Combining tokens into a
+    single reduction changes a few BF16-rounded activations on Ascend even
+    though the mathematical expression is the same. Registering it as a
+    custom op keeps the dynamic token loop opaque to ``torch.compile`` while
+    retaining the exact eager arithmetic at runtime.
+    """
+    rows = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
+    if rows.shape[0] == 0:
+        return torch.empty_like(prefix_sum)
+
+    score_weight = norm_weight.float() * projection_weight.squeeze(0).float()
+    outputs = []
+    for token_idx in range(rows.shape[0]):
+        rows_float = rows[token_idx : token_idx + 1].float()
+        normalized = rows_float * torch.rsqrt(
+            rows_float.square().mean(dim=-1, keepdim=True) + variance_epsilon
+        )
+        scores = (normalized * score_weight).sum(dim=-1)
+        probabilities = torch.softmax(scores, dim=-1)
+        outputs.append(
+            (probabilities.unsqueeze(-1) * rows_float).sum(dim=-2).to(rows.dtype)
+        )
+    return torch.cat(outputs, dim=0)
+
+
+def _kimi_reference_rowwise_attention_residual_fake(
+    prefix_sum: torch.Tensor,
+    block_residual: torch.Tensor,
+    projection_weight: torch.Tensor,
+    norm_weight: torch.Tensor,
+    variance_epsilon: float,
+) -> torch.Tensor:
+    return torch.empty_like(prefix_sum)
+
+
+direct_register_custom_op(
+    op_name="kimi_reference_rowwise_attention_residual",
+    op_func=_kimi_reference_rowwise_attention_residual_impl,
+    fake_impl=_kimi_reference_rowwise_attention_residual_fake,
+    mutates_args=[],
+    dispatch_key="PrivateUse1",
+)
 
 
 def _configure_kimi_mlapo_shape(mla_impl: Any, kv_lora_rank: int) -> bool:
@@ -1518,9 +1572,9 @@ def _apply_attention_residual(
 ) -> torch.Tensor:
     """Apply K3's learned normalized mixture over residual block starts."""
     if os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ATTN_RES") == "1":
-        rows = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
-        score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
         if os.environ.get("VLLM_ASCEND_KIMI_VECTORIZED_ATTN_RES") == "1":
+            rows = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
+            score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
             rows_float = rows.float()
             if os.environ.get("VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_RMS_NORM") == "1":
                 normalized, _ = torch_npu.npu_rms_norm(
@@ -1551,16 +1605,21 @@ def _apply_attention_residual(
                     .to(rows.dtype)
                 )
             return (probabilities.unsqueeze(-1) * rows_float).sum(dim=-2).to(rows.dtype)
-        outputs = []
-        for token_idx in range(rows.shape[0]):
-            rows_float = rows[token_idx : token_idx + 1].float()
-            normalized = rows_float * torch.rsqrt(
-                rows_float.square().mean(dim=-1, keepdim=True) + norm.variance_epsilon
+        if prefix_sum.device.type == "npu":
+            return torch.ops.vllm.kimi_reference_rowwise_attention_residual(
+                prefix_sum,
+                block_residual,
+                projection.weight,
+                norm.weight,
+                norm.variance_epsilon,
             )
-            scores = (normalized * score_weight).sum(dim=-1)
-            probabilities = torch.softmax(scores, dim=-1)
-            outputs.append((probabilities.unsqueeze(-1) * rows_float).sum(dim=-2).to(rows.dtype))
-        return torch.cat(outputs, dim=0)
+        return _kimi_reference_rowwise_attention_residual_impl(
+            prefix_sum,
+            block_residual,
+            projection.weight,
+            norm.weight,
+            norm.variance_epsilon,
+        )
 
     use_triton_attention_residual = (
         apply_attn_res is not None

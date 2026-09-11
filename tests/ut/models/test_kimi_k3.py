@@ -23,6 +23,7 @@ from vllm_ascend.models.kimi_k3 import (
     _decomposed_mla_forward_decode,
     _decomposed_mla_forward_prefill,
     _KimiReferenceRMSNorm,
+    _kimi_reference_rowwise_attention_residual_impl,
     _move_module_to_device,
     _reference_mla_forward_decode,
     _reference_mla_forward_prefill,
@@ -404,6 +405,61 @@ def test_kimi_k3_vectorized_attention_residual_uses_explicit_fp32_reductions():
         )
 
     assert torch.equal(actual, expected)
+
+
+def test_kimi_k3_rowwise_attention_residual_preserves_per_token_schedule():
+    prefix_sum = torch.tensor(
+        [[0.5, -0.25, 1.0, 0.75], [1.25, 0.5, -0.75, 0.25]],
+        dtype=torch.bfloat16,
+    )
+    block_residual = torch.tensor(
+        [
+            [[0.25, 0.5, -0.5, 1.0], [1.0, -0.75, 0.5, 0.25]],
+            [[-0.5, 0.25, 0.75, 1.0], [0.5, 1.0, -0.25, -0.75]],
+        ],
+        dtype=torch.bfloat16,
+    )
+    projection_weight = torch.tensor(
+        [[0.75, -0.5, 1.25, 0.25]], dtype=torch.bfloat16
+    )
+    norm_weight = torch.tensor([1.0, 0.5, 1.5, -0.75], dtype=torch.bfloat16)
+    variance_epsilon = 1e-6
+
+    expected_rows = []
+    rows = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
+    score_weight = norm_weight.float() * projection_weight.squeeze(0).float()
+    for token_idx in range(rows.shape[0]):
+        rows_float = rows[token_idx : token_idx + 1].float()
+        normalized = rows_float * torch.rsqrt(
+            rows_float.square().mean(dim=-1, keepdim=True) + variance_epsilon
+        )
+        probabilities = torch.softmax((normalized * score_weight).sum(dim=-1), dim=-1)
+        expected_rows.append(
+            (probabilities.unsqueeze(-1) * rows_float).sum(dim=-2).to(rows.dtype)
+        )
+
+    actual = _kimi_reference_rowwise_attention_residual_impl(
+        prefix_sum,
+        block_residual,
+        projection_weight,
+        norm_weight,
+        variance_epsilon,
+    )
+
+    assert torch.equal(actual, torch.cat(expected_rows, dim=0))
+
+
+def test_kimi_k3_rowwise_attention_residual_handles_empty_batch():
+    actual = _kimi_reference_rowwise_attention_residual_impl(
+        torch.empty((0, 4), dtype=torch.bfloat16),
+        torch.empty((0, 2, 4), dtype=torch.bfloat16),
+        torch.ones((1, 4), dtype=torch.bfloat16),
+        torch.ones((4,), dtype=torch.bfloat16),
+        1e-6,
+    )
+
+    assert actual.shape == (0, 4)
+    assert actual.dtype == torch.bfloat16
 
 
 def test_kimi_k3_reference_router_skips_discarded_bf16_projection():
