@@ -275,6 +275,7 @@ class BlockTable:
             block_numbers = self.block_table.cpu.flatten()[block_table_indices]
             slot_mapping = block_numbers * self.block_size + block_offsets
             self.slot_mapping.cpu[: req_indices.shape[0]] = torch.where(mask, slot_mapping, -1)
+            self.slot_mapping.copy_to_gpu(req_indices.shape[0])
 
     def commit_block_table(self, num_reqs: int) -> None:
         self.block_table.copy_to_gpu(num_reqs)
