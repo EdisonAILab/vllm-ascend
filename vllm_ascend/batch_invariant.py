@@ -93,6 +93,7 @@ def override_envs_for_invariance():
 
 
 _batch_invariant_LIB = None
+_training_parity_matmul_LIB = None
 
 
 def enable_batch_invariant_mode():
@@ -160,3 +161,36 @@ def init_batch_invariance():
                 "Batch-invariant mode requested but Triton or AscendC batch-invariant "
                 "ops is not available.skipping batch-invariant initialization."
             )
+
+
+def init_training_parity_matmul():
+    """Enable only BI matrix multiplication for the opt-in training oracle.
+
+    Training-parity decode deliberately keeps the training engine's standard
+    attention implementation.  Registering the complete vLLM BI mode here
+    would also replace FIA, norms, sums, and softmax, changing more than the
+    row-count-dependent projection operation isolated by logdiff.
+    """
+    global _training_parity_matmul_LIB
+
+    if os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") != "1":
+        return
+    if envs.VLLM_BATCH_INVARIANT:
+        return
+    if not HAS_ASCENDC_BATCH_INVARIANT:
+        raise RuntimeError("VLLM_ASCEND_TRAINING_PARITY requires Ascend batch-invariant operators for mm/matmul")
+    if _training_parity_matmul_LIB is not None:
+        return
+
+    logger.info("Enabling opt-in training-parity BI mm/matmul only.")
+    _training_parity_matmul_LIB = torch.library.Library("aten", "IMPL")
+    _training_parity_matmul_LIB.impl(
+        "aten::mm",
+        torch.ops.batch_invariant_ops.npu_mm_batch_invariant,
+        "NPU",
+    )
+    _training_parity_matmul_LIB.impl(
+        "aten::matmul",
+        torch.ops.batch_invariant_ops.npu_matmul_batch_invariant,
+        "NPU",
+    )

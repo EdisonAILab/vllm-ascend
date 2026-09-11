@@ -142,6 +142,52 @@ class TestBatchInvariant:
             batch_invariant.override_envs_for_invariance.assert_not_called()
             batch_invariant.enable_batch_invariant_mode.assert_not_called()
 
+    @patch("vllm_ascend.batch_invariant.HAS_ASCENDC_BATCH_INVARIANT", True)
+    def test_init_training_parity_matmul(self):
+        import vllm.envs as envs
+
+        mock_library = MagicMock()
+        original_library = batch_invariant._training_parity_matmul_LIB
+        try:
+            batch_invariant._training_parity_matmul_LIB = None
+            with (
+                patch.dict(os.environ, {"VLLM_ASCEND_TRAINING_PARITY": "1"}),
+                patch.object(envs, "VLLM_BATCH_INVARIANT", False),
+                patch.object(
+                    batch_invariant.torch.library,
+                    "Library",
+                    return_value=mock_library,
+                ),
+            ):
+                batch_invariant.init_training_parity_matmul()
+        finally:
+            batch_invariant._training_parity_matmul_LIB = original_library
+
+        assert mock_library.impl.call_count == 2
+        mock_library.impl.assert_any_call(
+            "aten::mm",
+            batch_invariant.torch.ops.batch_invariant_ops.npu_mm_batch_invariant,
+            "NPU",
+        )
+        mock_library.impl.assert_any_call(
+            "aten::matmul",
+            batch_invariant.torch.ops.batch_invariant_ops.npu_matmul_batch_invariant,
+            "NPU",
+        )
+
+    def test_init_training_parity_matmul_disabled(self):
+        original_library = batch_invariant._training_parity_matmul_LIB
+        try:
+            batch_invariant._training_parity_matmul_LIB = None
+            with (
+                patch.dict(os.environ, {"VLLM_ASCEND_TRAINING_PARITY": "0"}),
+                patch.object(batch_invariant.torch.library, "Library") as library,
+            ):
+                batch_invariant.init_training_parity_matmul()
+                library.assert_not_called()
+        finally:
+            batch_invariant._training_parity_matmul_LIB = original_library
+
     @patch("vllm_ascend.batch_invariant.torch_npu")
     def test_add_rms_norm(self, mock_torch_npu):
         """Test add_rms_norm function"""
