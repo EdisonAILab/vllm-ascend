@@ -33,7 +33,7 @@ from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.platform import NPUPlatform
-from vllm_ascend.utils import has_rope, is_vl_model
+from vllm_ascend.utils import has_rope, is_950, is_vl_model
 
 _TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
 
@@ -180,7 +180,11 @@ def rope_forward_oot(
     query_shape, key_shape = query.shape, key.shape
     if offsets is not None:
         raise NotImplementedError("Batched rotary embedding is currently not supported on NPU.")
-    if HAS_TRITON:
+    # The Triton RoPE kernel is rejected by the current A5 runtime with
+    # ACL error 207000. The native operator is graph-compatible and applies
+    # RoPE independently to each token, so keep Triton on other devices and
+    # use the existing native path on A5.
+    if HAS_TRITON and not is_950():
         num_tokens = query.shape[0]
         query, key = rope_forward_triton(
             query.view(num_tokens, -1, head_size),

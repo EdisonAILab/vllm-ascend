@@ -25,6 +25,7 @@ from vllm_ascend.ops.rotary_embedding import (
     AscendRotaryEmbedding,
     AscendYaRNRotaryEmbedding,
     get_identity_cos_and_sin_mla,
+    rope_forward_oot,
 )
 
 HEAD_SIZE = 64
@@ -58,6 +59,57 @@ def _make_tensors(seq_len=SEQ_LEN, num_heads=NUM_HEADS, head_size=HEAD_SIZE):
     query = torch.randn(seq_len, num_heads * head_size)
     key = torch.randn(seq_len, num_heads * head_size)
     return positions, query, key
+
+
+@patch("vllm_ascend.ops.rotary_embedding.rope_forward_triton", create=True)
+@patch("vllm_ascend.ops.rotary_embedding.torch_npu._npu_rotary_embedding")
+@patch("vllm_ascend.ops.rotary_embedding.is_950", return_value=True)
+@patch("vllm_ascend.ops.rotary_embedding.HAS_TRITON", True)
+def test_rope_forward_oot_uses_native_operator_on_a5(mock_is_950, mock_native, mock_triton):
+    positions, query, key = _make_tensors()
+    cos_sin_cache = torch.randn(MAX_POS, ROTARY_DIM)
+
+    actual_query, actual_key = rope_forward_oot(
+        positions,
+        query,
+        key,
+        cos_sin_cache,
+        HEAD_SIZE,
+        ROTARY_DIM,
+        True,
+    )
+
+    mock_is_950.assert_called_once_with()
+    mock_native.assert_called_once()
+    mock_triton.assert_not_called()
+    assert actual_query.shape == query.shape
+    assert actual_key.shape == key.shape
+
+
+@patch("vllm_ascend.ops.rotary_embedding.rope_forward_triton", create=True)
+@patch("vllm_ascend.ops.rotary_embedding.torch_npu._npu_rotary_embedding")
+@patch("vllm_ascend.ops.rotary_embedding.is_950", return_value=False)
+@patch("vllm_ascend.ops.rotary_embedding.HAS_TRITON", True)
+def test_rope_forward_oot_keeps_triton_on_other_devices(mock_is_950, mock_native, mock_triton):
+    positions, query, key = _make_tensors()
+    cos_sin_cache = torch.randn(MAX_POS, ROTARY_DIM)
+    mock_triton.return_value = (query, key)
+
+    actual = rope_forward_oot(
+        positions,
+        query,
+        key,
+        cos_sin_cache,
+        HEAD_SIZE,
+        ROTARY_DIM,
+        True,
+    )
+
+    mock_is_950.assert_called_once_with()
+    mock_triton.assert_called_once()
+    mock_native.assert_not_called()
+    assert torch.equal(actual[0], query)
+    assert torch.equal(actual[1], key)
 
 
 def check_parent_init_signature_has_not_changed(parent_func, child_func):
