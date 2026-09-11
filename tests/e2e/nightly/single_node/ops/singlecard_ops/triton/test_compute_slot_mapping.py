@@ -1,4 +1,8 @@
+import pytest
 import torch
+from vllm.v1.worker.block_table import (
+    _compute_slot_mapping_kernel as v1_compute_slot_mapping_kernel,
+)
 from vllm.v1.worker.gpu.block_table import _compute_slot_mappings_kernel as ref_compute_slot_mappings_kernel
 
 from vllm_ascend.worker.v2.block_table import _compute_slot_mappings_kernel as ascend_compute_slot_mappings_kernel
@@ -107,3 +111,34 @@ def test_compute_slot_mapping_npu_kernel():
         import traceback
 
         traceback.print_exc()
+
+
+@pytest.mark.parametrize("position", [0, 127, 128, 162, 235, 278, 511, 512, 630])
+def test_v1_compute_slot_mapping_single_token_across_blocks(position: int):
+    """One-token decode must select the position's physical KV block."""
+    device = torch.device("npu")
+    block_size = 128
+    block_table = torch.arange(1, 17, dtype=torch.int32, device=device).reshape(1, -1)
+    positions = torch.tensor([position], dtype=torch.int64, device=device)
+    query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    slot_mapping = torch.full((1,), -1, dtype=torch.int32, device=device)
+
+    v1_compute_slot_mapping_kernel[(2,)](
+        1,
+        1,
+        query_start_loc,
+        positions,
+        block_table,
+        block_table.stride(0),
+        block_size,
+        slot_mapping,
+        TOTAL_CP_WORLD_SIZE=1,
+        TOTAL_CP_RANK=0,
+        CP_KV_CACHE_INTERLEAVE_SIZE=1,
+        PAD_ID=-1,
+        BLOCK_SIZE=1024,
+    )
+    torch.npu.synchronize()
+
+    expected = int(block_table[0, position // block_size].item()) * block_size + position % block_size
+    assert int(slot_mapping.item()) == expected

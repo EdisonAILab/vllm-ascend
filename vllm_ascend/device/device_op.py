@@ -52,6 +52,75 @@ else:
     triton_q_rms = None  # type: ignore
 
 
+_TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
+
+if _TRAINING_PARITY:
+    from batch_invariant_ops import npu_softmax_batch_invariant
+else:
+    npu_softmax_batch_invariant = None
+
+
+def _training_parity_moe_gating_top_k(
+    x: torch.Tensor,
+    *,
+    k: int,
+    k_group: int,
+    group_count: int,
+    norm_type: int,
+    routed_scaling_factor: float,
+    bias_opt: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if norm_type != 0 or group_count != 1 or k_group != 1 or bias_opt is not None:
+        raise ValueError(
+            "training parity only supports ungrouped softmax routing without bias"
+        )
+    topk_logits, topk_ids = torch.topk(x, k=k, dim=-1)
+    if npu_softmax_batch_invariant is None:
+        raise RuntimeError("training-parity BI router softmax is unavailable")
+    topk_weights = npu_softmax_batch_invariant(
+        topk_logits.float(), -1
+    ).to(x.dtype)
+    topk_weights = topk_weights * routed_scaling_factor
+    out = torch.empty(0, dtype=x.dtype, device=x.device)
+    return topk_weights, topk_ids.to(torch.int32), out
+
+
+def _gather_paged_kv_cache(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    seq_offsets: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> None:
+    """Gather normal-layout paged KV cache entries without internal formats."""
+    num_tokens = key.shape[0]
+    request_ids = torch.arange(
+        seq_lens.numel(), device=seq_lens.device, dtype=torch.int32
+    )
+    request_ids = torch.repeat_interleave(
+        request_ids, seq_lens, output_size=num_tokens
+    )
+    request_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
+    token_offsets = torch.arange(
+        num_tokens, device=seq_lens.device, dtype=torch.int32
+    ) - torch.repeat_interleave(request_starts, seq_lens, output_size=num_tokens)
+    cache_positions = (
+        torch.repeat_interleave(seq_offsets, seq_lens, output_size=num_tokens)
+        + token_offsets
+    )
+    block_size = key_cache.shape[1]
+    block_offsets = torch.remainder(cache_positions, block_size)
+    logical_blocks = torch.div(cache_positions, block_size, rounding_mode="floor")
+    physical_blocks = block_tables[
+        request_ids.to(torch.long), logical_blocks.to(torch.long)
+    ]
+    cache_indices = (physical_blocks.to(torch.long), block_offsets.to(torch.long))
+    key.copy_(key_cache[cache_indices])
+    value.copy_(value_cache[cache_indices])
+
+
 class BaseDeviceAdaptor:
     @classmethod
     def reshape_and_cache(cls, key, value, key_cache, value_cache, slot_mapping):
@@ -157,6 +226,16 @@ class BaseDeviceAdaptor:
         eps: float = 1e-20,
         bias_opt: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _TRAINING_PARITY:
+            return _training_parity_moe_gating_top_k(
+                x,
+                k=k,
+                k_group=k_group,
+                group_count=group_count,
+                norm_type=norm_type,
+                routed_scaling_factor=routed_scaling_factor,
+                bias_opt=bias_opt,
+            )
         topk_weights, topk_ids, out = torch.ops._C_ascend.moe_gating_top_k(
             x,
             k=k,
@@ -1105,6 +1184,16 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         eps: float = 1e-20,
         bias_opt: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if _TRAINING_PARITY:
+            return _training_parity_moe_gating_top_k(
+                x,
+                k=k,
+                k_group=k_group,
+                group_count=group_count,
+                norm_type=norm_type,
+                routed_scaling_factor=routed_scaling_factor,
+                bias_opt=bias_opt,
+            )
         topk_weights, topk_ids, out = torch_npu.npu_moe_gating_top_k(
             x,
             k=k,
@@ -1400,14 +1489,14 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
 
     @staticmethod
     def kv_cache_load(cache_kv_c, cache_k_pe, block_table, context_seq_len_npu, seq_offset, key, value):
-        torch_npu.npu_gather_pa_kv_cache(
+        _gather_paged_kv_cache(
             cache_kv_c,
             cache_k_pe,
             block_table,
             context_seq_len_npu.contiguous(),
-            seq_offset=seq_offset,
-            key=key,
-            value=value,
+            seq_offset,
+            key,
+            value,
         )
 
     @staticmethod

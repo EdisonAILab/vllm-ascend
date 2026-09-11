@@ -206,6 +206,7 @@ class BlockTable:
             if not isinstance(positions, torch.Tensor):
                 positions = torch.from_numpy(positions)
             self._compute_dcp_slot_mapping(req_indices, positions)
+            self.slot_mapping.copy_to_gpu(req_indices.shape[0])
         else:
             if isinstance(req_indices, torch.Tensor):
                 if req_indices.device.type != "cpu":

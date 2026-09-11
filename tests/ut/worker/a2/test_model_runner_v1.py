@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, call, patch
 
 import numpy as np
 import torch
+import vllm.envs as envs
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
@@ -65,6 +66,123 @@ class TestDSparkAuxCaptureMode(unittest.TestCase):
         )
 
         self.assertFalse(runner._draft_uses_qwen3_gqa_dspark())
+
+
+class TestNPUModelRunnerSlotMapping(unittest.TestCase):
+    def _build_runner(self, *, use_async_spec_decode: bool = False):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.use_async_spec_decode = use_async_spec_decode
+        runner.input_batch = MagicMock()
+        runner.query_start_loc = MagicMock()
+        runner.query_start_loc.gpu = torch.tensor([0, 2, 4], dtype=torch.int32)
+        runner.positions = torch.tensor([127, 128, 128, 129], dtype=torch.int64)
+        return runner
+
+    def test_batch_invariant_mode_uses_cpu_slot_mapping(self):
+        runner = self._build_runner()
+        req_indices = np.array([0, 0, 1, 1], dtype=np.int32)
+        positions = np.array([127, 128, 128, 129], dtype=np.int64)
+
+        with patch.object(envs, "VLLM_BATCH_INVARIANT", True):
+            runner._compute_slot_mapping(
+                num_reqs=2,
+                total_num_scheduled_tokens=4,
+                req_indices=req_indices,
+                positions_np=positions,
+            )
+
+        args = runner.input_batch.block_table.compute_slot_mapping_draft.call_args.args
+        np.testing.assert_array_equal(args[0], req_indices)
+        np.testing.assert_array_equal(args[1], positions)
+        runner.input_batch.block_table.compute_slot_mapping.assert_not_called()
+
+    def test_non_batch_invariant_mode_keeps_npu_slot_mapping(self):
+        runner = self._build_runner()
+        req_indices = np.array([0, 0, 1, 1], dtype=np.int32)
+        positions = np.array([127, 128, 128, 129], dtype=np.int64)
+
+        with patch.object(envs, "VLLM_BATCH_INVARIANT", False):
+            runner._compute_slot_mapping(
+                num_reqs=2,
+                total_num_scheduled_tokens=4,
+                req_indices=req_indices,
+                positions_np=positions,
+            )
+
+        args = runner.input_batch.block_table.compute_slot_mapping.call_args.args
+        self.assertEqual(args[0], 2)
+        torch.testing.assert_close(args[1], runner.query_start_loc.gpu)
+        torch.testing.assert_close(args[2], runner.positions)
+        runner.input_batch.block_table.compute_slot_mapping_draft.assert_not_called()
+
+    def test_async_spec_decode_uses_corrected_npu_positions(self):
+        runner = self._build_runner(use_async_spec_decode=True)
+        req_indices = np.array([0, 0, 1, 1], dtype=np.int32)
+        optimistic_positions = np.array([130, 131, 131, 132], dtype=np.int64)
+
+        with patch.object(envs, "VLLM_BATCH_INVARIANT", True):
+            runner._compute_slot_mapping(
+                num_reqs=2,
+                total_num_scheduled_tokens=4,
+                req_indices=req_indices,
+                positions_np=optimistic_positions,
+            )
+
+        positions = runner.input_batch.block_table.compute_slot_mapping_draft.call_args.args[1]
+        np.testing.assert_array_equal(positions, runner.positions.numpy())
+        self.assertFalse(np.array_equal(positions, optimistic_positions))
+
+
+class TestNPUModelRunnerSamplingIndices(unittest.TestCase):
+    def _build_runner(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.query_start_loc = SimpleNamespace(
+            gpu=torch.tensor([0, 2, 5], dtype=torch.int32)
+        )
+        return runner
+
+    def test_a5_refreshes_non_spec_indices_from_request_boundaries(self):
+        runner = self._build_runner()
+        stale = torch.tensor([6702, 6702], dtype=torch.int32)
+
+        with patch(
+            "vllm_ascend.worker.model_runner_v1.get_ascend_device_type",
+            return_value=AscendDeviceType.A5,
+        ):
+            result = runner._refresh_sampling_logits_indices(stale, None, 2)
+
+        torch.testing.assert_close(
+            result,
+            torch.tensor([1, 4], dtype=torch.int32),
+        )
+
+    def test_a5_keeps_speculative_decode_indices(self):
+        runner = self._build_runner()
+        prepared = torch.tensor([0, 3, 4], dtype=torch.int32)
+
+        with patch(
+            "vllm_ascend.worker.model_runner_v1.get_ascend_device_type",
+            return_value=AscendDeviceType.A5,
+        ):
+            result = runner._refresh_sampling_logits_indices(
+                prepared,
+                MagicMock(),
+                2,
+            )
+
+        self.assertIs(result, prepared)
+
+    def test_non_a5_keeps_prepared_indices(self):
+        runner = self._build_runner()
+        prepared = torch.tensor([1, 4], dtype=torch.int32)
+
+        with patch(
+            "vllm_ascend.worker.model_runner_v1.get_ascend_device_type",
+            return_value=AscendDeviceType.A3,
+        ):
+            result = runner._refresh_sampling_logits_indices(prepared, None, 2)
+
+        self.assertIs(result, prepared)
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):

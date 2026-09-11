@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
@@ -67,6 +68,11 @@ from vllm_ascend.utils import is_950, weak_ref_tensors
 # default max value of sliding window size
 SWA_INT_MAX = 2147483647
 _ATTN_KEYS_BUFFER = None
+_TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
+_TRAINING_PARITY_BOOL_ATTN_MASK = None
+_TRAINING_PARITY_FIA_DISPATCH_COUNT = 0
+_TRAINING_PARITY_FIA_MIN_KV = None
+_TRAINING_PARITY_FIA_MAX_KV = None
 
 
 @register_backend(AttentionBackendEnum.CUSTOM, "ASCEND")
@@ -465,6 +471,8 @@ class AscendAttentionBackendImpl(AttentionImpl):
         # attn_metadata during graph replay. Record the captured layer name only
         # for that path.
         self._layer_name: str | None = None
+        self._training_parity_dense_key: torch.Tensor | None = None
+        self._training_parity_dense_value: torch.Tensor | None = None
 
     def _graph_metadata_layer_name(self, layer: AttentionLayer | None = None) -> str | None:
         layer_name = layer.layer_name if layer is not None else self._layer_name
@@ -1269,6 +1277,158 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         return key, value, block_size, block_table, actual_seq_lengths_kv
 
+    def _use_training_parity_dense_kv(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+    ) -> bool:
+        """Limit dense shadow KV to the validated Qwen3 TP configurations."""
+        if not (
+            _TRAINING_PARITY
+            and attn_metadata.causal
+            and self.attn_type != AttentionType.ENCODER_DECODER
+            and self.sliding_window is None
+            and self.sinks is None
+            and key.dtype == torch.bfloat16
+            and value.dtype == torch.bfloat16
+            and self.num_heads in (16, 32)
+            and self.num_kv_heads in (2, 4)
+            and self.head_size == 128
+            and len(attn_metadata.seq_lens_list) == 1
+        ):
+            return False
+        tp_world_size = get_tensor_model_parallel_world_size()
+        return (
+            tp_world_size <= 2
+            and self.num_heads * tp_world_size == 32
+            and self.num_kv_heads * tp_world_size == 4
+        )
+
+    def _update_training_parity_dense_kv(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: AscendMetadata,
+    ) -> None:
+        """Maintain an append-only dense KV shadow independent of paged-cache layout."""
+        flat_key = key.reshape(-1, self.num_kv_heads, self.head_size)
+        flat_value = value.reshape(-1, self.num_kv_heads, self.head_size)
+        if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+            capacity = int(self.vllm_config.model_config.max_model_len)
+            if flat_key.shape[0] > capacity:
+                raise RuntimeError("training-parity prefill exceeds model capacity")
+            self._training_parity_dense_key = flat_key.new_zeros((capacity, self.num_kv_heads, self.head_size))
+            self._training_parity_dense_value = flat_value.new_zeros((capacity, self.num_kv_heads, self.head_size))
+            self._training_parity_dense_key[: flat_key.shape[0]].copy_(flat_key)
+            self._training_parity_dense_value[: flat_value.shape[0]].copy_(flat_value)
+            return
+
+        if attn_metadata.attn_state != AscendAttentionState.DecodeOnly:
+            return
+        if self._training_parity_dense_key is None or self._training_parity_dense_value is None:
+            raise RuntimeError("training-parity dense KV was not initialized by prefill")
+        sequence_length = attn_metadata.seq_lens_list[0]
+        start = sequence_length - flat_key.shape[0]
+        if start < 0 or sequence_length > self._training_parity_dense_key.shape[0]:
+            raise RuntimeError("training-parity dense KV write is out of bounds")
+        self._training_parity_dense_key[start:sequence_length].copy_(flat_key)
+        self._training_parity_dense_value[start:sequence_length].copy_(flat_value)
+
+    def _use_training_parity_decode_fia(
+        self,
+        query: torch.Tensor,
+        block_size: int,
+        block_table: torch.Tensor | None,
+        actual_seq_lengths_kv: list[int],
+        attn_metadata: AscendMetadata,
+    ) -> bool:
+        """Select the private FIA after dense shadow KV has been initialized."""
+        return (
+            attn_metadata.attn_state == AscendAttentionState.DecodeOnly
+            and query.shape[0] == 1
+            and block_table is not None
+            and attn_metadata.attn_mask is not None
+            and len(actual_seq_lengths_kv) == 1
+            and actual_seq_lengths_kv[0] > block_size
+            and self._training_parity_dense_key is not None
+            and self._training_parity_dense_value is not None
+        )
+
+    def _training_parity_decode_fia(
+        self,
+        query: torch.Tensor,
+        sequence_length: int,
+        atten_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Use dense shadow KV with the length-generic batch-invariant FIA."""
+        global _TRAINING_PARITY_BOOL_ATTN_MASK
+        global _TRAINING_PARITY_FIA_DISPATCH_COUNT
+        global _TRAINING_PARITY_FIA_MIN_KV
+        global _TRAINING_PARITY_FIA_MAX_KV
+
+        dense_key_buffer = self._training_parity_dense_key
+        dense_value_buffer = self._training_parity_dense_value
+        if dense_key_buffer is None or dense_value_buffer is None:
+            raise RuntimeError("training-parity dense KV is unavailable")
+        tp_world_size = get_tensor_model_parallel_world_size()
+        padded_length = cdiv(sequence_length, tp_world_size) * tp_world_size
+        dense_key_buffer[sequence_length:padded_length].zero_()
+        dense_value_buffer[sequence_length:padded_length].zero_()
+        dense_key = dense_key_buffer[:padded_length].contiguous()
+        dense_value = dense_value_buffer[:padded_length].contiguous()
+        padded_query = torch.zeros(
+            (padded_length, self.num_heads, self.head_size),
+            dtype=query.dtype,
+            device=query.device,
+        )
+        padded_query[sequence_length - 1 : sequence_length].copy_(query)
+        if (
+            _TRAINING_PARITY_BOOL_ATTN_MASK is None
+            or _TRAINING_PARITY_BOOL_ATTN_MASK.device != atten_mask.device
+            or _TRAINING_PARITY_BOOL_ATTN_MASK.shape != atten_mask.shape
+        ):
+            _TRAINING_PARITY_BOOL_ATTN_MASK = atten_mask.bool()
+
+        # Importing the extension registers the private operator namespace. A
+        # missing or incompatible vendor must fail here rather than silently
+        # falling back to stock FIA or training FA.
+        import batch_invariant_ops  # type: ignore[import-not-found] # noqa: F401
+
+        fia = (
+            torch.ops.batch_invariant_ops
+            .npu_fused_infer_attention_score_batch_invariant
+        )
+        output, _ = fia(
+            padded_query,
+            dense_key,
+            dense_value,
+            atten_mask=_TRAINING_PARITY_BOOL_ATTN_MASK,
+            block_table=None,
+            input_layout="TND",
+            actual_seq_lengths=[padded_length],
+            actual_seq_lengths_kv=[padded_length],
+            num_key_value_heads=self.num_kv_heads,
+            num_heads=self.num_heads,
+            scale=self.scale,
+            pre_tokens=65536,
+            next_tokens=0,
+            sparse_mode=2,
+            softmax_lse_flag=False,
+        )
+        _TRAINING_PARITY_FIA_DISPATCH_COUNT += 1
+        _TRAINING_PARITY_FIA_MIN_KV = (
+            sequence_length
+            if _TRAINING_PARITY_FIA_MIN_KV is None
+            else min(_TRAINING_PARITY_FIA_MIN_KV, sequence_length)
+        )
+        _TRAINING_PARITY_FIA_MAX_KV = (
+            sequence_length
+            if _TRAINING_PARITY_FIA_MAX_KV is None
+            else max(_TRAINING_PARITY_FIA_MAX_KV, sequence_length)
+        )
+        return output[sequence_length - 1 : sequence_length]
+
     def forward_fused_infer_attention(
         self,
         query: torch.Tensor,
@@ -1290,18 +1450,41 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
+        passed_key = key
         passed_value = value
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache
         )
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
+        if self._use_training_parity_dense_kv(passed_key, passed_value, attn_metadata):
+            self._update_training_parity_dense_kv(passed_key, passed_value, attn_metadata)
         if (
             attn_metadata.attn_state == AscendAttentionState.PrefillNoCache
             and self.attn_type != AttentionType.ENCODER_DECODER
         ):
             key = key[:num_tokens]
             value = value[:num_tokens]
+
+        # FIA does not support non-contiguous K/V strides. Qwen3 GQA keeps V
+        # as a split view of the fused QKV projection, so materialize K/V at
+        # the operator boundary before invoking FIA.
+        key = key.contiguous()
+        value = value.contiguous()
+        if self._use_training_parity_decode_fia(
+            query,
+            block_size,
+            block_table,
+            actual_seq_lengths_kv,
+            attn_metadata,
+        ):
+            attn_output = self._training_parity_decode_fia(
+                query,
+                actual_seq_lengths_kv[0],
+                attn_metadata.attn_mask,
+            )
+            output[:num_tokens] = attn_output.view(num_tokens, self.num_heads, self.head_size)
+            return output
         # Get workspace from cache or calculate it if not present.
         if self.sinks is not None:
             actual_seq_qlen = attn_metadata.actual_seq_lengths_q

@@ -33,7 +33,9 @@ from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.platform import NPUPlatform
-from vllm_ascend.utils import has_rope, is_vl_model
+from vllm_ascend.utils import has_rope, is_950, is_vl_model
+
+_TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
 
 if HAS_TRITON:
     from vllm.model_executor.layers.rotary_embedding.mrope import triton_mrope
@@ -165,6 +167,35 @@ def get_cos_and_sin_slice():
     return _cos_slice, _sin_slice
 
 
+def _rope_forward_torch_neox(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    head_size: int,
+    rotary_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply NeoX RoPE out of place without returning aliases."""
+    positions = positions.flatten()
+    token_count = positions.shape[0]
+    cache = cos_sin_cache.index_select(0, positions).to(query.dtype)
+    cos_half, sin_half = cache.chunk(2, dim=-1)
+    cos = cos_half.repeat(1, 2).unsqueeze(1)
+    sin = sin_half.repeat(1, 2).unsqueeze(1)
+
+    def apply(value: torch.Tensor) -> torch.Tensor:
+        original_shape = value.shape
+        value = value.reshape(token_count, -1, head_size)
+        rotary = value[..., :rotary_dim]
+        passthrough = value[..., rotary_dim:]
+        first, second = torch.chunk(rotary, 2, dim=-1)
+        rotated = torch.cat((-second, first), dim=-1)
+        rotary = rotary * cos + rotated * sin
+        return torch.cat((rotary, passthrough), dim=-1).reshape(original_shape)
+
+    return apply(query), apply(key)
+
+
 def rope_forward_oot(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -178,6 +209,20 @@ def rope_forward_oot(
     query_shape, key_shape = query.shape, key.shape
     if offsets is not None:
         raise NotImplementedError("Batched rotary embedding is currently not supported on NPU.")
+    # The Triton kernel is rejected by the current A5 runtime with ACL error
+    # 207000. The native fallback mutates temporary Q/K buffers while this
+    # custom op is registered as non-mutating, so model execution can reuse
+    # those buffers. Use an out-of-place decomposition for the NeoX layout
+    # used by Qwen3; retain the existing paths for other devices and layouts.
+    if is_950() and is_neox_style:
+        return _rope_forward_torch_neox(
+            positions,
+            query,
+            key,
+            cos_sin_cache,
+            head_size,
+            rotary_dim,
+        )
     if HAS_TRITON:
         num_tokens = query.shape[0]
         query, key = rope_forward_triton(
@@ -260,6 +305,19 @@ class AscendRotaryEmbedding(RotaryEmbedding):
         flash_comm_v1_enabled = _EXTRA_CTX.flash_comm_v1_enabled if is_forward_context_available() else False
         if is_draft_model and self.use_mtp and flash_comm_v1_enabled:
             positions = torch.ops.vllm.maybe_all_gather_and_maybe_unpad(positions.contiguous(), True)
+        if _TRAINING_PARITY:
+            if offsets is not None:
+                raise ValueError("training parity RoPE does not support offsets")
+            if not is_neox_style:
+                raise ValueError("training parity RoPE only supports NeoX layout")
+            return _rope_forward_torch_neox(
+                positions,
+                query,
+                key,
+                self.cos_sin_cache,
+                self.head_size,
+                self.rotary_dim,
+            )
         return torch.ops.vllm.npu_rotary_embedding(
             positions, query, key, self.cos_sin_cache, self.head_size, self.rotary_dim, is_neox_style
         )

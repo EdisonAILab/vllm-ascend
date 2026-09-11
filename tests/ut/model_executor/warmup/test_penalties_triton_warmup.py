@@ -24,8 +24,9 @@ def test_local_vocab_size():
 
 @patch.object(pw, "apply_penalties_triton")
 @patch.object(pw, "get_tensor_model_parallel_world_size", return_value=1)
+@patch.object(pw, "is_950", return_value=False)
 @patch.object(pw, "HAS_TRITON", True)
-def test_penalties_triton_warmup(mock_tp, mock_apply):
+def test_penalties_triton_warmup(mock_is_950, mock_tp, mock_apply):
     worker = make_mock_worker(max_num_seqs=4, max_num_batched_tokens=300, vocab_size=512)
     pw.penalties_triton_warmup(worker)
 
@@ -35,3 +36,15 @@ def test_penalties_triton_warmup(mock_tp, mock_apply):
     assert logits.shape == (4, 512)
     assert prompt_tokens.shape == (4, expected_seq_len)
     assert output_tokens.shape == (4, expected_seq_len)
+
+
+@patch.object(pw, "apply_penalties_triton")
+@patch.object(pw, "is_950", return_value=True)
+@patch.object(pw, "HAS_TRITON", True)
+def test_penalties_triton_warmup_skips_unsupported_a5_kernel(mock_is_950, mock_apply):
+    worker = make_mock_worker(max_num_seqs=4, max_num_batched_tokens=300, vocab_size=512)
+
+    pw.penalties_triton_warmup(worker)
+
+    mock_is_950.assert_called_once_with()
+    mock_apply.assert_not_called()

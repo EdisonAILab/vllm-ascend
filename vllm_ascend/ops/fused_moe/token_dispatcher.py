@@ -20,13 +20,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from abc import ABC, abstractmethod
 from typing import Generic
 
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
-from vllm.distributed.parallel_state import get_ep_group
+from vllm.distributed.parallel_state import get_ep_group, get_tp_group
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import get_dispatch_v2_tokens_capacity, get_mc2_tokens_capacity
@@ -55,6 +56,8 @@ from vllm_ascend.utils import (
 
 EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
 EXPERT_TOKEN_NUMS_TYPE_COUNT = 1
+
+_TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
 
 
 def _get_expert_token_nums_type(token_dispatch_input: MoETokenDispatchInput) -> int:
@@ -391,6 +394,22 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             quant_mode = -1
 
         num_tokens = hidden_states.shape[:-1].numel()
+        if _TRAINING_PARITY:
+            # vLLM's EP group also spans TP ranks for MoE models when expert
+            # parallelism is disabled.  expert_map, rather than ep_size,
+            # distinguishes genuinely sharded experts from TP-local shards.
+            if expert_map is not None:
+                raise ValueError(
+                    "training parity AllGather MoE does not support expert-sharded routing"
+                )
+            flat_experts = topk_ids.reshape(-1)
+            assignment_order = torch.argsort(flat_experts, stable=True)
+            token_indices = torch.arange(
+                num_tokens, device=flat_experts.device, dtype=torch.long
+            ).repeat_interleave(self.top_k)
+            self._training_parity_sorted_token_indices = token_indices.index_select(
+                0, assignment_order
+            )
         apply_router_weight_on_input = token_dispatch_input.routing.apply_router_weight_on_input
         if apply_router_weight_on_input:
             assert topk_weights.dim() == 2, "`topk_weights` should be in shape (num_tokens, topk)"
@@ -422,19 +441,72 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         expert_tokens = expert_tokens.to(torch.int64)
         group_list_type = 1  # `count` mode
 
+        topk_scales = None
+        combine_topk_weights = topk_weights
+        if _TRAINING_PARITY:
+            if with_quant:
+                raise ValueError("training parity MoE currently supports BF16 only")
+            flat_weights = topk_weights.reshape(-1)
+            sorted_weights = torch.empty_like(flat_weights)
+            sorted_weights.scatter_(
+                0, expanded_row_idx.abs().long(), flat_weights
+            )
+            topk_scales = sorted_weights.unsqueeze(-1)
+            combine_topk_weights = torch.ones_like(topk_weights)
+
         return MoETokenDispatchOutput(
             hidden_states=sorted_hidden_states,
             dynamic_scale=dynamic_scale if with_quant else None,
             group_list=expert_tokens,
             group_list_type=group_list_type,
+            topk_scales=topk_scales,
             combine_metadata=MoEAllGatherCombineMetadata(
-                topk_weights=topk_weights,
+                topk_weights=combine_topk_weights,
                 expanded_row_idx=expanded_row_idx,
                 restore_shape=restore_shape,
             ),
         )
 
     def token_combine(self, hidden_states, combine_metadata, bias=None):
+        if _TRAINING_PARITY:
+            tp_group = get_tp_group()
+            if tp_group.world_size > 2:
+                raise ValueError(
+                    "training parity MoE assignment reduction is validated up to TP=2"
+                )
+            if tp_group.world_size > 1:
+                # Megatron expert TP reduces each expert assignment before
+                # unpermuting top-k assignments back to tokens.  vLLM's normal
+                # path does the same sums in the opposite order.
+                hidden_states = tp_group.all_reduce(hidden_states)
+            if bias is not None:
+                raise ValueError("training parity MoE combine does not support bias")
+            sorted_token_indices = self._training_parity_sorted_token_indices
+            num_tokens = combine_metadata.restore_shape[:-1].numel()
+            final_hidden_states = torch.zeros(
+                (num_tokens, hidden_states.shape[-1]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            was_enabled = torch.are_deterministic_algorithms_enabled()
+            torch.use_deterministic_algorithms(True)
+            try:
+                final_hidden_states.index_add_(
+                    0, sorted_token_indices, hidden_states
+                )
+            finally:
+                torch.use_deterministic_algorithms(was_enabled)
+            if tp_group.world_size > 1:
+                # MoERunner still performs its standard late TP all-reduce.
+                # Every rank now has the already-reduced result, so scale by
+                # TP here; the later sum of identical power-of-two-scaled BF16
+                # values restores the result exactly.
+                final_hidden_states.mul_(1.0 / tp_group.world_size)
+            if len(combine_metadata.restore_shape) == 3:
+                final_hidden_states = final_hidden_states.view(
+                    combine_metadata.restore_shape
+                )
+            return final_hidden_states
         final_hidden_states = DeviceOperator.npu_moe_token_unpermute(
             permuted_tokens=hidden_states,
             sorted_indices=combine_metadata.expanded_row_idx,

@@ -13,7 +13,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-
+import os
 
 import torch
 from torch import nn
@@ -23,6 +23,9 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm, RMSNormG
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.triton.fused_norm_gate import layer_norm_fwd_npu
 from vllm_ascend.utils import enable_custom_op
+
+
+_TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
 
 
 class AscendRMSNorm(RMSNorm):
@@ -69,6 +72,14 @@ class AscendRMSNorm(RMSNorm):
 
         if residual is not None:
             residual = torch.ops.vllm.maybe_chunk_residual(x, residual)
+            if _TRAINING_PARITY:
+                residual = x + residual
+                x, _ = torch_npu.npu_rms_norm(
+                    residual, self.weight, self.variance_epsilon
+                )
+                if self.bias_loaded:
+                    x.add_(self.bias)
+                return x, residual
             if enable_custom_op():
                 x, _, residual = torch.ops._C_ascend.npu_add_rms_norm_bias(
                     x, residual, self.weight, self.bias, self.variance_epsilon
