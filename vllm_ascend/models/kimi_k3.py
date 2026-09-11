@@ -876,14 +876,7 @@ class KimiK3MoE(nn.Module):
             quant_config=latent_quant_config,
             prefix=f"{prefix}.routed_expert_down_proj",
         )
-        routed_norm_type = (
-            _KimiDecomposedRMSNorm
-            if kimi_runtime_flag(
-                "VLLM_ASCEND_KIMI_DECOMPOSED_ROUTED_RMS_NORM",
-                reduced_default=True,
-            )
-            else RMSNorm
-        )
+        routed_norm_type = _kimi_routed_rms_norm_type()
         self.routed_expert_norm = (
             routed_norm_type(self.moe_hidden_size, eps=config.rms_norm_eps) if config.latent_moe_use_norm else None
         )
@@ -1070,6 +1063,21 @@ def _kimi_mla_rms_norm_type() -> type[nn.Module]:
         return _KimiReferenceRMSNorm
     if kimi_runtime_flag(
         "VLLM_ASCEND_KIMI_DECOMPOSED_MLA_RMS_NORM",
+        reduced_default=False,
+    ):
+        return _KimiDecomposedRMSNorm
+    return RMSNorm
+
+
+def _kimi_routed_rms_norm_type() -> type[nn.Module]:
+    """Select the reduced routed-expert norm on the Megatron contract."""
+    if kimi_runtime_flag(
+        "VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM",
+        reduced_default=True,
+    ):
+        return _KimiReferenceRMSNorm
+    if kimi_runtime_flag(
+        "VLLM_ASCEND_KIMI_DECOMPOSED_ROUTED_RMS_NORM",
         reduced_default=False,
     ):
         return _KimiDecomposedRMSNorm

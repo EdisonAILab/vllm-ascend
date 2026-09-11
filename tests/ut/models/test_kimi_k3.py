@@ -25,6 +25,7 @@ from vllm_ascend.models.kimi_k3 import (
     _KimiReferenceRMSNorm,
     _KimiDecomposedRMSNorm,
     _kimi_mla_rms_norm_type,
+    _kimi_routed_rms_norm_type,
     _kimi_reference_rowwise_attention_residual_impl,
     _move_module_to_device,
     _reference_mla_forward_decode,
@@ -200,6 +201,33 @@ def test_kimi_k3_explicit_decomposed_mla_rms_norm_override_is_retained():
         side_effect=lambda name, *, reduced_default: values.get(name, reduced_default),
     ):
         assert _kimi_mla_rms_norm_type() is _KimiDecomposedRMSNorm
+
+
+def test_kimi_k3_reduced_routed_rms_norm_defaults_to_megatron_contract():
+    defaults = {}
+
+    def reduced_defaults(name: str, *, reduced_default: bool) -> bool:
+        defaults[name] = reduced_default
+        return reduced_default
+
+    with patch.object(kimi_k3, "kimi_runtime_flag", side_effect=reduced_defaults):
+        assert _kimi_routed_rms_norm_type() is _KimiReferenceRMSNorm
+
+    assert defaults == {"VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM": True}
+
+
+def test_kimi_k3_explicit_decomposed_routed_rms_norm_override_is_retained():
+    values = {
+        "VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM": False,
+        "VLLM_ASCEND_KIMI_DECOMPOSED_ROUTED_RMS_NORM": True,
+    }
+
+    with patch.object(
+        kimi_k3,
+        "kimi_runtime_flag",
+        side_effect=lambda name, *, reduced_default: values.get(name, reduced_default),
+    ):
+        assert _kimi_routed_rms_norm_type() is _KimiDecomposedRMSNorm
 
 
 def test_kimi_k3_decomposed_mla_prefill_matches_rowwise_reference():
