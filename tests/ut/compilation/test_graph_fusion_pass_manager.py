@@ -13,6 +13,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
+import sys
 from unittest.mock import MagicMock, patch
 
 import vllm.envs as envs
@@ -36,10 +37,17 @@ def _qknorm_only_config():
 
 def test_qknorm_rope_fusion_enabled_by_default():
     config = _qknorm_only_config()
+    pass_cls = MagicMock()
+    pass_module = MagicMock(QKNormRopeFusionPass=pass_cls)
 
     with (
         patch.object(envs, "VLLM_BATCH_INVARIANT", False),
-        patch("vllm_ascend.compilation.passes.qknorm_rope_fusion_pass.QKNormRopeFusionPass") as pass_cls,
+        patch.dict(
+            sys.modules,
+            {
+                "vllm_ascend.compilation.passes.qknorm_rope_fusion_pass": pass_module
+            },
+        ),
     ):
         manager = GraphFusionPassManager()
         manager.configure(config)
@@ -50,10 +58,17 @@ def test_qknorm_rope_fusion_enabled_by_default():
 
 def test_batch_invariant_mode_disables_qknorm_rope_fusion():
     config = _qknorm_only_config()
+    pass_cls = MagicMock()
+    pass_module = MagicMock(QKNormRopeFusionPass=pass_cls)
 
     with (
         patch.object(envs, "VLLM_BATCH_INVARIANT", True),
-        patch("vllm_ascend.compilation.passes.qknorm_rope_fusion_pass.QKNormRopeFusionPass") as pass_cls,
+        patch.dict(
+            sys.modules,
+            {
+                "vllm_ascend.compilation.passes.qknorm_rope_fusion_pass": pass_module
+            },
+        ),
     ):
         manager = GraphFusionPassManager()
         manager.configure(config)

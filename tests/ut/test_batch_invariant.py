@@ -239,6 +239,7 @@ class TestBatchInvariant:
         import vllm.envs as envs
 
         mock_library = MagicMock()
+        custom_ops = MagicMock()
         original_library = batch_invariant._training_parity_matmul_LIB
         try:
             batch_invariant._training_parity_matmul_LIB = None
@@ -250,6 +251,11 @@ class TestBatchInvariant:
                     "Library",
                     return_value=mock_library,
                 ),
+                patch.object(
+                    batch_invariant.torch.ops,
+                    "batch_invariant_ops",
+                    custom_ops,
+                ),
             ):
                 batch_invariant.init_training_parity_matmul()
         finally:
@@ -258,12 +264,12 @@ class TestBatchInvariant:
         assert mock_library.impl.call_count == 2
         mock_library.impl.assert_any_call(
             "aten::mm",
-            batch_invariant.torch.ops.batch_invariant_ops.npu_mm_batch_invariant,
+            custom_ops.npu_mm_batch_invariant,
             "NPU",
         )
         mock_library.impl.assert_any_call(
             "aten::matmul",
-            batch_invariant.torch.ops.batch_invariant_ops.npu_matmul_batch_invariant,
+            custom_ops.npu_matmul_batch_invariant,
             "NPU",
         )
 
