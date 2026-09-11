@@ -1261,6 +1261,71 @@ def _decomposed_mla_forward_decode(
     return torch.stack(outputs).reshape(-1, impl.num_heads * impl.v_head_dim)
 
 
+def _kimi_mla_prefill_context_length(
+    prefill_meta,
+    request_index: int,
+    query_length: int,
+) -> int:
+    """Return the already-computed prefix length for one prefill request."""
+    sequence_lengths = getattr(prefill_meta, "context_lens", None)
+    if sequence_lengths is None:
+        return 0
+    context_length = int(sequence_lengths[request_index]) - query_length
+    if context_length < 0:
+        raise ValueError("Kimi MLA prefill sequence length is shorter than its query length")
+    return context_length
+
+
+def _kimi_mla_cached_prefix(
+    impl,
+    kv_c_and_k_pe_cache: tuple[torch.Tensor, ...],
+    prefill_meta,
+    request_index: int,
+    context_length: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Materialize and up-project one reduced Kimi MLA cached prefix."""
+    if context_length <= 0:
+        raise ValueError("Kimi MLA cached-prefix materialization requires a positive length")
+    if len(kv_c_and_k_pe_cache) < 2:
+        raise ValueError("Kimi MLA cached prefill requires latent and positional KV caches")
+
+    k_latent_cache, k_pe_cache = kv_c_and_k_pe_cache[:2]
+    block_size = k_latent_cache.shape[1]
+    k_latent_cache = k_latent_cache.view(
+        -1,
+        impl.num_kv_heads,
+        block_size,
+        impl.kv_lora_rank,
+    )
+    k_pe_cache = k_pe_cache.view(
+        -1,
+        impl.num_kv_heads,
+        block_size,
+        impl.qk_rope_head_dim,
+    )
+    positions = torch.arange(
+        context_length,
+        device=k_latent_cache.device,
+        dtype=torch.long,
+    )
+    logical_blocks = torch.div(positions, block_size, rounding_mode="floor")
+    block_offsets = positions.remainder(block_size)
+    physical_blocks = prefill_meta.block_table[request_index].to(torch.long)[logical_blocks]
+    k_latent = k_latent_cache[physical_blocks, 0, block_offsets]
+    k_pe = k_pe_cache[physical_blocks, 0, block_offsets]
+    key_value = impl.kv_b_proj(k_latent)[0].view(
+        -1,
+        impl.num_heads,
+        impl.qk_nope_head_dim + impl.v_head_dim,
+    )
+    k_nope, value = key_value.split(
+        [impl.qk_nope_head_dim, impl.v_head_dim],
+        dim=-1,
+    )
+    k_pe = k_pe.unsqueeze(1).expand(-1, impl.num_heads, -1)
+    return k_nope, k_pe, value
+
+
 def _reference_mla_forward_prefill(
     impl,
     q_nope: torch.Tensor,
@@ -1272,25 +1337,46 @@ def _reference_mla_forward_prefill(
     attn_metadata,
 ) -> torch.Tensor:
     """Evaluate causal prefill one query row at a time like cached decode."""
-    del kv_c_and_k_pe_cache
     prefill_meta = attn_metadata.prefill
     assert prefill_meta is not None
     outputs = []
     start = 0
-    for end_value in prefill_meta.actual_seq_lengths_q:
+    for request_index, end_value in enumerate(prefill_meta.actual_seq_lengths_q):
         end = int(end_value)
+        query_length = end - start
+        context_length = _kimi_mla_prefill_context_length(
+            prefill_meta,
+            request_index,
+            query_length,
+        )
+        if context_length:
+            prefix_k_nope, prefix_k_pe, prefix_value = _kimi_mla_cached_prefix(
+                impl,
+                kv_c_and_k_pe_cache,
+                prefill_meta,
+                request_index,
+                context_length,
+            )
+        else:
+            prefix_k_nope = k_nope[start:start]
+            prefix_k_pe = k_pe[start:start]
+            prefix_value = value[start:start]
+        sequence_k_nope = torch.cat((prefix_k_nope, k_nope[start:end]), dim=0)
+        sequence_k_pe = torch.cat((prefix_k_pe, k_pe[start:end]), dim=0)
+        sequence_value = torch.cat((prefix_value, value[start:end]), dim=0)
         for token_idx in range(start, end):
-            prefix_slice = slice(start, token_idx + 1)
+            current_offset = token_idx - start
+            visible_length = context_length + current_offset + 1
             scores = torch.einsum(
                 "hd,shd->hs",
                 q_nope[token_idx].float(),
-                k_nope[prefix_slice].float(),
+                sequence_k_nope[:visible_length].float(),
             )
             scores.add_(
                 torch.einsum(
                     "hd,shd->hs",
                     q_pe[token_idx].float(),
-                    k_pe[prefix_slice].float(),
+                    sequence_k_pe[:visible_length].float(),
                 )
             )
             probabilities = torch.softmax(scores * impl.scale, dim=-1)
@@ -1298,7 +1384,7 @@ def _reference_mla_forward_prefill(
                 torch.einsum(
                     "hs,shd->hd",
                     probabilities,
-                    value[prefix_slice].float(),
+                    sequence_value[:visible_length].float(),
                 ).to(q_nope.dtype)
             )
         start = end
@@ -1318,21 +1404,37 @@ def _decomposed_mla_forward_prefill(
     attn_metadata,
 ) -> torch.Tensor:
     """Run reduced Kimi prefill with vectorized FP32 attention reductions."""
-    del kv_c_and_k_pe_cache
     prefill_meta = attn_metadata.prefill
     assert prefill_meta is not None
     outputs = []
     start = 0
-    for end_value in prefill_meta.actual_seq_lengths_q:
+    for request_index, end_value in enumerate(prefill_meta.actual_seq_lengths_q):
         end = int(end_value)
         sequence_length = end - start
         if sequence_length == 0:
             continue
+        context_length = _kimi_mla_prefill_context_length(
+            prefill_meta,
+            request_index,
+            sequence_length,
+        )
         q_nope_sequence = q_nope[start:end].float()
         q_pe_sequence = q_pe[start:end].float()
-        k_nope_sequence = k_nope[start:end].float()
-        k_pe_sequence = k_pe[start:end].float()
-        value_sequence = value[start:end].float()
+        if context_length:
+            prefix_k_nope, prefix_k_pe, prefix_value = _kimi_mla_cached_prefix(
+                impl,
+                kv_c_and_k_pe_cache,
+                prefill_meta,
+                request_index,
+                context_length,
+            )
+        else:
+            prefix_k_nope = k_nope[start:start]
+            prefix_k_pe = k_pe[start:start]
+            prefix_value = value[start:start]
+        k_nope_sequence = torch.cat((prefix_k_nope, k_nope[start:end]), dim=0).float()
+        k_pe_sequence = torch.cat((prefix_k_pe, k_pe[start:end]), dim=0).float()
+        value_sequence = torch.cat((prefix_value, value[start:end]), dim=0).float()
         scores = torch.einsum(
             "thd,shd->hts",
             q_nope_sequence,
@@ -1347,11 +1449,11 @@ def _decomposed_mla_forward_prefill(
         )
         causal_mask = torch.triu(
             torch.ones(
-                (sequence_length, sequence_length),
+                (sequence_length, context_length + sequence_length),
                 dtype=torch.bool,
                 device=q_nope.device,
             ),
-            diagonal=1,
+            diagonal=context_length + 1,
         )
         probabilities = torch.softmax(
             scores.masked_fill(causal_mask.unsqueeze(0), float("-inf")) * impl.scale,

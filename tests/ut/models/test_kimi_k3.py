@@ -246,16 +246,16 @@ def _make_reduced_mla_decode_fixture():
     block_size = 4
     k_latent_cache = torch.randn(
         3,
-        1,
         block_size,
+        1,
         impl.kv_lora_rank,
         generator=generator,
         dtype=torch.bfloat16,
     )
     k_pe_cache = torch.randn(
         3,
-        1,
         block_size,
+        1,
         impl.qk_rope_head_dim,
         generator=generator,
         dtype=torch.bfloat16,
@@ -276,6 +276,68 @@ def _make_reduced_mla_decode_fixture():
     )
     block_table = torch.tensor([[2, 0], [1, 2]], dtype=torch.int32)
     return impl, q_nope, q_pe, k_latent_cache, k_pe_cache, block_size, block_table
+
+
+def test_kimi_k3_decomposed_mla_chunked_prefill_reads_cached_context():
+    (
+        impl,
+        q_nope,
+        q_pe,
+        k_latent_cache,
+        k_pe_cache,
+        block_size,
+        block_table,
+    ) = _make_reduced_mla_decode_fixture()
+    context_length = 3
+    current_k_nope = torch.tensor(
+        [
+            [[0.25, -0.5], [0.75, 1.0]],
+            [[-1.0, 0.5], [0.125, -0.25]],
+        ],
+        dtype=torch.bfloat16,
+    )
+    current_k_pe = torch.tensor(
+        [[[0.5], [-0.75]], [[1.0], [0.25]]],
+        dtype=torch.bfloat16,
+    )
+    current_value = torch.tensor(
+        [
+            [[0.5, -0.25, 0.75], [1.0, 0.25, -0.5]],
+            [[-0.75, 0.5, 0.25], [0.125, -1.0, 0.5]],
+        ],
+        dtype=torch.bfloat16,
+    )
+    metadata = SimpleNamespace(
+        prefill=SimpleNamespace(
+            actual_seq_lengths_q=[2],
+            context_lens=torch.tensor([context_length + 2], dtype=torch.int32),
+            block_table=block_table[:1],
+        )
+    )
+
+    expected = _reference_mla_forward_prefill(
+        impl,
+        q_nope,
+        q_pe,
+        current_k_nope,
+        current_k_pe,
+        current_value,
+        (k_latent_cache, k_pe_cache),
+        metadata,
+    )
+    actual = _decomposed_mla_forward_prefill(
+        impl,
+        q_nope,
+        q_pe,
+        current_k_nope,
+        current_k_pe,
+        current_value,
+        (k_latent_cache, k_pe_cache),
+        metadata,
+    )
+
+    assert actual.shape == (2, impl.num_heads * impl.v_head_dim)
+    assert torch.equal(actual, expected)
 
 
 def test_kimi_k3_decomposed_mla_decode_matches_rowwise_reference():

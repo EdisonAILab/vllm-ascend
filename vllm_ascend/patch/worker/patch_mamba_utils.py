@@ -1,6 +1,7 @@
 # mypy: ignore-errors
 
 import itertools
+import os
 from typing import Any
 
 import torch
@@ -21,6 +22,11 @@ from vllm_ascend.utils import is_310p
 
 def _can_launch_triton_batch_memcpy() -> bool:
     return not is_310p()
+
+
+def _use_reference_mamba_state_copy() -> bool:
+    """Select the opt-in tensor-copy path used by Kimi parity gates."""
+    return os.getenv("VLLM_ASCEND_KIMI_REFERENCE_MAMBA_STATE_COPY", "0") == "1"
 
 
 def _batch_memcpy_triton(src_ptrs, dst_ptrs, sizes):
@@ -182,7 +188,7 @@ def _batch_memcpy_unavailable(src_ptrs, dst_ptrs, sizes):
     )
 
 
-if _can_launch_triton_batch_memcpy():
+if _can_launch_triton_batch_memcpy() and not _use_reference_mamba_state_copy():
     mamba_utils.batch_memcpy_kernel = batch_memcpy_kernel
     mamba_utils.batch_memcpy = _batch_memcpy_triton
     mamba_utils.postprocess_mamba_fused_kernel = postprocess_mamba_fused_kernel
@@ -190,7 +196,12 @@ else:
     mamba_utils.batch_memcpy = _batch_memcpy_unavailable
     mamba_utils.collect_mamba_copy_meta = _collect_mamba_copy_meta_torch
     mamba_utils.do_mamba_copy_block = _do_mamba_copy_block_torch
-    mamba_utils.postprocess_mamba_align_gpu = _postprocess_mamba_align_gpu_cpu_fallback
+    if is_310p():
+        mamba_utils.postprocess_mamba_align_gpu = _postprocess_mamba_align_gpu_cpu_fallback
+    else:
+        # The A5 fused postprocess is sound; only replace the separate
+        # pointer-based preprocess copy that fails for Kimi cache transitions.
+        mamba_utils.postprocess_mamba_fused_kernel = postprocess_mamba_fused_kernel
 
 # Ascend NPU does not support DT_UINT64 in aclnnInplaceZero.
 # MambaCopyBuffers.create() uses torch.uint64 for src_ptrs/dst_ptrs,

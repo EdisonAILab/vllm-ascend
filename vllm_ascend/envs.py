@@ -78,6 +78,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_KIMI_REFERENCE_KDA_CORE": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_KDA_CORE", "0"))),
     "VLLM_ASCEND_KIMI_NATIVE_KDA_CORE": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_NATIVE_KDA_CORE", "0"))),
     "VLLM_ASCEND_KIMI_NATIVE_STATE_OPS": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_NATIVE_STATE_OPS", "0"))),
+    # Use explicit tensor copies for hybrid Kimi Mamba/KDA state movement.
+    # This is a correctness/reference path for prefix-cache qualification; the
+    # default serving path keeps the faster pointer-based Triton batch memcpy.
+    "VLLM_ASCEND_KIMI_REFERENCE_MAMBA_STATE_COPY": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_MAMBA_STATE_COPY", "0"))
+    ),
     "VLLM_ASCEND_KIMI_KDA_NATIVE_NORM_GATE": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_KDA_NATIVE_NORM_GATE", "0"))),
     "VLLM_ASCEND_KIMI_SITU_MIN_ROWS": lambda: int(os.getenv("VLLM_ASCEND_KIMI_SITU_MIN_ROWS", "0")),
     "VLLM_ASCEND_KIMI_GATE_LOWER_BOUND": lambda: os.getenv("VLLM_ASCEND_KIMI_GATE_LOWER_BOUND", None),

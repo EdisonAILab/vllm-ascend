@@ -52,3 +52,17 @@ def test_310p_postprocess_fallback_mirrors_state_copy_without_triton() -> None:
     assert "copy_spec = state_copy_func(state, block_ids, src_block_idx, accept_token_bias + 1)" in src
     assert "_tensor_view_from_data_ptr(state, copy_spec.start_addr, copy_spec.num_elements)" in src
     assert "dst_state.copy_(src_state.clone())" in src
+
+
+def test_kimi_reference_state_copy_is_opt_in_and_preserves_a5_postprocess() -> None:
+    source = PATCH_MAMBA_UTILS.read_text()
+
+    assert "VLLM_ASCEND_KIMI_REFERENCE_MAMBA_STATE_COPY" in source
+    assert (
+        "if _can_launch_triton_batch_memcpy() and not "
+        "_use_reference_mamba_state_copy():"
+    ) in source
+    assert "mamba_utils.collect_mamba_copy_meta = _collect_mamba_copy_meta_torch" in source
+    assert "mamba_utils.do_mamba_copy_block = _do_mamba_copy_block_torch" in source
+    assert "if is_310p():" in source
+    assert "mamba_utils.postprocess_mamba_fused_kernel = postprocess_mamba_fused_kernel" in source
