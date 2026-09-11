@@ -78,6 +78,20 @@ _CUSTOM_OP_REGISTERED = False
 MAX_REDUCED_CAPTURE_SIZES = 4
 
 
+def _configure_fixed_order_all_reduce_split(compilation_config) -> None:
+    """Keep the deterministic TP reduction outside PIECEWISE ACL graphs."""
+    if os.environ.get("VLLM_TP_FIXED_ORDER_ALLREDUCE") != "1":
+        return
+
+    op_name = "vllm::fixed_order_all_reduce_"
+    if op_name not in compilation_config.splitting_ops:
+        compilation_config.splitting_ops.append(op_name)
+        logger.info(
+            "Fixed-order TP reduction: executing %s outside PIECEWISE ACL graphs.",
+            op_name,
+        )
+
+
 class NPUPlatform(Platform):
     _enum = PlatformEnum.OOT
     device_name: str = "npu"
@@ -1205,6 +1219,7 @@ def _setup_compile_backend(
                 "vllm::dsa_forward",
             ]
         )
+        _configure_fixed_order_all_reduce_split(compilation_config)
         # TODO(2026/7/15): Delete the reduced gear after the new driver is released.
         if get_current_hardware_profile().supports(HardwareCapability.REDUCED_CUDAGRAPH_CAPTURE_SIZES):
             _prune_reduced_capture_sizes(vllm_config)
