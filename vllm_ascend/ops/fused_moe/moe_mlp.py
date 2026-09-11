@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
-
+import os
 
 import torch
 import torch_npu
+from torch.nn import functional as F
 from torch.nn.functional import pad
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.triton_utils import HAS_TRITON
@@ -42,6 +43,8 @@ from vllm_ascend.utils import (
 
 ASCEND_DEVICE_TYPE = get_ascend_device_type()
 SITU_MX_DST_TYPE_E4M3FN = 36
+
+_TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
 
 
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb, activation=None):
@@ -766,7 +769,11 @@ def unquant_apply_mlp(
             gate, up = gate_up_out.chunk(2, dim=-1)
             gate.clamp_(max=swiglu_limit)
             up.clamp_(min=-swiglu_limit, max=swiglu_limit)
-        gate_up_out = torch_npu.npu_swiglu(gate_up_out)
+        if _TRAINING_PARITY:
+            gate, up = torch.chunk(gate_up_out, 2, dim=-1)
+            gate_up_out = F.silu(gate) * up
+        else:
+            gate_up_out = torch_npu.npu_swiglu(gate_up_out)
 
     if topk_scales is not None:
         gate_up_out *= topk_scales
