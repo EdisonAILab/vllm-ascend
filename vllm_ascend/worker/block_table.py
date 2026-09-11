@@ -9,6 +9,7 @@ from vllm.v1.kv_cache_interface import KVCacheGroupSpec, MambaSpec, UniformTypeK
 from vllm.v1.utils import CpuGpuBuffer
 
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
+from vllm_ascend.models.kimi_runtime import kimi_runtime_flag
 from vllm_ascend.ops.triton.compute_slot_mapping import (
     _compute_slot_mapping_kernel,
     _next_power_of_2,
@@ -166,7 +167,10 @@ class BlockTable:
             )
             self._compute_dcp_slot_mapping(req_indices, positions)
         else:
-            if os.environ.get("VLLM_ASCEND_NATIVE_SLOT_MAPPING") == "1":
+            if kimi_runtime_flag(
+                "VLLM_ASCEND_NATIVE_SLOT_MAPPING",
+                reduced_default=True,
+            ):
                 req_indices = torch.repeat_interleave(
                     torch.arange(
                         num_reqs,

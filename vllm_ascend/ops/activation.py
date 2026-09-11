@@ -16,7 +16,6 @@
 #
 
 import math
-import os
 from dataclasses import dataclass
 
 import torch
@@ -29,6 +28,8 @@ from vllm.model_executor.layers.activation import (
     SwigluOAIAndMul,
     SwigluStepAndMul,
 )
+
+from vllm_ascend.models.kimi_runtime import kimi_runtime_int
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,7 +57,10 @@ def situ_and_mul(
     if x.shape[-1] % 2 != 0:
         raise ValueError(f"SiTU expects an even last dimension, got {x.shape[-1]}.")
 
-    minimum_rows = int(os.environ.get("VLLM_ASCEND_KIMI_SITU_MIN_ROWS", "0"))
+    minimum_rows = kimi_runtime_int(
+        "VLLM_ASCEND_KIMI_SITU_MIN_ROWS",
+        reduced_default=2,
+    )
     row_count = math.prod(x.shape[:-1])
     padded = 0 < row_count < minimum_rows
     work = x

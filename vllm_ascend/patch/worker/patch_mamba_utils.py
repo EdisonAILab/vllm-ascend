@@ -15,9 +15,14 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
 from vllm.v1.worker.mamba_utils import MambaCopyBuffers
 
+from vllm_ascend.models.kimi_runtime import kimi_runtime_flag
 from vllm_ascend.ops.triton.batch_memcpy import batch_memcpy_kernel
 from vllm_ascend.ops.triton.mamba.postprocess import postprocess_mamba_fused_kernel
 from vllm_ascend.utils import is_310p
+
+
+_original_collect_mamba_copy_meta = mamba_utils.collect_mamba_copy_meta
+_original_do_mamba_copy_block = mamba_utils.do_mamba_copy_block
 
 
 def _can_launch_triton_batch_memcpy() -> bool:
@@ -25,8 +30,11 @@ def _can_launch_triton_batch_memcpy() -> bool:
 
 
 def _use_reference_mamba_state_copy() -> bool:
-    """Select the opt-in tensor-copy path used by Kimi parity gates."""
-    return os.getenv("VLLM_ASCEND_KIMI_REFERENCE_MAMBA_STATE_COPY", "0") == "1"
+    """Select tensor copies explicitly or for the reduced Kimi W4A8 model."""
+    return kimi_runtime_flag(
+        "VLLM_ASCEND_KIMI_REFERENCE_MAMBA_STATE_COPY",
+        reduced_default=True,
+    )
 
 
 def _batch_memcpy_triton(src_ptrs, dst_ptrs, sizes):
@@ -111,6 +119,24 @@ def _do_mamba_copy_block_torch(copy_bufs: mamba_utils.MambaCopyBuffers):
     copy_bufs._tensor_copy_pairs = []
 
 
+def _collect_mamba_copy_meta_dispatch(*args, **kwargs) -> None:
+    copy_bufs = args[0]
+    use_tensor_copy = _use_reference_mamba_state_copy()
+    copy_bufs._use_tensor_copy = use_tensor_copy
+    collect = (
+        _collect_mamba_copy_meta_torch
+        if use_tensor_copy
+        else _original_collect_mamba_copy_meta
+    )
+    collect(*args, **kwargs)
+
+
+def _do_mamba_copy_block_dispatch(copy_bufs: mamba_utils.MambaCopyBuffers):
+    if getattr(copy_bufs, "_use_tensor_copy", _use_reference_mamba_state_copy()):
+        return _do_mamba_copy_block_torch(copy_bufs)
+    return _original_do_mamba_copy_block(copy_bufs)
+
+
 def _postprocess_mamba_align_gpu_cpu_fallback(
     *,
     bufs: "mamba_utils.MambaBuffers",
@@ -188,9 +214,11 @@ def _batch_memcpy_unavailable(src_ptrs, dst_ptrs, sizes):
     )
 
 
-if _can_launch_triton_batch_memcpy() and not _use_reference_mamba_state_copy():
+if _can_launch_triton_batch_memcpy():
     mamba_utils.batch_memcpy_kernel = batch_memcpy_kernel
     mamba_utils.batch_memcpy = _batch_memcpy_triton
+    mamba_utils.collect_mamba_copy_meta = _collect_mamba_copy_meta_dispatch
+    mamba_utils.do_mamba_copy_block = _do_mamba_copy_block_dispatch
     mamba_utils.postprocess_mamba_fused_kernel = postprocess_mamba_fused_kernel
 else:
     mamba_utils.batch_memcpy = _batch_memcpy_unavailable
@@ -250,6 +278,7 @@ def preprocess_mamba(
         mamba_state_idx.pop(req_id, None)
 
     copy_bufs.offset = 0
+    copy_bufs._use_tensor_copy = _use_reference_mamba_state_copy()
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
         prev_state_idx = mamba_state_idx.get(req_id)

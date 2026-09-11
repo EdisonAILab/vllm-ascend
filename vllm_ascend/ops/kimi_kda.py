@@ -48,6 +48,10 @@ from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
+from vllm_ascend.models.kimi_runtime import (
+    kimi_reduced_w4a8_runtime_enabled,
+    kimi_runtime_flag,
+)
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
 from vllm_ascend.ops.kimi_kda_state import kimi_kda_state_shape
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
@@ -222,6 +226,8 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         gate_override = os.environ.get("VLLM_ASCEND_KIMI_GATE_LOWER_BOUND")
         if gate_override is not None:
             self.gate_lower_bound = float(gate_override)
+        elif self.gate_lower_bound is None and kimi_reduced_w4a8_runtime_enabled():
+            self.gate_lower_bound = -5.0
 
         # KDA uses the same hidden states and TP head layout for Q, K, and V.
         # Pack their checkpoint shards into one standard QKV linear so MXFP8
@@ -380,7 +386,10 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         core_attn_out: torch.Tensor,
         output_gate: torch.Tensor,
     ) -> torch.Tensor:
-        if os.environ.get("VLLM_ASCEND_KIMI_KDA_NATIVE_NORM_GATE") == "1":
+        if kimi_runtime_flag(
+            "VLLM_ASCEND_KIMI_KDA_NATIVE_NORM_GATE",
+            reduced_default=True,
+        ):
             # Triton-Ascend 3.2.2 aborts in this fused kernel on 950DT.
             # Keep the same RMSNorm + sigmoid-gate math for the plumbing smoke.
             return self.o_norm.forward_native(core_attn_out, output_gate)
@@ -404,7 +413,10 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         out = torch.empty_like(mixed_qkv)
-        unfused_activation = os.environ.get("VLLM_ASCEND_KIMI_UNFUSED_SHORT_CONV_ACTIVATION") == "1"
+        unfused_activation = kimi_runtime_flag(
+            "VLLM_ASCEND_KIMI_UNFUSED_SHORT_CONV_ACTIVATION",
+            reduced_default=True,
+        )
         torch.ops._C_ascend.npu_causal_conv1d_custom(
             out,
             mixed_qkv,
@@ -545,7 +557,10 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         return torch.cat(outputs, dim=-1)
 
     def _recurrent_gate(self, raw_gate: torch.Tensor) -> torch.Tensor:
-        if os.environ.get("VLLM_ASCEND_KIMI_NATIVE_STATE_OPS") == "1":
+        if kimi_runtime_flag(
+            "VLLM_ASCEND_KIMI_NATIVE_STATE_OPS",
+            reduced_default=True,
+        ):
             gate_input = raw_gate.float() + self.dt_bias.float().reshape(1, 1, -1, self.head_dim)
             decay = self.A_log.float().reshape(1, 1, -1, 1).exp()
             if self.gate_lower_bound is not None:
@@ -702,7 +717,10 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         *,
         num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        if os.environ.get("VLLM_ASCEND_KIMI_NATIVE_KDA_CORE") == "1":
+        if kimi_runtime_flag(
+            "VLLM_ASCEND_KIMI_NATIVE_KDA_CORE",
+            reduced_default=True,
+        ):
             if num_accepted_tokens is not None:
                 raise NotImplementedError("native reduced-shape KDA does not support speculative decode")
             return self._run_native_kda(
@@ -816,7 +834,10 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
             self._tap("reference_core_output", reference_output)
             return reference_output
 
-        if os.environ.get("VLLM_ASCEND_KIMI_NATIVE_KDA_CORE") == "1":
+        if kimi_runtime_flag(
+            "VLLM_ASCEND_KIMI_NATIVE_KDA_CORE",
+            reduced_default=True,
+        ):
             return self._run_native_kda(
                 q,
                 k,
@@ -832,7 +853,10 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         # The recurrent cache uses [H,V,K].  PR141's AscendC prefill operator
         # uses [H,K,V], so transpose only at that operator boundary.
         initial_state_vk = recurrent_state[state_indices].contiguous()
-        native_state_ops = os.environ.get("VLLM_ASCEND_KIMI_NATIVE_STATE_OPS") == "1"
+        native_state_ops = kimi_runtime_flag(
+            "VLLM_ASCEND_KIMI_NATIVE_STATE_OPS",
+            reduced_default=True,
+        )
         if native_state_ops:
             has_initial_state = has_initial_state.to(
                 device=initial_state_vk.device,

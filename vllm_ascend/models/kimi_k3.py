@@ -108,6 +108,10 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+from vllm_ascend.models.kimi_runtime import (
+    configure_kimi_reduced_w4a8_runtime,
+    kimi_runtime_flag,
+)
 from vllm_ascend.ops.activation import AscendSituAndMul, SituActivationConfig
 from vllm_ascend.ops.kimi_kda import uses_kimi_k3_global_inputs_embeds
 from vllm_ascend.ops.kimi_kda_state import kimi_kda_state_shape
@@ -802,7 +806,10 @@ class _KimiRoutedOutputTransform(nn.Module):
         if self.parity_tap_prefix is not None:
             _parity_tap(f"{self.parity_tap_prefix}_combined", hidden_states)
         if norm is not None:
-            if os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM") == "1":
+            if kimi_runtime_flag(
+                "VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM",
+                reduced_default=False,
+            ):
                 input_dtype = hidden_states.dtype
                 normalized = hidden_states.float()
                 normalized = normalized * torch.rsqrt(
@@ -849,7 +856,10 @@ class KimiK3MoE(nn.Module):
         # The Ascend MoE runner can schedule the router projection internally
         # with the shared-expert work. Its post-load FP32 copy is made from
         # this BF16 parameter, preserving Kimi's BF16-rounded-weight contract.
-        self._use_internal_router_fp32 = os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32") == "1"
+        self._use_internal_router_fp32 = kimi_runtime_flag(
+            "VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32",
+            reduced_default=True,
+        )
         if self._use_internal_router_fp32:
             self.gate.precast_fp32_weight = True
         self.register_buffer(
@@ -867,7 +877,12 @@ class KimiK3MoE(nn.Module):
             prefix=f"{prefix}.routed_expert_down_proj",
         )
         routed_norm_type = (
-            _KimiDecomposedRMSNorm if os.environ.get("VLLM_ASCEND_KIMI_DECOMPOSED_ROUTED_RMS_NORM") == "1" else RMSNorm
+            _KimiDecomposedRMSNorm
+            if kimi_runtime_flag(
+                "VLLM_ASCEND_KIMI_DECOMPOSED_ROUTED_RMS_NORM",
+                reduced_default=True,
+            )
+            else RMSNorm
         )
         self.routed_expert_norm = (
             routed_norm_type(self.moe_hidden_size, eps=config.rms_norm_eps) if config.latent_moe_use_norm else None
@@ -938,7 +953,10 @@ class KimiK3MoE(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_size)
         if self.parity_tap_prefix is not None:
             _parity_tap("02_moe_input", hidden_states)
-        use_reference_router_fp32 = os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32") == "1"
+        use_reference_router_fp32 = kimi_runtime_flag(
+            "VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32",
+            reduced_default=True,
+        )
         if use_reference_router_fp32 and getattr(self, "_use_internal_router_fp32", False):
             if not self.experts.is_internal_router:
                 raise RuntimeError("Kimi K3 internal FP32 router weight was not prepared after checkpoint loading")
@@ -1517,9 +1535,15 @@ class KimiK3MLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.fused_qkv_a_proj",
         )
-        if os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_MLA_RMS_NORM") == "1":
+        if kimi_runtime_flag(
+            "VLLM_ASCEND_KIMI_REFERENCE_MLA_RMS_NORM",
+            reduced_default=False,
+        ):
             norm_type = _KimiReferenceRMSNorm
-        elif os.environ.get("VLLM_ASCEND_KIMI_DECOMPOSED_MLA_RMS_NORM") == "1":
+        elif kimi_runtime_flag(
+            "VLLM_ASCEND_KIMI_DECOMPOSED_MLA_RMS_NORM",
+            reduced_default=True,
+        ):
             norm_type = _KimiDecomposedRMSNorm
         else:
             norm_type = RMSNorm
@@ -1599,8 +1623,14 @@ class KimiK3MLAAttention(nn.Module):
         )
         if mla_impl.kimi_reduced_shape_decode:
             mla_impl.kimi_reduced_shape_rope_dim = _KIMI_MLA_KERNEL_ROPE_DIM
-        reference_mla = os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_MLA_DECODE") == "1"
-        decomposed_mla = os.environ.get("VLLM_ASCEND_KIMI_DECOMPOSED_MLA_ATTENTION") == "1"
+        reference_mla = kimi_runtime_flag(
+            "VLLM_ASCEND_KIMI_REFERENCE_MLA_DECODE",
+            reduced_default=False,
+        )
+        decomposed_mla = kimi_runtime_flag(
+            "VLLM_ASCEND_KIMI_DECOMPOSED_MLA_ATTENTION",
+            reduced_default=True,
+        )
         if reference_mla or decomposed_mla:
             # The A5 fused MLA prolog requires the production 512-wide KV
             # latent.  Keep the normal paged cache, but route this deliberately
@@ -1673,12 +1703,21 @@ def _apply_attention_residual(
     norm: RMSNorm,
 ) -> torch.Tensor:
     """Apply K3's learned normalized mixture over residual block starts."""
-    if os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_ATTN_RES") == "1":
-        if os.environ.get("VLLM_ASCEND_KIMI_VECTORIZED_ATTN_RES") == "1":
+    if kimi_runtime_flag(
+        "VLLM_ASCEND_KIMI_REFERENCE_ATTN_RES",
+        reduced_default=True,
+    ):
+        if kimi_runtime_flag(
+            "VLLM_ASCEND_KIMI_VECTORIZED_ATTN_RES",
+            reduced_default=False,
+        ):
             rows = torch.cat((block_residual, prefix_sum.unsqueeze(1)), dim=1)
             score_weight = norm.weight.float() * projection.weight.squeeze(0).float()
             rows_float = rows.float()
-            if os.environ.get("VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_RMS_NORM") == "1":
+            if kimi_runtime_flag(
+                "VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_RMS_NORM",
+                reduced_default=False,
+            ):
                 normalized, _ = torch_npu.npu_rms_norm(
                     rows_float,
                     norm.weight.float(),
@@ -1689,7 +1728,10 @@ def _apply_attention_residual(
                 normalized = rows_float * torch.rsqrt(
                     rows_float.square().mean(dim=-1, keepdim=True) + norm.variance_epsilon
                 )
-            if os.environ.get("VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_SCORE_MATMUL") == "1":
+            if kimi_runtime_flag(
+                "VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_SCORE_MATMUL",
+                reduced_default=False,
+            ):
                 scores = torch.matmul(
                     normalized,
                     score_weight.unsqueeze(-1),
@@ -1697,7 +1739,10 @@ def _apply_attention_residual(
             else:
                 scores = (normalized * score_weight).sum(dim=-1)
             probabilities = torch.softmax(scores, dim=-1)
-            if os.environ.get("VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_MIX_MATMUL") == "1":
+            if kimi_runtime_flag(
+                "VLLM_ASCEND_KIMI_ATTN_RES_NATIVE_MIX_MATMUL",
+                reduced_default=False,
+            ):
                 return (
                     torch.matmul(
                         probabilities.unsqueeze(1),
@@ -1725,7 +1770,10 @@ def _apply_attention_residual(
 
     use_triton_attention_residual = (
         apply_attn_res is not None
-        and os.environ.get("VLLM_ASCEND_KIMI_NATIVE_ATTN_RES") != "1"
+        and not kimi_runtime_flag(
+            "VLLM_ASCEND_KIMI_NATIVE_ATTN_RES",
+            reduced_default=True,
+        )
         and prefix_sum.device.type == "npu"
         and prefix_sum.numel() > 0
     )
@@ -1901,6 +1949,16 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config: KimiK3TextConfig = vllm_config.model_config.hf_text_config
+        reduced_w4a8 = configure_kimi_reduced_w4a8_runtime(vllm_config)
+        if reduced_w4a8:
+            logger.info(
+                "KIMI_REDUCED_W4A8_DEFAULT_PROFILE hidden=%d layers=%d "
+                "heads=%d kv_lora_rank=%d",
+                config.hidden_size,
+                config.num_hidden_layers,
+                config.num_attention_heads,
+                config.kv_lora_rank,
+            )
         self.config = config
         self.vocab_size = config.vocab_size
 
