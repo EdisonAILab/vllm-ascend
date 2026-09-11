@@ -10,6 +10,7 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.triton_utils import HAS_TRITON
 
 from vllm_ascend.ops.triton.penalty import apply_penalties_triton
+from vllm_ascend.utils import is_950
 
 if TYPE_CHECKING:
     from vllm_ascend.worker.worker import NPUWorker
@@ -49,7 +50,7 @@ def _make_history_tokens(
 @torch.inference_mode()
 def penalties_triton_warmup(worker: NPUWorker) -> None:
     """JIT bincount and penalty Triton kernels before the first sampling with penalties."""
-    if not HAS_TRITON:
+    if not HAS_TRITON or is_950():
         return
 
     device = worker.device

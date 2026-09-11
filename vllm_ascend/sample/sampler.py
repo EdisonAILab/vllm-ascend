@@ -10,7 +10,7 @@ from vllm.v1.sample.sampler import Sampler
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.sample.penalties import apply_all_penalties
-from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, global_stream, npu_stream_switch
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type, global_stream, is_950, npu_stream_switch
 
 DEFAULT_LOGPROBS_MODE = "raw_logprobs"
 
@@ -52,9 +52,9 @@ class AscendSampler(Sampler):
         output_token_ids: list[list[int]],
     ) -> torch.Tensor:
         """Use Triton-Ascend penalties on NPU when Triton is available; else vLLM default."""
-        if not HAS_TRITON:
+        if not HAS_TRITON or is_950():
             logger.warning_once(
-                "[sample/sampler] Triton not available, falling back to vLLM default "
+                "[sample/sampler] Triton penalties unavailable on this device, falling back to vLLM default "
                 "penalty implementation. Penalty performance may be degraded on NPU. "
             )
             return Sampler.apply_penalties(logits, sampling_metadata, output_token_ids)
