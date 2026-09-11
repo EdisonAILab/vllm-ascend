@@ -167,6 +167,35 @@ def get_cos_and_sin_slice():
     return _cos_slice, _sin_slice
 
 
+def _rope_forward_torch_neox(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    head_size: int,
+    rotary_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply NeoX RoPE out of place without returning aliases."""
+    positions = positions.flatten()
+    token_count = positions.shape[0]
+    cache = cos_sin_cache.index_select(0, positions).to(query.dtype)
+    cos_half, sin_half = cache.chunk(2, dim=-1)
+    cos = cos_half.repeat(1, 2).unsqueeze(1)
+    sin = sin_half.repeat(1, 2).unsqueeze(1)
+
+    def apply(value: torch.Tensor) -> torch.Tensor:
+        original_shape = value.shape
+        value = value.reshape(token_count, -1, head_size)
+        rotary = value[..., :rotary_dim]
+        passthrough = value[..., rotary_dim:]
+        first, second = torch.chunk(rotary, 2, dim=-1)
+        rotated = torch.cat((-second, first), dim=-1)
+        rotary = rotary * cos + rotated * sin
+        return torch.cat((rotary, passthrough), dim=-1).reshape(original_shape)
+
+    return apply(query), apply(key)
+
+
 def rope_forward_oot(
     positions: torch.Tensor,
     query: torch.Tensor,
@@ -180,11 +209,21 @@ def rope_forward_oot(
     query_shape, key_shape = query.shape, key.shape
     if offsets is not None:
         raise NotImplementedError("Batched rotary embedding is currently not supported on NPU.")
-    # The Triton RoPE kernel is rejected by the current A5 runtime with
-    # ACL error 207000. The native operator is graph-compatible and applies
-    # RoPE independently to each token, so keep Triton on other devices and
-    # use the existing native path on A5.
-    if HAS_TRITON and not is_950():
+    # The Triton kernel is rejected by the current A5 runtime with ACL error
+    # 207000. The native fallback mutates temporary Q/K buffers while this
+    # custom op is registered as non-mutating, so model execution can reuse
+    # those buffers. Use an out-of-place decomposition for the NeoX layout
+    # used by Qwen3; retain the existing paths for other devices and layouts.
+    if is_950() and is_neox_style:
+        return _rope_forward_torch_neox(
+            positions,
+            query,
+            key,
+            cos_sin_cache,
+            head_size,
+            rotary_dim,
+        )
+    if HAS_TRITON:
         num_tokens = query.shape[0]
         query, key = rope_forward_triton(
             query.view(num_tokens, -1, head_size),
@@ -271,24 +310,14 @@ class AscendRotaryEmbedding(RotaryEmbedding):
                 raise ValueError("training parity RoPE does not support offsets")
             if not is_neox_style:
                 raise ValueError("training parity RoPE only supports NeoX layout")
-            positions = positions.flatten()
-            token_count = positions.shape[0]
-            cache = self.cos_sin_cache.index_select(0, positions).to(query.dtype)
-            cos_half, sin_half = cache.chunk(2, dim=-1)
-            cos = cos_half.repeat(1, 2).unsqueeze(1)
-            sin = sin_half.repeat(1, 2).unsqueeze(1)
-
-            def apply(value):
-                original_shape = value.shape
-                value = value.view(token_count, -1, self.head_size)
-                rotary = value[..., : self.rotary_dim]
-                passthrough = value[..., self.rotary_dim :]
-                first, second = torch.chunk(rotary, 2, dim=-1)
-                rotated = torch.cat((-second, first), dim=-1)
-                rotary = rotary * cos + rotated * sin
-                return torch.cat((rotary, passthrough), dim=-1).reshape(original_shape)
-
-            return apply(query), apply(key)
+            return _rope_forward_torch_neox(
+                positions,
+                query,
+                key,
+                self.cos_sin_cache,
+                self.head_size,
+                self.rotary_dim,
+            )
         return torch.ops.vllm.npu_rotary_embedding(
             positions, query, key, self.cos_sin_cache, self.head_size, self.rotary_dim, is_neox_style
         )

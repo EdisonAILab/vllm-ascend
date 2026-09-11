@@ -65,9 +65,11 @@ def _make_tensors(seq_len=SEQ_LEN, num_heads=NUM_HEADS, head_size=HEAD_SIZE):
 @patch("vllm_ascend.ops.rotary_embedding.torch_npu._npu_rotary_embedding")
 @patch("vllm_ascend.ops.rotary_embedding.is_950", return_value=True)
 @patch("vllm_ascend.ops.rotary_embedding.HAS_TRITON", True)
-def test_rope_forward_oot_uses_native_operator_on_a5(mock_is_950, mock_native, mock_triton):
+def test_rope_forward_oot_uses_out_of_place_torch_on_a5(mock_is_950, mock_native, mock_triton):
     positions, query, key = _make_tensors()
     cos_sin_cache = torch.randn(MAX_POS, ROTARY_DIM)
+    query_before = query.clone()
+    key_before = key.clone()
 
     actual_query, actual_key = rope_forward_oot(
         positions,
@@ -80,10 +82,28 @@ def test_rope_forward_oot_uses_native_operator_on_a5(mock_is_950, mock_native, m
     )
 
     mock_is_950.assert_called_once_with()
-    mock_native.assert_called_once()
+    mock_native.assert_not_called()
     mock_triton.assert_not_called()
     assert actual_query.shape == query.shape
     assert actual_key.shape == key.shape
+    assert actual_query.data_ptr() != query.data_ptr()
+    assert actual_key.data_ptr() != key.data_ptr()
+    assert torch.equal(query, query_before)
+    assert torch.equal(key, key_before)
+
+    cache = cos_sin_cache.index_select(0, positions)
+    cos_half, sin_half = cache.chunk(2, dim=-1)
+    cos = cos_half.repeat(1, 2).unsqueeze(1)
+    sin = sin_half.repeat(1, 2).unsqueeze(1)
+
+    def reference(value):
+        value = value.reshape(SEQ_LEN, NUM_HEADS, HEAD_SIZE)
+        first, second = value.chunk(2, dim=-1)
+        rotated = torch.cat((-second, first), dim=-1)
+        return (value * cos + rotated * sin).reshape(SEQ_LEN, -1)
+
+    torch.testing.assert_close(actual_query, reference(query_before))
+    torch.testing.assert_close(actual_key, reference(key_before))
 
 
 @patch("vllm_ascend.ops.rotary_embedding.rope_forward_triton", create=True)
