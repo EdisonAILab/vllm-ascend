@@ -1,4 +1,5 @@
 import importlib
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -14,6 +15,7 @@ from vllm_ascend.ascend_forward_context import MoECommType, override_mrv2_in_pro
 from vllm_ascend.device.hardware_profile import get_hardware_profile
 from vllm_ascend.platform import (
     NPUPlatform,
+    _configure_fixed_order_all_reduce_split,
     _setup_compile_backend,
     _validate_eplb_config,
     _validate_sfa_dcp_kv_sp,
@@ -98,6 +100,32 @@ class TestNPUPlatform(TestBase):
         self.assertEqual(NPUPlatform.simple_compile_backend, "eager")
         self.assertEqual(NPUPlatform.ray_device_key, "NPU")
         self.assertEqual(NPUPlatform.device_control_env_var, "ASCEND_RT_VISIBLE_DEVICES")
+
+    def test_fixed_order_all_reduce_is_piecewise_split(self):
+        config = SimpleNamespace(splitting_ops=["vllm::unified_attention_with_output"])
+
+        with patch.dict(os.environ, {"VLLM_TP_FIXED_ORDER_ALLREDUCE": "1"}):
+            _configure_fixed_order_all_reduce_split(config)
+            _configure_fixed_order_all_reduce_split(config)
+
+        self.assertEqual(
+            config.splitting_ops,
+            [
+                "vllm::unified_attention_with_output",
+                "vllm::fixed_order_all_reduce_",
+            ],
+        )
+
+    def test_native_all_reduce_does_not_add_fixed_order_split(self):
+        config = SimpleNamespace(splitting_ops=["vllm::unified_attention_with_output"])
+
+        with patch.dict(os.environ, {}, clear=True):
+            _configure_fixed_order_all_reduce_split(config)
+
+        self.assertEqual(
+            config.splitting_ops,
+            ["vllm::unified_attention_with_output"],
+        )
 
     @patch("vllm_ascend.platform.enable_sp", return_value=False)
     @patch("vllm_ascend.platform.enable_sfa_dcp_replicated_indexer", return_value=True)
