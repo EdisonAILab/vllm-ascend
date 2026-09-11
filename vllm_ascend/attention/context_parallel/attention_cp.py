@@ -457,7 +457,7 @@ class AscendAttentionDCPImpl(DCPImplMixin, AscendAttentionBackendImpl):
                 ),
             )
 
-        prefix_chunk_output, prefix_chunk_lse = torch.ops.npu.npu_fused_infer_attention_score(
+        prefix_chunk_output, prefix_chunk_lse = torch_npu.npu_fused_infer_attention_score(
             query,
             key.contiguous(),
             value.contiguous(),
@@ -568,7 +568,7 @@ class AscendAttentionDCPImpl(DCPImplMixin, AscendAttentionBackendImpl):
             # with the prefill computation.
             record_attention_compute_start()
 
-            attn_output_prefill, attn_lse_prefill = torch.ops.npu.npu_fused_infer_attention_score(
+            attn_output_prefill, attn_lse_prefill = torch_npu.npu_fused_infer_attention_score(
                 prefill_query,
                 key.contiguous(),
                 value.contiguous(),
