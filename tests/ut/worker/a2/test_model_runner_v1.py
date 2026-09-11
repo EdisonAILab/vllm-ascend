@@ -133,6 +133,58 @@ class TestNPUModelRunnerSlotMapping(unittest.TestCase):
         self.assertFalse(np.array_equal(positions, optimistic_positions))
 
 
+class TestNPUModelRunnerSamplingIndices(unittest.TestCase):
+    def _build_runner(self):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.query_start_loc = SimpleNamespace(
+            gpu=torch.tensor([0, 2, 5], dtype=torch.int32)
+        )
+        return runner
+
+    def test_a5_refreshes_non_spec_indices_from_request_boundaries(self):
+        runner = self._build_runner()
+        stale = torch.tensor([6702, 6702], dtype=torch.int32)
+
+        with patch(
+            "vllm_ascend.worker.model_runner_v1.get_ascend_device_type",
+            return_value=AscendDeviceType.A5,
+        ):
+            result = runner._refresh_sampling_logits_indices(stale, None, 2)
+
+        torch.testing.assert_close(
+            result,
+            torch.tensor([1, 4], dtype=torch.int32),
+        )
+
+    def test_a5_keeps_speculative_decode_indices(self):
+        runner = self._build_runner()
+        prepared = torch.tensor([0, 3, 4], dtype=torch.int32)
+
+        with patch(
+            "vllm_ascend.worker.model_runner_v1.get_ascend_device_type",
+            return_value=AscendDeviceType.A5,
+        ):
+            result = runner._refresh_sampling_logits_indices(
+                prepared,
+                MagicMock(),
+                2,
+            )
+
+        self.assertIs(result, prepared)
+
+    def test_non_a5_keeps_prepared_indices(self):
+        runner = self._build_runner()
+        prepared = torch.tensor([1, 4], dtype=torch.int32)
+
+        with patch(
+            "vllm_ascend.worker.model_runner_v1.get_ascend_device_type",
+            return_value=AscendDeviceType.A3,
+        ):
+            result = runner._refresh_sampling_logits_indices(prepared, None, 2)
+
+        self.assertIs(result, prepared)
+
+
 class TestNPUModelRunnerKVCache(unittest.TestCase):
     def _build_runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)

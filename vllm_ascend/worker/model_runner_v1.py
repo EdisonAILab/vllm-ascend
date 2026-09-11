@@ -1348,6 +1348,26 @@ class NPUModelRunner(GPUModelRunner):
             self.positions[:total_num_scheduled_tokens],
         )
 
+    def _refresh_sampling_logits_indices(
+        self,
+        logits_indices: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        num_reqs: int,
+    ) -> torch.Tensor:
+        """Keep A5 sampling indices out of the model-forward lifetime.
+
+        Non-speculative indices are derived from the persistent request-boundary
+        buffer. Rebuild them after forward on A5 because model execution can
+        overwrite a small temporary allocated before forward. Speculative decode
+        owns a different index layout and must retain its prepared tensor.
+        """
+        if (
+            get_ascend_device_type() == AscendDeviceType.A5
+            and spec_decode_metadata is None
+        ):
+            return self.query_start_loc.gpu[1 : num_reqs + 1] - 1
+        return logits_indices
+
     def _build_attn_state(self, num_reqs, num_scheduled_tokens, num_valid_tokens):
         if np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] == 0):
             attn_state = AscendAttentionState.PrefillNoCache
@@ -2174,6 +2194,11 @@ class NPUModelRunner(GPUModelRunner):
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+            )
+            logits_indices = self._refresh_sampling_logits_indices(
+                logits_indices,
+                spec_decode_metadata,
+                num_reqs,
             )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
