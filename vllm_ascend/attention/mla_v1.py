@@ -1581,6 +1581,13 @@ class AscendMLAImpl(MLAAttentionImpl):
             value_cache=kv_cache[1],
             slot_mapping=slots,
         )
+        if getattr(self, "kimi_parity_layer", None) == 4:
+            from vllm_ascend.models.kimi_k3 import _parity_tap
+
+            _parity_tap("04_mla_cache_slots", slots.unsqueeze(0))
+            _parity_tap("04_mla_cache_write_values", kv_c_normed.unsqueeze(0))
+            cached_values = kv_cache[0].view(-1, self.kv_lora_rank)[slots.to(torch.long)]
+            _parity_tap("04_mla_cache_readback", cached_values.unsqueeze(0))
         return k_pe, kv_c_normed
 
     def exec_kv_decode(

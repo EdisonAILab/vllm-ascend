@@ -1,4 +1,5 @@
 import importlib
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -9,7 +10,7 @@ from vllm.v1.attention.selector import AttentionSelectorConfig  # type: ignore
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_forward_context import MoECommType, override_mrv2_in_profile_run
-from vllm_ascend.platform import NPUPlatform
+from vllm_ascend.platform import NPUPlatform, _configure_fixed_order_all_reduce_split
 from vllm_ascend.utils import (
     ASCEND_QUANTIZATION_METHOD,
     COMPRESSED_TENSORS_METHOD,
@@ -87,6 +88,32 @@ class TestNPUPlatform(TestBase):
 
     def test_is_sleep_mode_available(self):
         self.assertTrue(self.platform.is_sleep_mode_available())
+
+    def test_fixed_order_all_reduce_is_piecewise_split(self):
+        config = MagicMock(splitting_ops=["vllm::unified_attention_with_output"])
+
+        with patch.dict(os.environ, {"VLLM_TP_FIXED_ORDER_ALLREDUCE": "1"}):
+            _configure_fixed_order_all_reduce_split(config)
+            _configure_fixed_order_all_reduce_split(config)
+
+        self.assertEqual(
+            config.splitting_ops,
+            [
+                "vllm::unified_attention_with_output",
+                "vllm::fixed_order_all_reduce_",
+            ],
+        )
+
+    def test_native_all_reduce_does_not_add_fixed_order_split(self):
+        config = MagicMock(splitting_ops=["vllm::unified_attention_with_output"])
+
+        with patch.dict(os.environ, {}, clear=True):
+            _configure_fixed_order_all_reduce_split(config)
+
+        self.assertEqual(
+            config.splitting_ops,
+            ["vllm::unified_attention_with_output"],
+        )
 
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")

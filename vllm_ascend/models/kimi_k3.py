@@ -134,6 +134,7 @@ if HAS_TRITON:
 
 _KIMI_MLAPO_KV_LORA_RANK = 512
 _KIMI_MLA_KERNEL_ROPE_DIM = 64
+_PARITY_TAP_COUNTS: dict[str, int] = {}
 
 
 def _kimi_reference_rowwise_attention_residual_impl(
@@ -220,8 +221,15 @@ def _parity_tap(name: str, tensor: torch.Tensor) -> None:
     expected_rows = (expected_tokens, 1) if name == "11_logits" else (expected_tokens,)
     if tensor.ndim == 0 or tensor.shape[0] not in expected_rows:
         return
+    filename = f"{name}.pt"
+    if os.environ.get("KIMI_PARITY_TAP_APPEND") == "1":
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        output_dir = os.path.join(output_dir, f"rank_{rank:02d}")
+        count = _PARITY_TAP_COUNTS.get(name, 0)
+        _PARITY_TAP_COUNTS[name] = count + 1
+        filename = f"{name}_{count:03d}.pt"
     os.makedirs(output_dir, exist_ok=True)
-    torch.save(tensor.detach().cpu().contiguous(), os.path.join(output_dir, f"{name}.pt"))
+    torch.save(tensor.detach().cpu().contiguous(), os.path.join(output_dir, filename))
 
 
 def _routed_latent_quant_config(
@@ -1271,6 +1279,14 @@ def _decomposed_mla_forward_decode(
             [impl.qk_nope_head_dim, impl.v_head_dim],
             dim=-1,
         )
+        tap_decode = getattr(impl, "kimi_parity_layer", None) == 4
+        if tap_decode:
+            _parity_tap("04_mla_decode_physical_blocks", physical_blocks.unsqueeze(0))
+            _parity_tap("04_mla_decode_k_latent", k_latent.unsqueeze(0))
+            _parity_tap("04_mla_decode_k_pe", k_pe.unsqueeze(0))
+            _parity_tap("04_mla_decode_key_value", key_value.unsqueeze(0))
+            _parity_tap("04_mla_decode_q_nope", q_nope[request_index].unsqueeze(0))
+            _parity_tap("04_mla_decode_q_pe", q_pe[request_index].unsqueeze(0))
         k_pe = k_pe.unsqueeze(1).expand(-1, impl.num_heads, -1)
         scores = torch.einsum(
             "hd,shd->hs",
@@ -1284,7 +1300,11 @@ def _decomposed_mla_forward_decode(
                 k_pe.float(),
             )
         )
+        if tap_decode:
+            _parity_tap("04_mla_decode_scores", scores.unsqueeze(0))
         sequence_length = decode_meta.seq_lens_device[request_index]
+        if tap_decode:
+            _parity_tap("04_mla_decode_sequence_length", sequence_length.reshape(1))
         output = torch.zeros(
             (impl.num_heads, impl.v_head_dim),
             dtype=q_nope.dtype,
@@ -1305,6 +1325,8 @@ def _decomposed_mla_forward_decode(
                 candidate,
                 output,
             )
+        if tap_decode:
+            _parity_tap("04_mla_decode_output", output.unsqueeze(0))
         outputs.append(output)
     return torch.stack(outputs).reshape(-1, impl.num_heads * impl.v_head_dim)
 

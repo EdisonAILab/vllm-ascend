@@ -19,6 +19,7 @@ from collections.abc import Callable
 from copy import copy
 from dataclasses import dataclass, field
 from functools import wraps
+import os
 from types import SimpleNamespace
 
 import torch
@@ -687,7 +688,18 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         self,
         fused_output: torch.Tensor,
     ) -> torch.Tensor:
-        if self._allgather_requires_early_routed_reduce:
+        dispatcher_already_reduced_tp_assignments = (
+            self.quant_type == QuantType.W4A8MXFP
+            and get_tp_group().world_size > 1
+            and os.environ.get(
+                "VLLM_ASCEND_KIMI_REFERENCE_TP_MOE_REDUCTION", "0"
+            )
+            == "1"
+        )
+        if (
+            self._allgather_requires_early_routed_reduce
+            and not dispatcher_already_reduced_tp_assignments
+        ):
             # K3 latent MoE: sum the per-rank routed partials BEFORE the
             # nonlinear RMSNorm+up_proj (v0.23 early-reduce semantics).
             fused_output = tensor_model_parallel_all_reduce(fused_output)

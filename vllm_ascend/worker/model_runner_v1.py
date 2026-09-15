@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -80,6 +81,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheSpec,
+    KVCacheTensor,
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -1317,6 +1319,86 @@ class NPUModelRunner(GPUModelRunner):
             total_num_scheduled_tokens,
         )
 
+    def _refresh_sampling_logits_indices(
+        self,
+        logits_indices: torch.Tensor,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        num_reqs: int,
+    ) -> torch.Tensor:
+        """Rebuild A5 sampling indices after model-forward temporary reuse."""
+        if (
+            get_ascend_device_type() == AscendDeviceType.A5
+            and spec_decode_metadata is None
+        ):
+            return self.query_start_loc.gpu[1 : num_reqs + 1] - 1
+        return logits_indices
+
+    def _dump_kimi_tp_post_forward(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        sample_hidden_states: torch.Tensor,
+        logits: torch.Tensor,
+        logits_indices: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        req_ids: list[str],
+        num_scheduled_tokens_np: np.ndarray,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
+    ) -> None:
+        """Persist opt-in TP localization tensors outside the model graph."""
+        output_root = os.environ.get("KIMI_TP_DEBUG_DIR")
+        if not output_root:
+            return
+        step = getattr(self, "_kimi_tp_debug_step", 0)
+        self._kimi_tp_debug_step = step + 1
+        rank = self.tp_rank
+        output_dir = os.path.join(output_root, f"rank_{rank:02d}")
+        os.makedirs(output_dir, exist_ok=True)
+
+        def cpu_copy(tensor: torch.Tensor | None) -> torch.Tensor | None:
+            if tensor is None:
+                return None
+            return tensor.detach().cpu().contiguous()
+
+        payload = {
+            "rank": rank,
+            "step": step,
+            "req_ids": list(req_ids),
+            "num_scheduled_tokens": num_scheduled_tokens_np.copy(),
+            "num_tokens_unpadded": num_tokens_unpadded,
+            "num_tokens_padded": num_tokens_padded,
+            "num_computed_tokens": self.input_batch.num_computed_tokens_cpu[
+                : len(req_ids)
+            ].copy(),
+            "query_start_loc": cpu_copy(
+                self.query_start_loc.gpu[: len(req_ids) + 1]
+            ),
+            "logits_indices": cpu_copy(logits_indices),
+            "input_ids": cpu_copy(input_ids),
+            "positions": cpu_copy(positions),
+            "hidden_states": cpu_copy(hidden_states),
+            "sample_hidden_states": cpu_copy(sample_hidden_states),
+            "logits": cpu_copy(logits),
+        }
+        path = os.path.join(output_dir, f"step_{step:03d}.pt")
+        torch.save(payload, path)
+        logger.warning(
+            "[KIMI_TP_DEBUG] rank=%d step=%d scheduled=%s "
+            "unpadded=%d padded=%d hidden_finite=%s sampled_finite=%s "
+            "logits_finite=%s path=%s",
+            rank,
+            step,
+            num_scheduled_tokens_np.tolist(),
+            num_tokens_unpadded,
+            num_tokens_padded,
+            bool(torch.isfinite(hidden_states).all()),
+            bool(torch.isfinite(sample_hidden_states).all()),
+            bool(torch.isfinite(logits).all()),
+            path,
+        )
+
     def _build_attn_state(self, num_reqs, num_scheduled_tokens, num_valid_tokens):
         if np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] == 0):
             attn_state = AscendAttentionState.PrefillNoCache
@@ -2144,6 +2226,11 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            logits_indices = self._refresh_sampling_logits_indices(
+                logits_indices,
+                spec_decode_metadata,
+                num_reqs,
+            )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -2170,6 +2257,18 @@ class NPUModelRunner(GPUModelRunner):
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
+                self._dump_kimi_tp_post_forward(
+                    hidden_states=hidden_states,
+                    sample_hidden_states=sample_hidden_states,
+                    logits=logits,
+                    logits_indices=logits_indices,
+                    input_ids=input_ids,
+                    positions=positions,
+                    req_ids=req_ids,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded,
+                )
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4041,6 +4140,48 @@ class NPUModelRunner(GPUModelRunner):
 
         return dsa_k_tensor, dsa_k_scale_tensor
 
+    def _hybrid_tensor_requires_separate_storage(
+        self,
+        kv_cache_tensor: KVCacheTensor,
+        layer_kv_cache_spec: dict[str, KVCacheSpec],
+    ) -> bool:
+        """Detect MLA/Mamba aliases whose primary state strides differ."""
+        mla_k_page_sizes = []
+        mamba_ssm_page_sizes = []
+        for layer_name in kv_cache_tensor.shared_by:
+            spec = layer_kv_cache_spec[layer_name]
+            if isinstance(spec, AscendMLAAttentionSpec):
+                k_dim, _ = self._get_attention_kv_cache_dims(layer_name, spec)
+                mla_k_page_sizes.append(
+                    spec.block_size
+                    * spec.num_kv_heads
+                    * k_dim
+                    * get_dtype_size(spec.dtype)
+                )
+            elif isinstance(spec, MambaSpec):
+                mamba_ssm_page_sizes.append(
+                    max(
+                        math.prod(shape) * get_dtype_size(dtype)
+                        for shape, dtype in zip(spec.shapes, spec.dtypes)
+                    )
+                )
+        return bool(
+            mla_k_page_sizes
+            and mamba_ssm_page_sizes
+            and set(mla_k_page_sizes) != set(mamba_ssm_page_sizes)
+        )
+
+    @staticmethod
+    def _unpadded_cache_page_size(spec: KVCacheSpec) -> int:
+        if isinstance(spec, AttentionSpec):
+            return spec.unpadded_page_size_bytes
+        if isinstance(spec, MambaSpec):
+            return sum(
+                math.prod(shape) * get_dtype_size(dtype)
+                for shape, dtype in zip(spec.shapes, spec.dtypes)
+            )
+        return spec.page_size_bytes
+
     def _allocate_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
         Initializes the KV cache buffer with the correct size. The buffer needs
@@ -4065,8 +4206,52 @@ class NPUModelRunner(GPUModelRunner):
         # If some tensors are shared by linear layers and attention layers,
         # the same tensor format must be maintained even if some layers
         # have only linear or attention layers, for example, the mtp layer.
-        self.hybrid_with_attn_and_mamba = False
+        self._separate_hybrid_cache_layers: set[str] = set()
+        effective_kv_cache_tensors = []
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            if self._hybrid_tensor_requires_separate_storage(
+                kv_cache_tensor,
+                layer_kv_cache_spec,
+            ):
+                self._separate_hybrid_cache_layers.update(kv_cache_tensor.shared_by)
+                layers_by_layout: dict[tuple, list[str]] = defaultdict(list)
+                for layer_name in kv_cache_tensor.shared_by:
+                    spec = layer_kv_cache_spec[layer_name]
+                    if isinstance(spec, AttentionSpec):
+                        layout_key = (
+                            "attention",
+                            spec.unpadded_page_size_bytes,
+                            spec.dtype,
+                        )
+                    elif isinstance(spec, MambaSpec):
+                        layout_key = (
+                            "mamba",
+                            tuple(spec.shapes),
+                            tuple(spec.dtypes),
+                        )
+                    else:
+                        layout_key = ("layer", layer_name)
+                    layers_by_layout[layout_key].append(layer_name)
+                for shared_by in layers_by_layout.values():
+                    spec = layer_kv_cache_spec[shared_by[0]]
+                    effective_kv_cache_tensors.append(
+                        KVCacheTensor(
+                            size=(
+                                self._unpadded_cache_page_size(spec)
+                                * kv_cache_config.num_blocks
+                            ),
+                            shared_by=shared_by,
+                        )
+                    )
+                logger.warning_once(
+                    "Allocating separate MLA/Mamba cache storage because "
+                    "their primary per-block state strides differ."
+                )
+            else:
+                effective_kv_cache_tensors.append(kv_cache_tensor)
+
+        self.hybrid_with_attn_and_mamba = False
+        for kv_cache_tensor in effective_kv_cache_tensors:
             use_mamba, use_attn = False, False
             for layer_name in kv_cache_tensor.shared_by:
                 if isinstance(layer_kv_cache_spec[layer_name], MambaSpec):
@@ -4078,7 +4263,7 @@ class NPUModelRunner(GPUModelRunner):
                 layer_name = kv_cache_tensor.shared_by[idx]
                 # Single tensor path for: mamba, hybrid attn-mamba, or cache_only_layers
                 if (
-                    "linear_attn" in layer_name
+                    isinstance(layer_kv_cache_spec[layer_name], MambaSpec)
                     or self.hybrid_with_attn_and_mamba
                     or "cache_only_layers" in layer_name
                     or is_hidden_state_cache_spec(layer_kv_cache_spec.get(layer_name))
@@ -4437,6 +4622,7 @@ class NPUModelRunner(GPUModelRunner):
                     elif (
                         self.use_hybrid_blocks
                         and self.hybrid_with_attn_and_mamba
+                        and layer_name not in self._separate_hybrid_cache_layers
                         and "cache_only_layers" not in layer_name
                         and not is_hidden_state_cache_spec(current_kv_cache_spec)
                     ):
@@ -4488,8 +4674,13 @@ class NPUModelRunner(GPUModelRunner):
                         ]
                         sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
                     assert raw_k_tensor is not None
-                    assert sum_page_size_bytes % current_kv_cache_spec.page_size_bytes == 0
-                    num_blocks = sum_page_size_bytes // current_kv_cache_spec.page_size_bytes
+                    cache_page_size = (
+                        self._unpadded_cache_page_size(current_kv_cache_spec)
+                        if layer_name in self._separate_hybrid_cache_layers
+                        else current_kv_cache_spec.page_size_bytes
+                    )
+                    assert sum_page_size_bytes % cache_page_size == 0
+                    num_blocks = sum_page_size_bytes // cache_page_size
 
                     # `num_blocks` is the number of blocks the model runner can use.
                     # `kv_cache_config.num_blocks` is the number of blocks that
@@ -4592,8 +4783,13 @@ class NPUModelRunner(GPUModelRunner):
                 elif isinstance(current_kv_cache_spec, MambaSpec):
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     assert raw_tensor is not None
-                    assert raw_tensor.numel() % current_kv_cache_spec.page_size_bytes == 0
-                    num_blocks = raw_tensor.numel() // current_kv_cache_spec.page_size_bytes
+                    cache_page_size = (
+                        self._unpadded_cache_page_size(current_kv_cache_spec)
+                        if layer_name in self._separate_hybrid_cache_layers
+                        else current_kv_cache_spec.page_size_bytes
+                    )
+                    assert raw_tensor.numel() % cache_page_size == 0
+                    num_blocks = raw_tensor.numel() // cache_page_size
                     assert num_blocks >= kv_cache_config.num_blocks
 
                     # `num_blocks` is the number of blocks the model runner can use.

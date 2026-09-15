@@ -92,8 +92,8 @@ def verify_and_update_config(cls, vllm_config) -> None:
         attn_token_page_size = 2 * attn_head_size * attn_num_kv_heads * get_dtype_size(kv_cache_dtype)
 
     attn_block_size = kernel_block_size * cdiv(ssm_block_page_size, kernel_block_size * attn_single_token_k_page_size)
-    assert attn_single_token_k_page_size * attn_block_size == ssm_block_page_size, (
-        "Cannot align ssm_page_size and attn_page_size."
+    assert attn_single_token_k_page_size * attn_block_size >= ssm_block_page_size, (
+        "Cannot make attn_page_size cover ssm_page_size."
     )
 
     # override attention block size if either (a) the
