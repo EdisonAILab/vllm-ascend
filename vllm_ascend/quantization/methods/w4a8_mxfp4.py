@@ -39,6 +39,7 @@ from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_lo
 from .registry import register_scheme
 
 _PARITY_MOE_CALL_INDEX = 0
+_PARITY_TAP_COUNTS: dict[str, int] = {}
 
 
 def _parity_tap(name: str, tensor: torch.Tensor) -> None:
@@ -46,11 +47,23 @@ def _parity_tap(name: str, tensor: torch.Tensor) -> None:
     output_dir = os.environ.get("KIMI_PARITY_TAP_DIR")
     if not output_dir:
         return
+    include = os.environ.get("KIMI_PARITY_TAP_INCLUDE")
+    if include:
+        prefixes = tuple(value.strip() for value in include.split(",") if value.strip())
+        if not prefixes or not name.startswith(prefixes):
+            return
     expected_tokens = int(os.environ.get("KIMI_PARITY_TAP_EXPECTED_TOKENS", "32"))
     if tensor.ndim == 0 or tensor.shape[0] != expected_tokens:
         return
+    filename = f"{name}.pt"
+    if os.environ.get("KIMI_PARITY_TAP_APPEND") == "1":
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        output_dir = os.path.join(output_dir, f"rank_{rank:02d}")
+        count = _PARITY_TAP_COUNTS.get(name, 0)
+        _PARITY_TAP_COUNTS[name] = count + 1
+        filename = f"{name}_{count:03d}.pt"
     os.makedirs(output_dir, exist_ok=True)
-    torch.save(tensor.detach().cpu().contiguous(), os.path.join(output_dir, f"{name}.pt"))
+    torch.save(tensor.detach().cpu().contiguous(), os.path.join(output_dir, filename))
 
 
 def _megatron_reference_select_experts(

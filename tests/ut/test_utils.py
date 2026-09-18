@@ -122,6 +122,37 @@ class TestUtils(TestBase):
             mock_import_module.side_effect = ImportError("import error")
             self.assertFalse(utils.enable_custom_op())
 
+    def test_a5_custom_ops_require_kimi_opt_in(self):
+        with (
+            mock.patch("vllm.envs.VLLM_BATCH_INVARIANT", False),
+            mock.patch.object(
+                utils,
+                "get_ascend_device_type",
+                return_value=utils.AscendDeviceType.A5,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"VLLM_ASCEND_KIMI_ENABLE_A5_CUSTOM_OPS": "0"},
+            ),
+        ):
+            self.assertTrue(utils._custom_ops_disabled_for_runtime())
+            self.assertFalse(utils._kimi_a5_custom_ops_enabled())
+
+        with (
+            mock.patch("vllm.envs.VLLM_BATCH_INVARIANT", False),
+            mock.patch.object(
+                utils,
+                "get_ascend_device_type",
+                return_value=utils.AscendDeviceType.A5,
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"VLLM_ASCEND_KIMI_ENABLE_A5_CUSTOM_OPS": "1"},
+            ),
+        ):
+            self.assertFalse(utils._custom_ops_disabled_for_runtime())
+            self.assertTrue(utils._kimi_a5_custom_ops_enabled())
+
     def test_prepend_env_path_moves_existing_entry_to_front(self):
         with mock.patch.dict(
             os.environ,

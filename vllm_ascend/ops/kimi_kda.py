@@ -27,10 +27,15 @@ from collections.abc import Callable
 from functools import partial, wraps
 
 import torch
-import torch.nn.functional as F
+import torch_npu
 from einops import rearrange
 from vllm.config import VllmConfig
-from vllm.distributed import get_pcp_group, get_tensor_model_parallel_rank
+from torch.nn import functional as F
+from vllm.distributed import (
+    get_pcp_group,
+    get_tensor_model_parallel_rank,
+    tensor_model_parallel_all_reduce,
+)
 from vllm.forward_context import get_forward_context
 
 try:
@@ -40,6 +45,9 @@ except ModuleNotFoundError:
 from vllm.model_executor.layers.linear import ColumnParallelLinear, QKVParallelLinear
 from vllm.model_executor.layers.mamba.gdn.kimi_gdn_linear_attn import (
     KimiGatedDeltaNetAttention,
+)
+from vllm.model_executor.model_loader.reload.meta import (
+    SKIP_TENSORS as _VLLM_LAYERWISE_RELOAD_SKIP_TENSORS,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import replace_parameter
@@ -74,13 +82,36 @@ if HAS_TRITON:
 
 _KDA_CHUNK_SIZE = 64
 _PACKED_CONV_WEIGHT_NAME = "packed_conv_weights"
+# This tensor is derived from q/k/v convolution weights and has no checkpoint
+# entry.  Keeping it live lets every source-weight post-load hook refresh it;
+# otherwise layerwise reload counts it as an unloaded q_conv1d parameter and
+# can leave the Q slice from the dummy model in place.
+_VLLM_LAYERWISE_RELOAD_SKIP_TENSORS.add(_PACKED_CONV_WEIGHT_NAME)
 _FUSED_QKV_NAME = "fused_qkv"
+_USE_PARTITION_INVARIANT_KDA = os.getenv("KIMI_VLLM_USE_PARTITION_INVARIANT_KDA", "0") == "1"
+_USE_TRAINING_CAUSAL_CONV1D = os.getenv("KIMI_VLLM_USE_TRAINING_CAUSAL_CONV1D", "0") == "1"
+_KDA_OPROJ_FP32_REDUCE = os.getenv("KIMI_KDA_OPROJ_FP32_REDUCE", "0") == "1"
+_PARITY_TAP_COUNTS: dict[str, int] = {}
+
+
+def _kimi_use_fused_kda_qkv(quant_config: object | None) -> bool:
+    """Return whether KDA may combine the Q/K/V projection GEMMs."""
+
+    return quant_config is not None and os.environ.get(
+        "VLLM_ASCEND_KIMI_SEPARATE_KDA_QKV",
+        "0",
+    ) != "1"
 
 
 def _parity_tap(name: str, tensor: torch.Tensor) -> None:
     output_dir = os.environ.get("KIMI_PARITY_TAP_DIR")
     if not output_dir:
         return
+    include = os.environ.get("KIMI_PARITY_TAP_INCLUDE")
+    if include:
+        prefixes = tuple(value.strip() for value in include.split(",") if value.strip())
+        if not prefixes or not name.startswith(prefixes):
+            return
     expected_tokens = int(os.environ.get("KIMI_PARITY_TAP_EXPECTED_TOKENS", "32"))
     static_taps = (
         "_a_log",
@@ -91,8 +122,15 @@ def _parity_tap(name: str, tensor: torch.Tensor) -> None:
     )
     if expected_tokens not in tensor.shape and not name.endswith(static_taps):
         return
+    filename = f"{name}.pt"
+    if os.environ.get("KIMI_PARITY_TAP_APPEND") == "1":
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        output_dir = os.path.join(output_dir, f"rank_{rank:02d}")
+        count = _PARITY_TAP_COUNTS.get(name, 0)
+        _PARITY_TAP_COUNTS[name] = count + 1
+        filename = f"{name}_{count:03d}.pt"
     os.makedirs(output_dir, exist_ok=True)
-    torch.save(tensor.detach().cpu().contiguous(), os.path.join(output_dir, f"{name}.pt"))
+    torch.save(tensor.detach().cpu().contiguous(), os.path.join(output_dir, filename))
 
 
 def _zero_padded_spec_output(
@@ -229,22 +267,29 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         elif self.gate_lower_bound is None and kimi_reduced_w4a8_runtime_enabled():
             self.gate_lower_bound = -5.0
 
-        # KDA uses the same hidden states and TP head layout for Q, K, and V.
-        # Pack their checkpoint shards into one standard QKV linear so MXFP8
-        # performs one dynamic quantization and one quantized matmul.
-        fused_qkv = QKVParallelLinear(
-            self.hidden_size,
-            self.head_dim,
-            self.num_heads,
-            self.num_heads,
-            bias=False,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.{_FUSED_QKV_NAME}",
-        )
-        del self.q_proj
-        del self.k_proj
-        del self.v_proj
-        self.fused_qkv = fused_qkv
+        # Quantized KDA needs one packed QKV projection so MXFP8 performs one
+        # dynamic quantization.  In ordinary BF16, retain the three upstream
+        # projections: the actor evaluates q/k/v independently and a fused NPU
+        # GEMM chooses different reduction tiling.
+        # Megatron evaluates Q, K, and V as three BF16 projections.  The fused
+        # projection is normally preferable, but its GEMM reduction tiling can
+        # round a few BF16 outputs differently.  Keep parity opt-in so ordinary
+        # vLLM performance is unchanged.
+        self.use_fused_qkv = _kimi_use_fused_kda_qkv(self.quant_config)
+        if self.use_fused_qkv:
+            fused_qkv = QKVParallelLinear(
+                self.hidden_size,
+                self.head_dim,
+                self.num_heads,
+                self.num_heads,
+                bias=False,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.{_FUSED_QKV_NAME}",
+            )
+            del self.q_proj
+            del self.k_proj
+            del self.v_proj
+            self.fused_qkv = fused_qkv
 
         self.A_log.weight_loader = partial(
             _load_a_log,
@@ -331,9 +376,14 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
             not self.is_vl_first_layer,
         )
         num_tokens = hidden_states.size(0)
-        qkv = self.fused_qkv(hidden_states)[0]
-        projection_size = self.local_num_heads * self.head_dim
-        q, k, v = qkv.split([projection_size] * 3, dim=-1)
+        if self.use_fused_qkv:
+            qkv = self.fused_qkv(hidden_states)[0]
+            projection_size = self.local_num_heads * self.head_dim
+            q, k, v = qkv.split([projection_size] * 3, dim=-1)
+        else:
+            q = self.q_proj(hidden_states)[0]
+            k = self.k_proj(hidden_states)[0]
+            v = self.v_proj(hidden_states)[0]
         self._tap("q_proj", q)
         self._tap("k_proj", k)
         self._tap("v_proj", v)
@@ -377,9 +427,28 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         core_attn_out = self._apply_output_norm_gate(core_attn_out, output_gate)
         self._tap("norm_gate_output", core_attn_out)
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
-        projected = self.o_proj(core_attn_out)[0]
+        projected = self._project_kda_output(core_attn_out)
         self._tap("o_proj", projected)
         output[:] = projected
+
+    def _project_kda_output(self, core_attn_out: torch.Tensor) -> torch.Tensor:
+        if not _KDA_OPROJ_FP32_REDUCE:
+            return self.o_proj(core_attn_out)[0]
+
+        projection = self.o_proj
+        if not projection.input_is_parallel:
+            raise RuntimeError("KDA FP32 o_proj parity path requires parallel input")
+        if projection.bias is not None:
+            raise RuntimeError("KDA FP32 o_proj parity path expects bias=False")
+        if not projection.reduce_results:
+            raise RuntimeError("KDA FP32 o_proj parity path requires TP reduction")
+
+        input_base = torch_npu.npu_format_cast(core_attn_out, 2)
+        weight_base = torch_npu.npu_format_cast(projection.weight, 2)
+        output_parallel = F.linear(input_base.float(), weight_base.float())
+        if projection.tp_size > 1:
+            output_parallel = tensor_model_parallel_all_reduce(output_parallel)
+        return output_parallel.to(core_attn_out.dtype)
 
     def _apply_output_norm_gate(
         self,
@@ -393,6 +462,17 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
             # Triton-Ascend 3.2.2 aborts in this fused kernel on 950DT.
             # Keep the same RMSNorm + sigmoid-gate math for the plumbing smoke.
             return self.o_norm.forward_native(core_attn_out, output_gate)
+        if _USE_PARTITION_INVARIANT_KDA:
+            input_dtype = core_attn_out.dtype
+            normalized = core_attn_out.float()
+            normalized = normalized * torch.rsqrt(
+                normalized.square().mean(dim=-1, keepdim=True) + self.o_norm.eps
+            )
+            return (
+                normalized
+                * self.o_norm.weight.float()
+                * torch.sigmoid(output_gate.float())
+            ).to(input_dtype)
         if apply_kda_rms_norm_sigmoid_gate is not None:
             return apply_kda_rms_norm_sigmoid_gate(
                 core_attn_out,
@@ -412,6 +492,106 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         run_mode: int,
         num_accepted_tokens: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if _USE_TRAINING_CAUSAL_CONV1D:
+            if num_accepted_tokens is not None:
+                raise RuntimeError(
+                    "training-identical Kimi causal_conv1d does not support speculative decode"
+                )
+            if mixed_qkv.shape[-1] % 3:
+                raise RuntimeError(
+                    "training-identical Kimi causal_conv1d requires equal q/k/v widths"
+                )
+            try:
+                from mindspeed_ops.api.triton.convolution import causal_conv1d
+            except ImportError as error:
+                raise RuntimeError(
+                    "training-identical Kimi causal_conv1d requires MindSpeed-Ops"
+                ) from error
+
+            query_start_loc = metadata.query_start_loc
+            cache_indices = metadata.cache_indices.reshape(-1)
+            num_sequences = query_start_loc.numel() - 1
+            if cache_indices.numel() != num_sequences:
+                raise RuntimeError(
+                    "training-identical Kimi causal_conv1d metadata mismatch: "
+                    f"cache_indices={cache_indices.numel()}, sequences={num_sequences}"
+                )
+
+            initial_state_mode = getattr(metadata, "initial_state_mode", None)
+            kernel_width = conv_weights_t.shape[0]
+            cached_state_width = conv_state.shape[1]
+            if cached_state_width != kernel_width - 1 or conv_state.shape[-1] != mixed_qkv.shape[-1]:
+                raise RuntimeError(
+                    "training-identical Kimi causal_conv1d cache shape mismatch: "
+                    f"cache={tuple(conv_state.shape)}, kernel={tuple(conv_weights_t.shape)}, "
+                    f"input={tuple(mixed_qkv.shape)}"
+                )
+
+            valid_cache = cache_indices != PAD_SLOT_ID
+            safe_cache_indices = torch.where(
+                valid_cache,
+                cache_indices,
+                torch.zeros_like(cache_indices),
+            )
+            active_state = conv_state[safe_cache_indices].transpose(1, 2).contiguous()
+            if initial_state_mode is not None:
+                initial_state_mode = initial_state_mode.reshape(-1).bool()
+                if initial_state_mode.numel() != num_sequences:
+                    raise RuntimeError(
+                        "training-identical Kimi causal_conv1d initial-state metadata mismatch"
+                    )
+                active_state = torch.where(
+                    (initial_state_mode & valid_cache)[:, None, None],
+                    active_state,
+                    torch.zeros_like(active_state),
+                )
+                use_initial_state = run_mode != 0 or bool(initial_state_mode.any().item())
+            else:
+                use_initial_state = True
+
+            # MindSpeed's actor kernel stores W state elements, with the first
+            # element unused by a width-W causal convolution. vLLM caches only
+            # the W-1 effective history elements.
+            actor_state = torch.cat(
+                (active_state.new_zeros((*active_state.shape[:-1], 1)), active_state),
+                dim=-1,
+            )
+            part_width = mixed_qkv.shape[-1] // 3
+            outputs: list[torch.Tensor] = []
+            final_states: list[torch.Tensor] = []
+            cu_seqlens = query_start_loc.to(device=mixed_qkv.device, dtype=torch.int32)
+            for part in range(3):
+                start = part * part_width
+                end = start + part_width
+                output, final_state = causal_conv1d(
+                    x=mixed_qkv[:, start:end].unsqueeze(0),
+                    weight=conv_weights_t[:, start:end].contiguous(),
+                    initial_state=(
+                        actor_state[:, start:end].contiguous()
+                        if use_initial_state
+                        else None
+                    ),
+                    activation="silu",
+                    cu_seqlens=cu_seqlens,
+                    output_final_state=True,
+                )
+                if final_state is None:
+                    raise RuntimeError(
+                        "training-identical Kimi causal_conv1d did not return final state"
+                    )
+                outputs.append(output)
+                final_states.append(final_state)
+
+            updated_state = (
+                torch.cat(final_states, dim=1)[..., -cached_state_width:]
+                .transpose(1, 2)
+                .contiguous()
+                .to(conv_state.dtype)
+            )
+            conv_state[cache_indices[valid_cache]] = updated_state[valid_cache]
+
+            return torch.cat(outputs, dim=-1).squeeze(0)
+
         out = torch.empty_like(mixed_qkv)
         unfused_activation = kimi_runtime_flag(
             "VLLM_ASCEND_KIMI_UNFUSED_SHORT_CONV_ACTIVATION",
@@ -704,6 +884,49 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
             recurrent_state[state_idx].copy_(state_kv.transpose(-1, -2).to(recurrent_state.dtype))
         return output
 
+    def _run_partition_invariant_recurrent(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        raw_gate: torch.Tensor,
+        beta: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        cu_seqlens: torch.Tensor | tuple[int, ...] | list[int],
+        state_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        from triton_ascend_kernels.attention.fla.kda.gate import (
+            fused_kda_gate as training_fused_kda_gate,
+        )
+        from vllm.third_party.flash_linear_attention.ops.kda import fused_recurrent_kda
+
+        effective_gate = training_fused_kda_gate(
+            raw_gate,
+            self.A_log,
+            head_k_dim=self.head_dim,
+            dt_bias=self.dt_bias,
+            lower_bound=self.gate_lower_bound,
+            output_dtype=torch.float32,
+        )
+        if isinstance(cu_seqlens, torch.Tensor):
+            cu_seqlens_tensor = cu_seqlens.to(device=q.device, dtype=torch.int32).contiguous()
+        else:
+            cu_seqlens_tensor = torch.tensor(cu_seqlens, device=q.device, dtype=torch.int32)
+
+        output, _ = fused_recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=effective_gate,
+            beta=beta,
+            initial_state=recurrent_state,
+            inplace_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            cu_seqlens=cu_seqlens_tensor,
+            ssm_state_indices=state_indices.to(device=q.device, dtype=torch.int64).contiguous(),
+        )
+        return output
+
     def _run_recurrent(
         self,
         q: torch.Tensor,
@@ -733,6 +956,21 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
                 cu_seqlens,
                 state_indices,
             )
+
+        if _USE_PARTITION_INVARIANT_KDA:
+            if num_accepted_tokens is not None:
+                raise RuntimeError("partition-invariant Kimi KDA does not support speculative decode")
+            return self._run_partition_invariant_recurrent(
+                q,
+                k,
+                v,
+                raw_gate,
+                beta,
+                recurrent_state,
+                cu_seqlens,
+                state_indices,
+            )
+
         out = torch.ops._C_ascend.recurrent_kda(
             q.contiguous(),
             k.contiguous(),
@@ -868,6 +1106,21 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         else:
             clear_ssm_states(initial_state_vk, has_initial_state)
 
+        if _USE_PARTITION_INVARIANT_KDA:
+            recurrent_state[state_indices] = initial_state_vk
+            recurrent_state_indices = state_indices[:, None].expand(
+                state_indices.shape[0], q.shape[1]
+            ).contiguous()
+            return self._run_partition_invariant_recurrent(
+                q,
+                k,
+                v,
+                raw_gate,
+                beta,
+                recurrent_state,
+                cu_seqlens,
+                recurrent_state_indices,
+            )
         initial_state_kv = initial_state_vk.transpose(-1, -2).contiguous()
         cu_seqlens_ascendc = (
             tuple(cu_seqlens.detach().cpu().tolist()) if isinstance(cu_seqlens, torch.Tensor) else cu_seqlens

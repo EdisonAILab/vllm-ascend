@@ -687,6 +687,7 @@ def test_kimi_k3_projector_registers_rotation_for_weight_loading(
         mm_hidden_size=2,
         text_hidden_size=8,
         merge_kernel_size=(2, 2),
+        use_rot_proj=True,
     )
     projector = KimiK3MultiModalProjector(config)
 
@@ -694,21 +695,22 @@ def test_kimi_k3_projector_registers_rotation_for_weight_loading(
 
 
 @pytest.mark.parametrize(
-    ("loaded_weights", "has_rot_proj"),
+    ("configured", "loaded_weights", "expected_skip_prefixes"),
     [
-        ({"mm_projector.rot_proj.weight"}, True),
-        ({"mm_projector.linear_1.weight"}, False),
+        (True, {"mm_projector.linear_1.weight"}, []),
+        (False, {"mm_projector.rot_proj.weight"}, ["mm_projector.rot_proj."]),
     ],
 )
-def test_kimi_k3_enables_projector_rotation_only_when_weight_is_loaded(
+def test_kimi_k3_projector_rotation_structure_is_config_driven(
     monkeypatch: pytest.MonkeyPatch,
+    configured: bool,
     loaded_weights: set[str],
-    has_rot_proj: bool,
+    expected_skip_prefixes: list[str],
 ):
     class StubLoader:
         def __init__(self, model, *, skip_prefixes):
             assert model is wrapper
-            assert skip_prefixes == []
+            assert skip_prefixes == expected_skip_prefixes
 
         def load_weights(self, weights, *, mapper):
             assert list(weights) == []
@@ -719,24 +721,20 @@ def test_kimi_k3_enables_projector_rotation_only_when_weight_is_loaded(
     wrapper = AscendKimiK3ForConditionalGeneration.__new__(AscendKimiK3ForConditionalGeneration)
     nn.Module.__init__(wrapper)
     wrapper.mm_projector = nn.Module()
-    wrapper.mm_projector.rot_proj = nn.Linear(1, 1, bias=False)
+    wrapper.mm_projector.rot_proj = nn.Linear(1, 1, bias=False) if configured else None
 
     actual = wrapper.load_weights(iter(()))
 
     assert actual == loaded_weights
-    assert hasattr(wrapper.mm_projector, "rot_proj") is has_rot_proj
-    assert ("mm_projector.rot_proj.weight" in dict(wrapper.named_parameters())) is has_rot_proj
+    assert (wrapper.mm_projector.rot_proj is not None) is configured
+    assert ("mm_projector.rot_proj.weight" in dict(wrapper.named_parameters())) is configured
 
 
-def test_kimi_k3_deletes_unused_rot_proj_when_projector_is_placeholder(
+def test_kimi_k3_preserves_configured_rot_proj_across_weight_buckets(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    # Text-only serving (--language-model-only, or --limit-mm-per-prompt at 0
-    # for all tower modalities) wraps tower components in StageMissingLayer.
-    # Its __getattr__ delegates to the wrapped projector, but del acts on the
-    # placeholder's own registries (empty by design), so deleting
-    # mm_projector.rot_proj directly raises AttributeError. The deletion must
-    # target the wrapped module instead.
+    # Verl streams rollout weights in buckets. A bucket that omits the
+    # projector rotation must not mutate config-defined module structure.
     class StubLoader:
         def __init__(self, model, *, skip_prefixes):
             assert model is wrapper
@@ -757,10 +755,8 @@ def test_kimi_k3_deletes_unused_rot_proj_when_projector_is_placeholder(
     actual = wrapper.load_weights(iter(()))
 
     assert actual == {"mm_projector.linear_1.weight"}
-    # The unused rotation was released from the wrapped projector...
-    assert hasattr(projector, "rot_proj") is False
-    # ...and lookups through the placeholder no longer find it either.
-    assert hasattr(wrapper.mm_projector, "rot_proj") is False
+    assert projector.rot_proj is not None
+    assert wrapper.mm_projector.rot_proj is projector.rot_proj
 
 
 def test_kimi_k3_projector_applies_rotation_only_after_weight_load():
@@ -781,9 +777,7 @@ def test_kimi_k3_projector_applies_rotation_only_after_weight_load():
     projector.post_norm = nn.Identity()
     image_features = torch.tensor([[1.0, 2.0]])
 
-    projector.rot_proj = ScaleLinear()
-    del projector.rot_proj
-    assert not hasattr(projector, "rot_proj")
+    projector.rot_proj = None
     torch.testing.assert_close(projector(image_features), image_features)
 
     projector.rot_proj = ScaleLinear()
@@ -958,8 +952,10 @@ def test_kimi_k3_vision_tp16_falls_back_to_data_parallel(
     assert layer.use_data_parallel is True
     assert layer.tp_size == 1
     assert layer.num_local_heads == 12
-    assert qkv_kwargs["disable_tp"] is True
-    assert output_kwargs["disable_tp"] is True
+    assert isinstance(layer.wqkv, nn.Linear)
+    assert isinstance(layer.wo, nn.Linear)
+    assert qkv_kwargs == {}
+    assert output_kwargs == {}
 
 
 def test_kimi_k3_vit_dp_compat_calls_release_helper_without_num_heads(
@@ -1062,8 +1058,8 @@ def test_kimi_k3_passes_situ_parameters_through_activation_config(monkeypatch):
         num_experts_per_token=2,
         moe_renormalize=True,
         use_grouped_topk=True,
-        num_expert_group=4,
-        topk_group=2,
+        num_expert_group=1,
+        topk_group=1,
         moe_router_activation_func="sigmoid",
         routed_scaling_factor=2.5,
         activation_situ_beta=4.0,
@@ -1107,8 +1103,8 @@ def test_kimi_k3_reference_router_is_precast_and_passed_to_fused_moe(monkeypatch
         num_experts_per_token=2,
         moe_renormalize=True,
         use_grouped_topk=True,
-        num_expert_group=4,
-        topk_group=2,
+        num_expert_group=1,
+        topk_group=1,
         moe_router_activation_func="sigmoid",
         routed_scaling_factor=2.5,
         activation_situ_beta=4.0,

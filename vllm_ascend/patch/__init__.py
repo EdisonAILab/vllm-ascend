@@ -992,6 +992,22 @@
 #    Future Plan:
 #       Remove this patch when vLLM aligns with the latest main.
 #
+# ** 10a. File: worker/patch_layerwise_reload.py**
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. vLLM layerwise callable-loader wrapping and deferred tensor ownership
+#    Why:
+#       Kimi parameters use `functools.partial` loaders without `__name__`.
+#       Verl weight buckets are views into a reusable IPC buffer, while vLLM
+#       may defer a shard until a later bucket arrives.
+#    How:
+#       Inspect callable names defensively when wrapping/unwrapping loaders.
+#       Clone only source tensors retained by the upstream deferred loader.
+#    Related PR (if no, explain why):
+#       No, the reusable IPC buffer belongs to Verl's transfer protocol.
+#    Future Plan:
+#       Remove this patch when the transfer protocol gives deferred consumers
+#       owned storage.
+#
 # ** 11. File: worker/patch_mamba_utils.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.v1.worker.mamba_utils.batch_memcpy_kernel = batch_memcpy_kernel`

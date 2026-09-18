@@ -29,9 +29,15 @@ def _ensure_global_patch():
     if _GLOBAL_PATCH_APPLIED:
         return
 
+    from vllm_ascend.patch.kimi_full_r3_schema import (
+        install_kimi_full_r3_schema_patch,
+    )
     from vllm_ascend.utils import adapt_patch
 
     adapt_patch(is_global_patch=True)
+    # EngineCore creates the scheduler-side route buffer without importing
+    # worker patches, so the packed schema must be installed process-wide.
+    install_kimi_full_r3_schema_patch()
     _GLOBAL_PATCH_APPLIED = True
 
 
@@ -70,17 +76,20 @@ def register_service_profiling():
 
 
 def register_model():
+    import transformers
+
     from vllm_ascend.transformers_utils.configs.kimi_k3 import register_kimi_k3_config
 
     register_kimi_k3_config()
 
-    from vllm_ascend.patch.hunyuan_vl_processor_compat import (
-        install_hunyuan_vl_processor_compat,
-    )
+    if hasattr(transformers, "HunYuanVLProcessor"):
+        from vllm_ascend.patch.hunyuan_vl_processor_compat import (
+            install_hunyuan_vl_processor_compat,
+        )
+
+        install_hunyuan_vl_processor_compat()
 
     from .models import register_model
-
-    install_hunyuan_vl_processor_compat()
 
     register_model()
 

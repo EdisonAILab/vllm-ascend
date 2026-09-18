@@ -69,6 +69,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Enable the opt-in training/inference parity path. This mode favors
     # deterministic operator contracts over serving performance.
     "VLLM_ASCEND_TRAINING_PARITY": lambda: bool(int(os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0"))),
+    # A5 disables the general custom-op extension by default because not every
+    # upstream operator is qualified there. Kimi K3 requires its explicitly
+    # compiled KDA operators, so permit registration only through this opt-in.
+    "VLLM_ASCEND_KIMI_ENABLE_A5_CUSTOM_OPS": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_ENABLE_A5_CUSTOM_OPS", "0"))
+    ),
     # Kimi K3 W4A8 mismatch-localization switches. All are non-sensitive and
     # disabled by default, so the production serving path is unchanged.
     "VLLM_ASCEND_KIMI_REFERENCE_SHORT_CONV": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_SHORT_CONV", "0"))),

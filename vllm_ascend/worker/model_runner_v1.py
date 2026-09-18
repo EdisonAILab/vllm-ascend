@@ -3958,10 +3958,16 @@ class NPUModelRunner(GPUModelRunner):
         # test_qwen3_moe_routing_replay
         from vllm_ascend.ops.fused_moe.fused_moe import AscendMoERunner
 
-        for module in self.compilation_config.static_forward_context.values():
+        # Match vLLM's binding scope. MoE runners are not guaranteed to be
+        # registered in static_forward_context (notably for Kimi K3).
+        bound = 0
+        for module in self.model.modules():
             if isinstance(module, AscendMoERunner):
-                module._ascend_routed_experts_capturer = capturer
                 module.routed_experts._ascend_routed_experts_capturer = capturer
+                module.routed_experts._ascend_routed_experts_layer_id = module.layer_id
+                bound += 1
+        if capturer is not None and bound == 0:
+            raise RuntimeError("Routed-expert capture found no Ascend MoE runners")
 
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()

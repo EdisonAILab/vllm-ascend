@@ -397,13 +397,27 @@ def aligned_16(tensor: torch.Tensor):
     return new_tensor
 
 
+def _custom_ops_disabled_for_runtime() -> bool:
+    import vllm.envs as envs
+
+    return envs.VLLM_BATCH_INVARIANT or (
+        get_ascend_device_type() == AscendDeviceType.A5
+        and not envs_ascend.VLLM_ASCEND_KIMI_ENABLE_A5_CUSTOM_OPS
+    )
+
+
+def _kimi_a5_custom_ops_enabled() -> bool:
+    return (
+        get_ascend_device_type() == AscendDeviceType.A5
+        and envs_ascend.VLLM_ASCEND_KIMI_ENABLE_A5_CUSTOM_OPS
+    )
+
+
 def enable_custom_op():
     """
     Enable lazy init for vllm_ascend_C to avoid early initialization of CANN's RTS component.
     Ensure that ASCEND_RT_VISIBLE_DEVICES can be dynamically modified before torch.npu.set_device().
     """
-    import vllm.envs as envs
-
     global _CUSTOM_OP_ENABLED
 
     if _CUSTOM_OP_ENABLED is not None:
@@ -414,7 +428,7 @@ def enable_custom_op():
     # FIXME(linfeng): Currently custom op compilation and execution are partially available
     # in ASCEND950 chip, we temporarily disable all custom ops. Please refer to
     # https://github.com/vllm-project/vllm-ascend/issues/7157 for latest update about custom op.
-    if envs.VLLM_BATCH_INVARIANT or get_ascend_device_type() == AscendDeviceType.A5:
+    if _custom_ops_disabled_for_runtime():
         _CUSTOM_OP_ENABLED = False
         return _CUSTOM_OP_ENABLED
 
@@ -425,8 +439,11 @@ def enable_custom_op():
         # register custom ops into torch_library here
         import vllm_ascend.vllm_ascend_C  # type: ignore  # noqa: F401
 
-        # register the meta implementation for custom kernel if necessary
-        import vllm_ascend.meta_registration  # type: ignore  # noqa: F401
+        # The A5 Kimi package intentionally contains only its qualified op
+        # subset. The generic module also registers metadata for unrelated
+        # schemas (for example bgmv_expand) that are absent from this package.
+        if not _kimi_a5_custom_ops_enabled():
+            import vllm_ascend.meta_registration  # type: ignore  # noqa: F401
 
         # isort: on
         _CUSTOM_OP_ENABLED = True
@@ -436,8 +453,9 @@ def enable_custom_op():
         if (not torch.compiler.is_compiling()) and "libcust_opapi.so" in str(e):
             try:
                 bootstrap_custom_op_env(include_vendor_lib=True)
-                import vllm_ascend.meta_registration  # type: ignore  # noqa: F401
                 import vllm_ascend.vllm_ascend_C  # type: ignore  # noqa: F401
+                if not _kimi_a5_custom_ops_enabled():
+                    import vllm_ascend.meta_registration  # type: ignore  # noqa: F401
 
                 _CUSTOM_OP_ENABLED = True
             except ImportError:
