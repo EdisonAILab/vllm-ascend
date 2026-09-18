@@ -1093,6 +1093,38 @@ class _KimiReferenceRMSNorm(nn.Module):
         return self.weight * normalized.to(input_dtype)
 
 
+class _KimiFixedCapacityRMSNorm(_KimiReferenceRMSNorm):
+    """Kimi RMSNorm evaluated in fixed-capacity token tiles."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        shape = hidden_states.shape
+        rows = hidden_states.reshape(-1, shape[-1])
+        outputs = []
+        for chunk in rows.split(32, dim=0):
+            row_count = chunk.shape[0]
+            if row_count < 32:
+                chunk = torch.cat(
+                    (
+                        chunk,
+                        torch.zeros(
+                            (32 - row_count, shape[-1]),
+                            dtype=chunk.dtype,
+                            device=chunk.device,
+                        ),
+                    ),
+                    dim=0,
+                )
+            normalized = chunk.float()
+            normalized = normalized * torch.rsqrt(
+                normalized.square().mean(dim=-1, keepdim=True)
+                + self.variance_epsilon
+            )
+            outputs.append(normalized[:row_count].to(input_dtype))
+        normalized = torch.cat(outputs, dim=0).reshape(shape)
+        return self.weight * normalized
+
+
 class _KimiDecomposedRMSNorm(_KimiReferenceRMSNorm):
     """Native NPU reduction with Kimi's BF16-before-weight contract."""
 
@@ -1167,6 +1199,11 @@ def _kimi_mla_rms_norm_type() -> type[nn.Module]:
 
 def _kimi_routed_rms_norm_type() -> type[nn.Module]:
     """Select the reduced routed-expert norm on the Megatron contract."""
+    if kimi_runtime_flag(
+        "VLLM_ASCEND_KIMI_FIXED_CAPACITY_ROUTED_RMS_NORM",
+        reduced_default=False,
+    ):
+        return _KimiFixedCapacityRMSNorm
     if kimi_runtime_flag(
         "VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM",
         reduced_default=True,

@@ -106,6 +106,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM": lambda: bool(
         int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM", "0"))
     ),
+    "VLLM_ASCEND_KIMI_FIXED_CAPACITY_ROUTED_RMS_NORM": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_FIXED_CAPACITY_ROUTED_RMS_NORM", "0"))
+    ),
     "VLLM_ASCEND_KIMI_DECOMPOSED_ROUTED_RMS_NORM": lambda: bool(
         int(os.getenv("VLLM_ASCEND_KIMI_DECOMPOSED_ROUTED_RMS_NORM", "0"))
     ),
