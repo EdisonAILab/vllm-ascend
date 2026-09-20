@@ -31,15 +31,25 @@ function(gen_opbuild_target)
     -fno-common
   )
 
+  set(_opbuild_commands
+      COMMAND OPS_PROTO_SEPARATE=1
+              OPS_PROJECT_NAME=${OPBUILD_PREFIX}
+              OPS_ACLNN_GEN=${OPBUILD_GENACLNN}
+              OPS_PRODUCT_NAME=\"${ASCEND_COMPUTE_UNIT}\"
+              ${OP_BUILD_TOOL}
+              $<TARGET_FILE:gen_op_host_${OPBUILD_PREFIX}>
+              ${OPBUILD_OUT_DIR}/${OPBUILD_OUT_SUB_DIR})
+  if(kernel_src_list AND ASCEND_COMPUTE_UNIT)
+    string(REPLACE ";" "," _kernel_srcs "${kernel_src_list}")
+    list(APPEND _opbuild_commands
+      COMMAND ${ASCEND_PYTHON_EXECUTABLE}
+              ${PROJECT_SOURCE_DIR}/scripts/util/insert_kernel_src.py
+              "${_kernel_srcs}"
+              ${OPBUILD_OUT_DIR}/${OPBUILD_OUT_SUB_DIR}
+              ${ASCEND_COMPUTE_UNIT})
+  endif()
   add_custom_command(OUTPUT ${OPBUILD_OUT_SRCS} ${OPBUILD_OUT_HEADERS}
-                     COMMAND OPS_PROTO_SEPARATE=1
-                             OPS_PROJECT_NAME=${OPBUILD_PREFIX}
-                             OPS_ACLNN_GEN=${OPBUILD_GENACLNN}
-                             OPS_PRODUCT_NAME=\"${ASCEND_COMPUTE_UNIT}\"
-                             ${OP_BUILD_TOOL}
-                             $<TARGET_FILE:gen_op_host_${OPBUILD_PREFIX}>
-                             ${OPBUILD_OUT_DIR}/${OPBUILD_OUT_SUB_DIR}
-  )
+                     ${_opbuild_commands})
 
   add_custom_target(${OPBUILD_TARGET}
                     DEPENDS ${OPBUILD_OUT_SRCS} ${OPBUILD_OUT_HEADERS}

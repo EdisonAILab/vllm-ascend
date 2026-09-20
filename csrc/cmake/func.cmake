@@ -245,6 +245,10 @@ function(add_ops_info_target)
             ${OPS_INFO_JSON}
             COMMAND mkdir -p ${CUSTOM_OPS_INFO_DIR}
             COMMAND cp -f ${OPS_INFO_JSON} ${CUSTOM_OPS_INFO_DIR}
+            DEPENDS
+            ${OPS_INFO_INI}
+            ${OPS_INFO_INNER_INI}
+            ${OPS_INFO_EXCLUDE_INI}
     )
 
     add_custom_target(${OPS_INFO_TARGET} ALL
@@ -463,6 +467,54 @@ function(add_bin_compile_target)
     set(SRC_OUT_DIR      ${_OUT_DIR}/src)
     file(MAKE_DIRECTORY  ${BIN_OUT_DIR})
 
+    # BI kernels share support files outside individual operator directories.
+    # Stage those trees once, in a deterministic order, instead of declaring
+    # three dependencies named `common` for every BI operator (which races on
+    # the same destination under parallel Ninja builds).
+    if(BATCH_INVARIANT_ROOT)
+        set(BI_COMMON_COPY_FLAG
+            ${SRC_OUT_DIR}/batch_invariant_common_${BINARY_COMPUTE_UNIT}_src_copy.done)
+        add_custom_command(OUTPUT ${BI_COMMON_COPY_FLAG}
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${_OUT_DIR}/common/inc
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    ${BATCH_INVARIANT_ROOT}/common/inc
+                    ${_OUT_DIR}/common/inc
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${SRC_OUT_DIR}/common/inc
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    ${BATCH_INVARIANT_ROOT}/common/inc
+                    ${SRC_OUT_DIR}/common/inc
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${SRC_OUT_DIR}/common/act
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    ${BATCH_INVARIANT_ROOT}/common/act
+                    ${SRC_OUT_DIR}/common/act
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${SRC_OUT_DIR}/common/op_kernel
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    ${BATCH_INVARIANT_ROOT}/ops/ascendc/common/op_kernel
+                    ${SRC_OUT_DIR}/common/op_kernel
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${SRC_OUT_DIR}/common/cmct
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    ${BATCH_INVARIANT_ROOT}/ops/ascendc/mat_mul_v3_batch_invariant/common/cmct
+                    ${SRC_OUT_DIR}/common/cmct
+            # CANN 9.2 opc adds <binary src>/ascendc/common to the kernel
+            # include path. Keep the compatibility copy above for the legacy
+            # package layout, and stage CMCT where the active compiler looks.
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                    ${SRC_OUT_DIR}/ascendc/common/cmct
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                    ${BATCH_INVARIANT_ROOT}/ops/ascendc/mat_mul_v3_batch_invariant/common/cmct
+                    ${SRC_OUT_DIR}/ascendc/common/cmct
+            COMMAND ${CMAKE_COMMAND} -E touch ${BI_COMMON_COPY_FLAG}
+            VERBATIM
+        )
+        add_custom_target(batch_invariant_common_${BINARY_COMPUTE_UNIT}_src_copy
+            DEPENDS ${BI_COMMON_COPY_FLAG})
+    endif()
+
     foreach(_op_info ${BINARY_OP_INFO})
         get_filename_component(_op_name "${_op_info}" NAME)
         set(${_op_name}_dir ${_op_info})
@@ -491,6 +543,7 @@ function(add_bin_compile_target)
         endif ()
 
         set(OP_TARGET_NAME ${op_file}_${BINARY_COMPUTE_UNIT})
+        string(REGEX REPLACE "_apt$" "" OP_BASE_FILE ${op_file})
 
         if (NOT TARGET ${OP_TARGET_NAME})
             add_custom_target(${OP_TARGET_NAME})
@@ -511,9 +564,31 @@ function(add_bin_compile_target)
                     COMPUTE_UNIT
                     ${BINARY_COMPUTE_UNIT}
             )
+            if(TARGET batch_invariant_common_${BINARY_COMPUTE_UNIT}_src_copy)
+                add_dependencies(${OP_TARGET_NAME}_src_copy
+                                 batch_invariant_common_${BINARY_COMPUTE_UNIT}_src_copy)
+            endif()
 
-            if (DEFINED ${op_file}_depends)
-                foreach(depend_info ${${op_file}_depends})
+            if(OP_BASE_FILE IN_LIST BATCH_INVARIANT_OPS)
+                set(_bi_local_support_flag
+                    ${OP_SRC_OUT_DIR}/op_kernel/inc/.batch_invariant_support.done)
+                add_custom_command(OUTPUT ${_bi_local_support_flag}
+                    COMMAND ${CMAKE_COMMAND} -E make_directory
+                            ${OP_SRC_OUT_DIR}/op_kernel/inc
+                    COMMAND ${CMAKE_COMMAND} -E copy_directory
+                            ${BATCH_INVARIANT_ROOT}/common/inc/op_kernel
+                            ${OP_SRC_OUT_DIR}/op_kernel/inc
+                    COMMAND ${CMAKE_COMMAND} -E touch ${_bi_local_support_flag}
+                    VERBATIM
+                )
+                add_custom_target(${OP_TARGET_NAME}_bi_support_src_copy
+                    DEPENDS ${_bi_local_support_flag})
+                add_dependencies(${OP_TARGET_NAME}_src_copy
+                                 ${OP_TARGET_NAME}_bi_support_src_copy)
+            endif()
+
+            if (DEFINED ${OP_BASE_FILE}_depends)
+                foreach(depend_info ${${OP_BASE_FILE}_depends})
                     get_filename_component(_depend_op_name "${depend_info}" NAME)
                     set(_depend_op_target ${_depend_op_name}_${BINARY_COMPUTE_UNIT}_src_copy)
                     add_ops_src_copy(
@@ -528,6 +603,31 @@ function(add_bin_compile_target)
                             BE_RELIED
                             ${OP_TARGET_NAME}_src_copy
                     )
+
+                    # Binary staging retains the main operator's op_kernel/
+                    # directory.  Some standalone BI kernels include a
+                    # dependency as ../<op>/<header>, which therefore resolves
+                    # inside the main operator's staging root rather than the
+                    # global source root used by ../../<op>/op_kernel paths.
+                    # Mirror only the dependency's kernel contents there; the
+                    # global dependency copy above remains the canonical path
+                    # for operators that include ../../<op>/op_kernel.
+                    if(EXISTS ${CMAKE_SOURCE_DIR}/${depend_info}/op_kernel)
+                        set(_nested_depend_target
+                            ${OP_TARGET_NAME}_${_depend_op_name}_nested_src_copy)
+                        add_ops_src_copy(
+                                TARGET_NAME
+                                ${_nested_depend_target}
+                                SRC
+                                ${CMAKE_SOURCE_DIR}/${depend_info}/op_kernel
+                                DST
+                                ${OP_SRC_OUT_DIR}/${_depend_op_name}
+                                COMPUTE_UNIT
+                                ${BINARY_COMPUTE_UNIT}
+                                BE_RELIED
+                                ${OP_TARGET_NAME}_src_copy
+                        )
+                    endif()
                 endforeach()
             endif ()
 
