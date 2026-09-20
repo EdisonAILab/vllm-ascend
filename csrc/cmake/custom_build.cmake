@@ -324,6 +324,12 @@ set(BATCH_INVARIANT_OPS
 )
 
 set(OPTEST_NAME optest_${PKG_NAME})
+# The BI matmul host implementations call helpers provided by matmul_utils.
+# Import that shared host module before the concrete operators so the unified
+# tiling library contains both the callers and their definitions.
+add_subdirectory(
+        ${BATCH_INVARIANT_ROOT}/ops/ascendc/matmul_utils/op_host
+        ${CMAKE_CURRENT_BINARY_DIR}/batch_invariant_ops/matmul_utils)
 foreach(BATCH_INVARIANT_OP ${BATCH_INVARIANT_OPS})
     set(BATCH_INVARIANT_OP_DIR
             ${BATCH_INVARIANT_ROOT}/ops/ascendc/${BATCH_INVARIANT_OP})
