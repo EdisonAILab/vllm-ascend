@@ -594,6 +594,79 @@ def test_mxfp_shared_situ_uses_situ_mx_quant(monkeypatch, quant_type):
     assert situ_call["dst_type"] == 36
 
 
+@pytest.mark.parametrize("quant_type", [QuantType.W4A8MXFP, QuantType.W8A8MXFP])
+def test_mxfp_shared_silu_uses_activation_then_dynamic_mx_quant(monkeypatch, quant_type):
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    nn.Module.__init__(runner)
+    hidden_states = torch.randn(2, 4, dtype=torch.bfloat16)
+    quantized_input = torch.ones(2, 4, dtype=torch.float8_e4m3fn)
+    input_scale = torch.ones(2, 1, dtype=torch.float32)
+    gate_up = torch.randn(2, 8, dtype=torch.bfloat16)
+    activated = torch.randn(2, 4, dtype=torch.bfloat16)
+    quantized_activated = torch.ones(2, 4, dtype=torch.float8_e4m3fn)
+    activated_scale = torch.ones(2, 1, dtype=torch.float32)
+    down_out = torch.randn(2, 4, dtype=torch.bfloat16)
+    gate_up_proj = MagicMock(return_value=(gate_up, None))
+    gate_up_proj.weight_scale = torch.ones(1)
+    down_proj = MagicMock(return_value=(down_out, None))
+    down_proj.weight_scale = torch.ones(1)
+    act_fn = MagicMock(return_value=activated)
+    runner._shared_experts = SimpleNamespace(
+        gate_up_proj=gate_up_proj,
+        down_proj=down_proj,
+        act_fn=act_fn,
+    )
+    runner.quant_type = quant_type
+    runner.multistream_overlap_shared_expert = False
+    events = fused_moe_module.FusedMoEEvents(
+        before_routed_experts=MagicMock(),
+        before_dispatch=MagicMock(),
+        before_gmm2=MagicMock(),
+        before_combine=MagicMock(),
+    )
+    dynamic_mx_quant = MagicMock(
+        side_effect=[
+            (quantized_input, input_scale),
+            (quantized_activated, activated_scale),
+        ]
+    )
+
+    monkeypatch.setattr(fused_moe_module, "npu_stream_switch", lambda *_args, **_kwargs: nullcontext())
+    monkeypatch.setattr(fused_moe_module, "shared_expert_dp_enabled", lambda: True)
+    monkeypatch.setattr(fused_moe_module, "shared_experts_calculation_stream", MagicMock())
+    monkeypatch.setattr(
+        fused_moe_module.torch.npu,
+        "current_stream",
+        MagicMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(
+        fused_moe_module.torch_npu,
+        "npu_dynamic_mx_quant",
+        dynamic_mx_quant,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "_EXTRA_CTX",
+        SimpleNamespace(
+            flash_comm_v1_enabled=False,
+            moe_comm_type=MoECommType.ALLGATHER,
+        ),
+    )
+
+    output = runner._forward_shared_experts(hidden_states, events)
+
+    assert output is down_out
+    gate_up_proj.assert_called_once_with((quantized_input, input_scale))
+    act_fn.assert_called_once_with(gate_up)
+    down_proj.assert_called_once_with((quantized_activated, activated_scale))
+    assert dynamic_mx_quant.call_count == 2
+    assert dynamic_mx_quant.call_args_list[0].args == (hidden_states,)
+    assert dynamic_mx_quant.call_args_list[1].args == (activated,)
+    assert dynamic_mx_quant.call_args_list[0].kwargs["dst_type"] is torch.float8_e4m3fn
+    assert dynamic_mx_quant.call_args_list[1].kwargs["dst_type"] is torch.float8_e4m3fn
+
+
 @pytest.mark.parametrize("has_shared_experts", [False, True])
 def test_shared_forward_impl_returns_current_runner_contract(monkeypatch, has_shared_experts):
     runner = AscendMoERunner.__new__(AscendMoERunner)
