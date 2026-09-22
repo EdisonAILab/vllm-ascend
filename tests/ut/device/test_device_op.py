@@ -43,6 +43,23 @@ def test_training_parity_router_uses_bi_softmax():
     assert out.numel() == 0
 
 
+def test_a5_fused_gdn_gating_uses_native_decomposition():
+    A_log = torch.randn(8, dtype=torch.float16)
+    a = torch.randn(37, 8, dtype=torch.float16)
+    b = torch.randn(37, 8, dtype=torch.float16)
+    dt_bias = torch.randn(8, dtype=torch.float16)
+    expected = (torch.randn(1, 37, 8), torch.randn(1, 37, 8))
+
+    with patch(
+        "vllm_ascend.device.device_op.fused_gdn_gating_native",
+        return_value=expected,
+    ) as native:
+        actual = A5DeviceAdaptor.fused_gdn_gating(A_log, a, b, dt_bias)
+
+    assert actual is expected
+    native.assert_called_once_with(A_log, a, b, dt_bias)
+
+
 @pytest.mark.parametrize("use_mla_rope", [True, False])
 def test_a5_mla_preprocess_only_decode_passes_optional_rope(use_mla_rope):
     num_tokens = 2
