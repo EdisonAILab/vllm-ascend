@@ -625,7 +625,7 @@ class AdpBuilder(opdesc_parser.OpDesc):
             kern_name = self.kern_name
         else:
             kern_name = self.op_intf
-        src = self.op_file + ".cpp"
+        src = (self.kernel_src or self.op_file) + ".cpp"
         virt_exprs = self._build_virtual()
         fd.write(
             IMPL_API.format(

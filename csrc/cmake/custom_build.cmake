@@ -295,6 +295,84 @@ else()
     add_subdirectory(attention)
 endif()
 
+# Keep the batch-invariant operators in the same custom vendor as the native
+# transformer operators. Qwen3.5 needs the native GDN APIs and the BI APIs in
+# one libcust_opapi.so; stacking two vendors with that SONAME makes API
+# selection depend on library search order.
+include(cmake/batch_invariant_compat.cmake)
+set(BATCH_INVARIANT_ROOT
+        ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ops_batchinvariant
+        CACHE PATH "ops-batchinvariant source root")
+if(NOT EXISTS ${BATCH_INVARIANT_ROOT}/ops/ascendc/CMakeLists.txt)
+    message(FATAL_ERROR
+            "Missing ops-batchinvariant sources at ${BATCH_INVARIANT_ROOT}. "
+            "Run: git submodule update --init csrc/third_party/ops_batchinvariant")
+endif()
+set(OPS_BATCHINVARIANT_DIR ${BATCH_INVARIANT_ROOT})
+batch_invariant_prepare(${BATCH_INVARIANT_ROOT})
+set(BATCH_INVARIANT_OPS
+        add_rms_norm_batch_invariant
+        batch_mat_mul_v3_batch_invariant
+        fused_infer_attention_score_batch_invariant
+        incre_flash_attention_batch_invariant
+        log_softmax_batch_invariant
+        mat_mul_v3_batch_invariant
+        prompt_flash_attention_batch_invariant
+        reduce_mean_batch_invariant
+        reduce_sum_batch_invariant
+        softmax_batch_invariant
+)
+
+set(OPTEST_NAME optest_${PKG_NAME})
+# The BI matmul host implementations call helpers provided by matmul_utils.
+# Import that shared host module before the concrete operators so the unified
+# tiling library contains both the callers and their definitions.
+add_subdirectory(
+        ${BATCH_INVARIANT_ROOT}/ops/ascendc/matmul_utils/op_host
+        ${CMAKE_CURRENT_BINARY_DIR}/batch_invariant_ops/matmul_utils)
+foreach(BATCH_INVARIANT_OP ${BATCH_INVARIANT_OPS})
+    set(BATCH_INVARIANT_OP_DIR
+            ${BATCH_INVARIANT_ROOT}/ops/ascendc/${BATCH_INVARIANT_OP})
+    if(EXISTS ${BATCH_INVARIANT_OP_DIR}/CMakeLists.txt)
+        add_subdirectory(
+                ${BATCH_INVARIANT_OP_DIR}
+                ${CMAKE_CURRENT_BINARY_DIR}/batch_invariant_ops/${BATCH_INVARIANT_OP})
+    elseif(EXISTS ${BATCH_INVARIANT_OP_DIR}/op_host/CMakeLists.txt)
+        add_subdirectory(
+                ${BATCH_INVARIANT_OP_DIR}/op_host
+                ${CMAKE_CURRENT_BINARY_DIR}/batch_invariant_ops/${BATCH_INVARIANT_OP})
+    else()
+        message(FATAL_ERROR "Missing BI operator CMake for ${BATCH_INVARIANT_OP}")
+    endif()
+endforeach()
+batch_invariant_finalize(${BATCH_INVARIANT_ROOT})
+
+# The standalone BI project declares these source-tree dependencies in its
+# category CMake files.  The transformer package uses a different binary
+# staging pipeline, so expose the same relationships in the variables that
+# add_bin_compile_target consumes.  Shared BI support is staged once by that
+# function to avoid concurrent writes from every operator.
+list(APPEND batch_mat_mul_v3_batch_invariant_depends
+        third_party/ops_batchinvariant/ops/ascendc/mat_mul_v3_batch_invariant)
+list(APPEND incre_flash_attention_batch_invariant_depends
+        third_party/ops_batchinvariant/ops/ascendc/prompt_flash_attention_batch_invariant)
+list(APPEND fused_infer_attention_score_batch_invariant_depends
+        third_party/ops_batchinvariant/ops/ascendc/incre_flash_attention_batch_invariant
+        third_party/ops_batchinvariant/ops/ascendc/prompt_flash_attention_batch_invariant)
+
+foreach(BATCH_INVARIANT_OP ${BATCH_INVARIANT_OPS})
+    list(APPEND OP_LIST ${BATCH_INVARIANT_OP})
+    set(BATCH_INVARIANT_OP_DIR
+            ${BATCH_INVARIANT_ROOT}/ops/ascendc/${BATCH_INVARIANT_OP})
+    list(APPEND OP_DIR_LIST ${BATCH_INVARIANT_OP_DIR})
+    list(APPEND COMPILED_OPS ${BATCH_INVARIANT_OP})
+    list(APPEND COMPILED_OP_DIRS ${BATCH_INVARIANT_OP_DIR})
+endforeach()
+list(REMOVE_DUPLICATES COMPILED_OPS)
+list(REMOVE_DUPLICATES COMPILED_OP_DIRS)
+set(COMPILED_OPS ${COMPILED_OPS} CACHE STRING "Compiled Ops" FORCE)
+set(COMPILED_OP_DIRS ${COMPILED_OP_DIRS} CACHE STRING "Compiled Ops Dirs" FORCE)
+
 
 if (UT_TEST_ALL OR OP_HOST_UT OR OP_API_UT OR OP_KERNEL_UT OR OP_GRAPH_UT)
         add_subdirectory(tests/ut/framework_normal)
@@ -311,7 +389,9 @@ if("${ASCEND_OP_NAME}" STREQUAL "all_gather_add")
 endif()
 
 list(APPEND OP_LIST ${COMPILED_OPS})
+list(REMOVE_DUPLICATES OP_LIST)
 list(APPEND OP_DIR_LIST ${COMPILED_OP_DIRS})
+list(REMOVE_DUPLICATES OP_DIR_LIST)
 
 if(ENABLE_TEST)
     foreach (OP_DIR ${OP_DIR_LIST})
@@ -661,6 +741,7 @@ endif ()
 if (BUILD_OPEN_PROJECT)
     string(REPLACE ";" "\;" OPS_PRODUCT_NAME "${ASCEND_COMPUTE_UNIT}")
     if (generate_aclnn_srcs)
+        string(REPLACE ";" "," _kernel_srcs "${kernel_src_list}")
         add_custom_command(OUTPUT ${generate_aclnn_srcs} ${generate_aclnn_headers}
                 COMMAND mkdir -p ${base_aclnn_binary_dir}
                 COMMAND OPS_PROTO_SEPARATE=1
@@ -670,6 +751,11 @@ if (BUILD_OPEN_PROJECT)
                 ${OP_BUILD_TOOL}
                 $<TARGET_FILE:op_host_aclnn>
                 ${base_aclnn_binary_dir}
+                COMMAND ${HI_PYTHON}
+                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/util/insert_kernel_src.py
+                "${_kernel_srcs}"
+                ${base_aclnn_binary_dir}
+                ${ASCEND_COMPUTE_UNIT}
         )
     endif ()
 
@@ -687,6 +773,11 @@ if (BUILD_OPEN_PROJECT)
                 ${OP_BUILD_TOOL}
                 $<TARGET_FILE:op_host_aclnnInner>
                 ${base_aclnn_binary_dir}/inner
+                COMMAND ${HI_PYTHON}
+                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/util/insert_kernel_src.py
+                "${_kernel_srcs}"
+                ${base_aclnn_binary_dir}/inner
+                ${ASCEND_COMPUTE_UNIT}
         )
     endif ()
 
@@ -704,6 +795,11 @@ if (BUILD_OPEN_PROJECT)
                 ${OP_BUILD_TOOL}
                 $<TARGET_FILE:op_host_aclnnExc>
                 ${base_aclnn_binary_dir}/exc
+                COMMAND ${HI_PYTHON}
+                ${CMAKE_CURRENT_SOURCE_DIR}/scripts/util/insert_kernel_src.py
+                "${_kernel_srcs}"
+                ${base_aclnn_binary_dir}/exc
+                ${ASCEND_COMPUTE_UNIT}
         )
     endif ()
 

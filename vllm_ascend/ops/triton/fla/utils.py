@@ -14,6 +14,8 @@ from collections.abc import Callable
 import torch
 from vllm.triton_utils import tl, triton
 
+from vllm_ascend.utils import is_950
+
 
 def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
     return cu_seqlens[1:] - cu_seqlens[:-1]
@@ -118,6 +120,12 @@ def clear_ssm_states(ssm_states: torch.Tensor, has_initial_state: torch.Tensor) 
         raise ValueError(
             f"clear_ssm_states: has_initial_state size mismatch: expected {num_rows}, got {has_initial_state.numel()}"
         )
+    if is_950():
+        keep_shape = (num_rows,) + (1,) * (ssm_states.ndim - 1)
+        keep = has_initial_state.reshape(keep_shape)
+        ssm_states.copy_(torch.where(keep, ssm_states, 0.0))
+        return
+
     inner_size = ssm_states.numel() // num_rows
     if inner_size == 0:
         return

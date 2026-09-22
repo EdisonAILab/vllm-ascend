@@ -41,7 +41,8 @@ resolve_op_dir() {
         "${ROOT_DIR}/csrc/attention/${op_name}" \
         "${ROOT_DIR}/csrc/mc2/${op_name}" \
         "${ROOT_DIR}/csrc/ffn/${op_name}" \
-        "${ROOT_DIR}/csrc/posembedding/${op_name}"; do
+        "${ROOT_DIR}/csrc/posembedding/${op_name}" \
+        "${ROOT_DIR}/csrc/third_party/ops_batchinvariant/ops/ascendc/${op_name}"; do
         if [[ -d "${candidate_dir}" ]]; then
             echo "${candidate_dir}"
             return 0
@@ -228,6 +229,16 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "store_kv_block_metadata"
         "sparse_attention_score"
         "mla_prolog_v3"
+        "add_rms_norm_batch_invariant"
+        "batch_mat_mul_v3_batch_invariant"
+        "fused_infer_attention_score_batch_invariant"
+        "incre_flash_attention_batch_invariant"
+        "log_softmax_batch_invariant"
+        "mat_mul_v3_batch_invariant"
+        "prompt_flash_attention_batch_invariant"
+        "reduce_mean_batch_invariant"
+        "reduce_sum_batch_invariant"
+        "softmax_batch_invariant"
     )
 
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
@@ -310,19 +321,13 @@ log_selected_ops
   log "installed files under ${custom_ops_install_dir} (maxdepth=4, first 120 entries):"
   { find "${custom_ops_install_dir}" -mindepth 1 -maxdepth 4 -print | sort | head -n 120 | sed 's#^#[build_aclnn] install: #'; } || true
 
-  # install batch_invariant run package and whl package
+  # BI operators are compiled into the custom_transformer vendor above. Do
+  # not install the legacy standalone BI vendor here: both packages export a
+  # libcust_opapi.so, so stacking them makes API resolution depend on search
+  # order and can hide either the native GDN APIs or the BI APIs.
   if [[ "${VLLM_BATCH_INVARIANT:-0}" == "1" ]]; then
-    log "VLLM_BATCH_INVARIANT=1, installing batch_invariant run package and whl package..."
-
-    # call separate installation script
-    batch_invariant_script="${ROOT_DIR}/csrc/build_batch_invariant_ops.sh"
-    if [[ -f "${batch_invariant_script}" ]]; then
-      log "Calling batch_invariant_ops build script: ${batch_invariant_script}"
-      bash "${batch_invariant_script}" "${SOC_ARG}"
-    else
-      log "Warning: batch_invariant_ops build script not found at ${batch_invariant_script}"
-    fi
+    log "VLLM_BATCH_INVARIANT=1, BI operators are already installed in the unified custom_transformer vendor"
   else
-    log "VLLM_BATCH_INVARIANT is not set to 1, skipping batch_invariant ops build"
+    log "VLLM_BATCH_INVARIANT is not set to 1; the unified package still contains BI APIs but runtime selection remains disabled"
   fi
 )

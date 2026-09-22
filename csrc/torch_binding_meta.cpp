@@ -617,6 +617,29 @@ at::Tensor npu_recurrent_gated_delta_rule_meta(
     return output;
 }
 
+#ifdef VLLM_ENABLE_A5_BI_KERNELS
+std::tuple<at::Tensor, at::Tensor> gdn_scan_batch_invariant_meta(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& alpha,
+    const at::Tensor& beta,
+    const at::Tensor& initial_state)
+{
+    return std::make_tuple(
+        at::empty_symint(query.sym_sizes(), value.options()),
+        at::empty_symint(initial_state.sym_sizes(), initial_state.options()));
+}
+
+void gdn_scatter_state_batch_invariant_meta(
+    at::Tensor& state_cache,
+    const at::Tensor& updates,
+    const at::Tensor& state_indices)
+{
+    return;
+}
+#endif
+
 at::Tensor recurrent_kda_meta(
     const at::Tensor& query,
     const at::Tensor& key,
@@ -1950,6 +1973,12 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_gemma_rms_norm", &vllm_ascend::meta::npu_gemma_rms_norm_meta);
     // recurrent_gated_delta_rule meta implementation
     ops.impl("npu_recurrent_gated_delta_rule", &vllm_ascend::meta::npu_recurrent_gated_delta_rule_meta);
+#ifdef VLLM_ENABLE_A5_BI_KERNELS
+    ops.impl("gdn_scan_batch_invariant", &vllm_ascend::meta::gdn_scan_batch_invariant_meta);
+    ops.impl(
+        "gdn_scatter_state_batch_invariant",
+        &vllm_ascend::meta::gdn_scatter_state_batch_invariant_meta);
+#endif
     ops.impl("recurrent_kda", &vllm_ascend::meta::recurrent_kda_meta);
     ops.impl("dequant_situ_quant", &vllm_ascend::meta::dequant_situ_quant_meta);
     ops.impl("situ_mx_quant", &vllm_ascend::meta::situ_mx_quant_meta);

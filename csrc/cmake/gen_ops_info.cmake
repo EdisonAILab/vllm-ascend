@@ -38,6 +38,48 @@ function(kernel_src_copy)
       endif()
     endif()
   endforeach()
+
+  if(BATCH_INVARIANT_ROOT)
+    add_custom_target(batch_invariant_common_src_copy
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${KNCPY_DST_DIR}/inc
+      COMMAND ${CMAKE_COMMAND} -E copy_directory
+              ${BATCH_INVARIANT_ROOT}/common/inc/op_kernel
+              ${KNCPY_DST_DIR}/inc
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${KNCPY_DST_DIR}/common
+      COMMAND ${CMAKE_COMMAND} -E copy_directory
+              ${BATCH_INVARIANT_ROOT}/ops/ascendc/common/op_kernel
+              ${KNCPY_DST_DIR}/common
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${KNCPY_DST_DIR}/common/act
+      COMMAND ${CMAKE_COMMAND} -E copy_directory
+              ${BATCH_INVARIANT_ROOT}/common/act
+              ${KNCPY_DST_DIR}/common/act
+      COMMAND ${CMAKE_COMMAND} -E make_directory ${KNCPY_DST_DIR}/common/cmct
+      COMMAND ${CMAKE_COMMAND} -E copy_directory
+              ${BATCH_INVARIANT_ROOT}/ops/ascendc/mat_mul_v3_batch_invariant/common/cmct
+              ${KNCPY_DST_DIR}/common/cmct
+      VERBATIM
+    )
+    add_dependencies(${KNCPY_TARGET} batch_invariant_common_src_copy)
+
+    if(ENABLE_PACKAGE)
+      install(
+        DIRECTORY ${BATCH_INVARIANT_ROOT}/common/inc/op_kernel/
+        DESTINATION ${IMPL_INSTALL_DIR}/inc
+      )
+      install(
+        DIRECTORY ${BATCH_INVARIANT_ROOT}/ops/ascendc/common/op_kernel/
+        DESTINATION ${IMPL_INSTALL_DIR}/common
+      )
+      install(
+        DIRECTORY ${BATCH_INVARIANT_ROOT}/common/act/
+        DESTINATION ${IMPL_INSTALL_DIR}/common/act
+      )
+      install(
+        DIRECTORY ${BATCH_INVARIANT_ROOT}/ops/ascendc/mat_mul_v3_batch_invariant/common/cmct/
+        DESTINATION ${IMPL_INSTALL_DIR}/common/cmct
+      )
+    endif()
+  endif()
 endfunction()
 
 ###################################################################################################

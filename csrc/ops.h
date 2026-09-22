@@ -24,6 +24,30 @@
 #include "torch_npu/csrc/aten/common/from_blob.h"
 
 namespace vllm_ascend {
+#ifdef VLLM_ENABLE_A5_BI_KERNELS
+    extern void gdn_scan_batch_invariant_impl(
+        void* stream,
+        void* q,
+        void* k,
+        void* v,
+        void* alpha,
+        void* beta,
+        void* initial_state,
+        void* output,
+        void* final_state,
+        int64_t batch,
+        int64_t tokens,
+        int64_t chunk_count);
+    extern void gdn_scatter_state_batch_invariant_impl(
+        void* stream,
+        void* state_cache,
+        void* updates,
+        void* state_indices,
+        int64_t cache_rows,
+        int64_t rows,
+        int64_t row_elements);
+#endif
+
   extern void bgmv_shrink_impl(
         AscendType type,
         void *stream,

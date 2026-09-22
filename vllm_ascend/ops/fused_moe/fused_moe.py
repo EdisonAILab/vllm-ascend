@@ -924,13 +924,12 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                         dst_type=situ_dst_type,
                     )
                 else:
-                    quantized_x, swiglu_out_scale, _ = torch.ops._C_ascend.npu_swiglu_group_quant(
-                        hidden_states,
-                        topk_weight=None,
-                        group_index=None,
-                        dst_type=torch.float8_e4m3fn,
-                        quant_mode=2,
-                        clamp_value=fused_moe_evts.swiglu_limit,
+                    # CANN 9.2 exposes npu_swiglu_group_quant but fails to
+                    # allocate its output on A5. Keep the model's activation
+                    # semantics and quantize the activated tensor separately.
+                    hidden_states = self._shared_experts.act_fn(hidden_states)
+                    quantized_x, swiglu_out_scale = torch_npu.npu_dynamic_mx_quant(
+                        hidden_states, dst_type=torch.float8_e4m3fn
                     )
                 # Execute the down projection concurrently with the combine
                 # communication.

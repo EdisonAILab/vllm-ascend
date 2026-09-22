@@ -10,6 +10,35 @@ from vllm.sequence import IntermediateTensors
 from vllm_ascend.patch.worker import patch_qwen3_5
 
 
+def test_qwen3_5_attention_uses_unfused_qk_norm_mrope_on_a5():
+    attention = patch_qwen3_5.AscendQwen3NextAttention.__new__(
+        patch_qwen3_5.AscendQwen3NextAttention
+    )
+    torch.nn.Module.__init__(attention)
+    attention.config = SimpleNamespace(model_type="qwen3_5_moe_text")
+    attention.attn_output_gate = True
+    qkv = torch.randn(2, 16)
+    q = torch.randn(2, 8)
+    k = torch.randn(2, 4)
+    v = torch.randn(2, 4)
+    gate = torch.zeros(2, 8)
+    attention.qkv_proj = MagicMock(return_value=(qkv, None))
+    attention._project_qkv_gate = MagicMock(return_value=(q, k, v, gate))
+    attention.attn = MagicMock(return_value=torch.full_like(gate, 2.0))
+    expected = torch.randn(2, 16)
+    attention.o_proj = MagicMock(return_value=(expected, None))
+    positions = torch.arange(2)
+
+    with patch("vllm_ascend.patch.worker.patch_qwen3_5.is_950", return_value=True):
+        actual = attention.forward(positions, torch.randn(2, 16))
+
+    assert actual is expected
+    attention._project_qkv_gate.assert_called_once_with(qkv, positions)
+    attention.attn.assert_called_once_with(q, k, v)
+    projected_input = attention.o_proj.call_args.args[0]
+    assert torch.equal(projected_input, torch.ones_like(gate))
+
+
 @pytest.mark.skipif(
     patch_qwen3_5.Qwen3_5MultiTokenPredictor is None,
     reason="Qwen3.5 MTP model is not available in this vLLM version.",

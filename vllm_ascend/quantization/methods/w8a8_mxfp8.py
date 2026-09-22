@@ -44,7 +44,6 @@ _GROUPED_BI_DECOMPOSE = os.environ.get("VLLM_MXFP8_GROUPED_BI_DECOMPOSE") == "1"
 _GROUPED_BI_GRAPH_NATIVE = (
     os.environ.get("VLLM_MXFP8_GROUPED_BI_GRAPH_NATIVE") == "1"
 )
-_DENSE_BI_NOTICE_PRINTED = False
 _GROUPED_BI_NOTICE_PRINTED = False
 _GROUPED_WEIGHT_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
 _NATIVE_NPU_GROUPED_MATMUL = torch_npu.npu_grouped_matmul
@@ -90,14 +89,6 @@ def _dense_bi_matmul(
     output_dtype: torch.dtype,
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    global _DENSE_BI_NOTICE_PRINTED
-    if not _DENSE_BI_NOTICE_PRINTED:
-        print(
-            "[BI_MXFP8_DENSE] dequantize + bf16 fixed-order matmul enabled",
-            flush=True,
-        )
-        _DENSE_BI_NOTICE_PRINTED = True
-
     cached = getattr(layer, "_bi_dense_bf16_weight", None)
     if cached is None:
         cached = _dequant_weight(layer.weight, layer.weight_scale, group_size).to(

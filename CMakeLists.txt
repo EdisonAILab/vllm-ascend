@@ -66,6 +66,9 @@ set(VLLM_ASCEND_CUSTOM_OP_EXCLUDE_ASCEND950
 if(SOC_VERSION MATCHES "ascend950")
     message(STATUS "A5 hardware detected: disabling MLAPO operators")
     list(REMOVE_ITEM VLLM_ASCEND_CUSTOM_OP ${VLLM_ASCEND_CUSTOM_OP_EXCLUDE_ASCEND950})
+    ascendc_library(vllm_ascend_a5_bi_kernels SHARED
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/a5/gdn_scan_batch_invariant.cpp
+    )
 endif()
 
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
@@ -151,6 +154,10 @@ if(SOC_VERSION MATCHES "ascend310p.*")
     target_compile_definitions(vllm_ascend_C PRIVATE -DASCEND_PLATFORM_310P)
 endif()
 
+if(SOC_VERSION MATCHES "ascend950")
+    target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_A5_BI_KERNELS)
+endif()
+
 if(NOT (SOC_VERSION MATCHES "ascend310p.*|ascend950"))
     target_compile_definitions(vllm_ascend_C PRIVATE -DVLLM_ENABLE_ATB_AND_DIRECT_KERNELS)
 endif()
@@ -175,10 +182,17 @@ set(VLLM_ASCEND_C_COMMON_LIBS
   opapi
 )
 
-if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
+if(SOC_VERSION MATCHES "ascend310p.*")
   target_link_libraries(
     vllm_ascend_C
     PUBLIC
+    ${VLLM_ASCEND_C_COMMON_LIBS}
+  )
+elseif(SOC_VERSION MATCHES "ascend950")
+  target_link_libraries(
+    vllm_ascend_C
+    PUBLIC
+    vllm_ascend_a5_bi_kernels
     ${VLLM_ASCEND_C_COMMON_LIBS}
   )
 else()
@@ -192,8 +206,10 @@ endif()
 
 target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGIN/_cann_ops_custom/vendors/custom_transformer/op_api/lib")
 
-if(SOC_VERSION MATCHES "ascend310p.*|ascend950")
+if(SOC_VERSION MATCHES "ascend310p.*")
   install(TARGETS vllm_ascend_C DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
+elseif(SOC_VERSION MATCHES "ascend950")
+  install(TARGETS vllm_ascend_C vllm_ascend_a5_bi_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 else()
   install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
 endif()

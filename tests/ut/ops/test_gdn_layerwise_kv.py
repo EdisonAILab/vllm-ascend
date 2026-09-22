@@ -99,6 +99,13 @@ def _run_gdn_forward(
     return model(hidden_states)
 
 
+def _register_cpu_attention_core() -> torch.library.Library:
+    """Keep a CPU test registration alive for this test's lifetime."""
+    cpu_impl = torch.library.Library("vllm", "IMPL", "CPU")
+    cpu_impl.impl("qwen_gdn_attention_core", qwen_gdn_attention_core)
+    return cpu_impl
+
+
 def _make_prefill_metadata(device: torch.device | str = "cpu") -> GDNAttentionMetadata:
     metadata = GDNAttentionMetadata(
         num_prefills=1,
@@ -122,7 +129,39 @@ def _make_prefill_metadata(device: torch.device | str = "cpu") -> GDNAttentionMe
             cache_indices=torch.tensor([0], dtype=torch.int32, device=device),
             initial_state_mode=torch.tensor([1], dtype=torch.int32, device=device),
         ),
-        chunk=Mock(),
+        chunk=SimpleNamespace(cu_seqlens_host=(0, 2)),
+    )
+    return metadata
+
+
+def _make_decode_metadata(
+    *,
+    graph_batch_size: int,
+    num_live_tokens: int,
+    device: torch.device | str = "cpu",
+) -> GDNAttentionMetadata:
+    state_indices = torch.tensor(
+        [0, 1, *([-1] * (graph_batch_size - num_live_tokens))],
+        dtype=torch.int32,
+        device=device,
+    )
+    metadata = GDNAttentionMetadata(
+        num_prefills=0,
+        num_prefill_tokens=0,
+        num_decodes=graph_batch_size,
+        num_decode_tokens=num_live_tokens,
+        num_spec_decodes=0,
+        num_spec_decode_tokens=0,
+        num_actual_tokens=graph_batch_size,
+        non_spec_state_indices_tensor=state_indices,
+    )
+    metadata.non_spec_decode_metadata = SimpleNamespace(
+        actual_seq_lengths=torch.ones(graph_batch_size, dtype=torch.int32, device=device),
+        causal_conv1d=GDNCausalConv1dMetadata(
+            query_start_loc=torch.arange(graph_batch_size + 1, dtype=torch.int32, device=device),
+            cache_indices=state_indices,
+            initial_state_mode=None,
+        ),
     )
     return metadata
 
@@ -130,8 +169,7 @@ def _make_prefill_metadata(device: torch.device | str = "cpu") -> GDNAttentionMe
 def test_connector_observes_updated_gdn_state_for_each_compiled_call():
     # vLLM registers this production dispatcher for NPU only. Keep a CPU
     # registration alive for this test so Inductor sees the same custom op.
-    cpu_impl = torch.library.Library("vllm", "IMPL", "CPU")
-    cpu_impl.impl("qwen_gdn_attention_core", qwen_gdn_attention_core)
+    cpu_impl = _register_cpu_attention_core()
     model = _GDNForwardWrapper()
     hidden_states = torch.arange(4, dtype=torch.float32).reshape(2, 2)
     output = torch.empty_like(hidden_states)
@@ -195,3 +233,122 @@ def test_connector_observes_updated_gdn_state_for_each_compiled_call():
     for execution, (conv_state, ssm_state) in enumerate(observed_states, start=1):
         torch.testing.assert_close(conv_state, torch.full_like(conv_state, execution))
         torch.testing.assert_close(ssm_state, torch.full_like(ssm_state, execution))
+
+
+def test_batch_invariant_prefill_preserves_cache_orientation_and_updates_state():
+    cpu_impl = _register_cpu_attention_core()
+    model = _GDNForwardWrapper()
+    model.ssm_state[0, 0].copy_(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+    hidden_states = torch.arange(4, dtype=torch.float32).reshape(2, 2)
+    output = torch.empty_like(hidden_states)
+    metadata = _make_prefill_metadata()
+    forward_context = ForwardContext(
+        no_compile_layers={model.prefix: model},
+        attn_metadata={model.prefix: metadata},
+        slot_mapping={},
+    )
+    captured = {}
+
+    def causal_conv1d(output_tensor, mixed_qkv, conv_weights, **kwargs):
+        del conv_weights, kwargs
+        output_tensor.copy_(mixed_qkv)
+
+    def batch_invariant_prefill(query, key, value, log_decay, beta, initial_state, cu_seqlens_host):
+        del query, key, log_decay, beta
+        captured["initial_state"] = initial_state.clone()
+        captured["cu_seqlens_host"] = tuple(cu_seqlens_host)
+        return value + 1, initial_state + 5
+
+    gating = (torch.zeros(1, 2, 1), torch.zeros(1, 2, 1))
+    with (
+        override_forward_context(forward_context),
+        patch.object(torch.accelerator, "is_available", return_value=False),
+        patch("vllm_ascend.ops.gdn.get_pcp_group", return_value=SimpleNamespace(world_size=1)),
+        patch("vllm_ascend.ops.gdn.DeviceOperator.fused_gdn_gating", return_value=gating),
+        patch("vllm_ascend.ops.gdn.clear_ssm_states"),
+        patch("vllm_ascend.ops.gdn.envs.VLLM_BATCH_INVARIANT", True),
+        patch("vllm_ascend.ops.gdn.is_gdn_scan_batch_invariant_available", return_value=True),
+        patch("vllm_ascend.ops.gdn.gdn_scan_batch_invariant_packed", side_effect=batch_invariant_prefill),
+        patch.object(
+            torch.ops._C_ascend,
+            "npu_causal_conv1d_custom",
+            side_effect=causal_conv1d,
+            create=True,
+        ),
+    ):
+        result = model(hidden_states, output)
+
+    torch.testing.assert_close(result, hidden_states + 1)
+    torch.testing.assert_close(
+        captured["initial_state"][0, 0],
+        torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+    )
+    assert captured["cu_seqlens_host"] == (0, 2)
+    torch.testing.assert_close(
+        model.ssm_state[0, 0],
+        torch.tensor([[6.0, 7.0], [8.0, 9.0]]),
+    )
+
+
+def test_batch_invariant_decode_keeps_fixed_graph_width_and_updates_real_rows():
+    cpu_impl = _register_cpu_attention_core()
+    graph_batch_size = 4
+    model = _GDNForwardWrapper()
+    model.ssm_state = torch.zeros(3, 1, 2, 2)
+    model.ssm_state[0].fill_(1)
+    model.ssm_state[1].fill_(2)
+    model.ssm_state[2].fill_(9)
+    hidden_states = torch.arange(graph_batch_size * 2, dtype=torch.float32).reshape(graph_batch_size, 2)
+    output = torch.empty_like(hidden_states)
+    metadata = _make_decode_metadata(graph_batch_size=graph_batch_size, num_live_tokens=2)
+    forward_context = ForwardContext(
+        no_compile_layers={model.prefix: model},
+        attn_metadata={model.prefix: metadata},
+        slot_mapping={},
+    )
+    captured = {}
+
+    def causal_conv1d(output_tensor, mixed_qkv, conv_weights, **kwargs):
+        del conv_weights, kwargs
+        output_tensor.copy_(mixed_qkv)
+
+    def batch_invariant_decode(query, key, value, log_decay, beta, initial_state):
+        del key, log_decay, beta
+        captured["query_shape"] = tuple(query.shape)
+        captured["initial_state"] = initial_state.clone()
+        return value + 1, initial_state + 5
+
+    def scatter_state(state_cache, updates, state_indices):
+        captured["state_indices"] = state_indices.clone()
+        valid = state_indices >= 0
+        state_cache[state_indices[valid].long()] = updates[valid]
+
+    gating = (
+        torch.zeros(1, graph_batch_size, 1),
+        torch.zeros(1, graph_batch_size, 1),
+    )
+    with (
+        override_forward_context(forward_context),
+        patch.object(torch.accelerator, "is_available", return_value=False),
+        patch("vllm_ascend.ops.gdn.DeviceOperator.fused_gdn_gating", return_value=gating),
+        patch("vllm_ascend.ops.gdn.envs.VLLM_BATCH_INVARIANT", True),
+        patch("vllm_ascend.ops.gdn.is_gdn_scan_batch_invariant_available", return_value=True),
+        patch("vllm_ascend.ops.gdn.gdn_scan_batch_invariant_dense", side_effect=batch_invariant_decode),
+        patch("vllm_ascend.ops.gdn.gdn_scatter_state_batch_invariant", side_effect=scatter_state),
+        patch.object(
+            torch.ops._C_ascend,
+            "npu_causal_conv1d_custom",
+            side_effect=causal_conv1d,
+            create=True,
+        ),
+    ):
+        result = model(hidden_states, output)
+
+    assert captured["query_shape"] == (graph_batch_size, 1, 1, 2)
+    assert captured["state_indices"].tolist() == [0, 1, -1, -1]
+    torch.testing.assert_close(captured["initial_state"][0], torch.ones(1, 2, 2))
+    torch.testing.assert_close(captured["initial_state"][1], torch.full((1, 2, 2), 2.0))
+    torch.testing.assert_close(result, hidden_states + 1)
+    torch.testing.assert_close(model.ssm_state[0], torch.full((1, 2, 2), 6.0))
+    torch.testing.assert_close(model.ssm_state[1], torch.full((1, 2, 2), 7.0))
+    torch.testing.assert_close(model.ssm_state[2], torch.full((1, 2, 2), 9.0))

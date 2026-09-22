@@ -2366,6 +2366,117 @@ std::vector<int64_t> get_npu_storage_shape(const at::Tensor& tensor)
     return std::vector<int64_t>(desc.storage_sizes_.begin(), desc.storage_sizes_.end());
 }
 
+#ifdef VLLM_ENABLE_A5_BI_KERNELS
+std::tuple<at::Tensor, at::Tensor> gdn_scan_batch_invariant(
+    const at::Tensor& query,
+    const at::Tensor& key,
+    const at::Tensor& value,
+    const at::Tensor& alpha,
+    const at::Tensor& beta,
+    const at::Tensor& initial_state)
+{
+    constexpr int64_t head_dim = 128;
+    constexpr int64_t max_tokens = 4096;
+    TORCH_CHECK(query.is_privateuseone(), "gdn_scan_batch_invariant: query must be on NPU.");
+    TORCH_CHECK(key.device() == query.device() && value.device() == query.device() &&
+                alpha.device() == query.device() && beta.device() == query.device() &&
+                initial_state.device() == query.device(),
+                "gdn_scan_batch_invariant: all inputs must be on the same NPU.");
+    TORCH_CHECK(query.scalar_type() == at::kBFloat16 && key.scalar_type() == at::kBFloat16 &&
+                value.scalar_type() == at::kBFloat16,
+                "gdn_scan_batch_invariant: query, key, and value must be bfloat16.");
+    TORCH_CHECK(alpha.scalar_type() == at::kFloat && beta.scalar_type() == at::kFloat &&
+                initial_state.scalar_type() == at::kFloat,
+                "gdn_scan_batch_invariant: alpha, beta, and initial_state must be float32.");
+    TORCH_CHECK(query.dim() == 3 && query.size(2) == head_dim,
+                "gdn_scan_batch_invariant: query must have shape [B, T, 128].");
+    TORCH_CHECK(key.sizes() == query.sizes() && value.sizes() == query.sizes(),
+                "gdn_scan_batch_invariant: key and value must match query shape.");
+
+    const int64_t batch = query.size(0);
+    const int64_t tokens = query.size(1);
+    TORCH_CHECK(batch > 0 && tokens > 0,
+                "gdn_scan_batch_invariant: B and T must both be positive.");
+    TORCH_CHECK(tokens <= max_tokens,
+                "gdn_scan_batch_invariant: T must not exceed 4096; chunk the input first.");
+    TORCH_CHECK(alpha.dim() == 2 && alpha.size(0) == batch && alpha.size(1) == tokens &&
+                beta.sizes() == alpha.sizes(),
+                "gdn_scan_batch_invariant: alpha and beta must have shape [B, T].");
+    TORCH_CHECK(initial_state.dim() == 3 && initial_state.size(0) == batch &&
+                initial_state.size(1) == head_dim && initial_state.size(2) == head_dim,
+                "gdn_scan_batch_invariant: initial_state must have shape [B, 128, 128].");
+
+    const at::Tensor query_contiguous = query.contiguous();
+    const at::Tensor key_contiguous = key.contiguous();
+    const at::Tensor value_contiguous = value.contiguous();
+    const at::Tensor alpha_contiguous = alpha.contiguous();
+    const at::Tensor beta_contiguous = beta.contiguous();
+    const at::Tensor state_contiguous = initial_state.contiguous();
+    at::Tensor output = at::empty(query.sizes(), value.options());
+    at::Tensor final_state = at::empty(initial_state.sizes(), initial_state.options());
+
+    const int64_t chunk_count = batch >= 56 ? 1 : (batch >= 28 ? 2 : (batch >= 14 ? 4 : 8));
+    auto stream = c10_npu::getCurrentNPUStream().stream();
+    gdn_scan_batch_invariant_impl(
+        stream,
+        query_contiguous.data_ptr(),
+        key_contiguous.data_ptr(),
+        value_contiguous.data_ptr(),
+        alpha_contiguous.data_ptr(),
+        beta_contiguous.data_ptr(),
+        state_contiguous.data_ptr(),
+        output.data_ptr(),
+        final_state.data_ptr(),
+        batch,
+        tokens,
+        chunk_count);
+    return std::make_tuple(output, final_state);
+}
+
+void gdn_scatter_state_batch_invariant(
+    at::Tensor& state_cache,
+    const at::Tensor& updates,
+    const at::Tensor& state_indices)
+{
+    TORCH_CHECK(state_cache.is_privateuseone(),
+                "gdn_scatter_state_batch_invariant: state_cache must be on NPU.");
+    TORCH_CHECK(updates.device() == state_cache.device() &&
+                state_indices.device() == state_cache.device(),
+                "gdn_scatter_state_batch_invariant: all inputs must be on the same NPU.");
+    TORCH_CHECK(state_cache.scalar_type() == at::kFloat &&
+                updates.scalar_type() == at::kFloat,
+                "gdn_scatter_state_batch_invariant: state_cache and updates must be float32.");
+    TORCH_CHECK(state_indices.scalar_type() == at::kInt,
+                "gdn_scatter_state_batch_invariant: state_indices must be int32.");
+    TORCH_CHECK(state_cache.is_contiguous() && updates.is_contiguous() &&
+                state_indices.is_contiguous(),
+                "gdn_scatter_state_batch_invariant: all inputs must be contiguous.");
+    TORCH_CHECK(state_cache.dim() >= 2 && updates.dim() == state_cache.dim(),
+                "gdn_scatter_state_batch_invariant: state tensors must have matching ranks of at least two.");
+    TORCH_CHECK(state_indices.dim() == 1 &&
+                state_indices.size(0) == updates.size(0),
+                "gdn_scatter_state_batch_invariant: one state index is required per update row.");
+    TORCH_CHECK(state_cache.sizes().slice(1) == updates.sizes().slice(1),
+                "gdn_scatter_state_batch_invariant: update rows must match the cache row shape.");
+
+    const int64_t rows = updates.size(0);
+    TORCH_CHECK(rows > 0,
+                "gdn_scatter_state_batch_invariant: at least one update row is required.");
+    const int64_t row_elements = updates.numel() / rows;
+    TORCH_CHECK(row_elements > 0 && row_elements % 8 == 0,
+                "gdn_scatter_state_batch_invariant: nonempty rows must be 32-byte aligned.");
+    auto stream = c10_npu::getCurrentNPUStream().stream();
+    gdn_scatter_state_batch_invariant_impl(
+        stream,
+        state_cache.data_ptr(),
+        updates.data_ptr(),
+        state_indices.data_ptr(),
+        state_cache.size(0),
+        rows,
+        row_elements);
+}
+#endif
+
 
 } // namespace vllm_ascend
 
@@ -2455,6 +2566,20 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                               Tensor? g=None, "
         "                               Tensor? gk=None) -> Tensor");
     ops.impl("npu_recurrent_gated_delta_rule", torch::kPrivateUse1, &vllm_ascend::npu_recurrent_gated_delta_rule);
+
+#ifdef VLLM_ENABLE_A5_BI_KERNELS
+    ops.def(
+        "gdn_scan_batch_invariant(Tensor query, Tensor key, Tensor value, "
+        "Tensor alpha, Tensor beta, Tensor initial_state) -> (Tensor output, Tensor final_state)");
+    ops.impl("gdn_scan_batch_invariant", torch::kPrivateUse1, &vllm_ascend::gdn_scan_batch_invariant);
+    ops.def(
+        "gdn_scatter_state_batch_invariant(Tensor(a!) state_cache, Tensor updates, "
+        "Tensor state_indices) -> ()");
+    ops.impl(
+        "gdn_scatter_state_batch_invariant",
+        torch::kPrivateUse1,
+        &vllm_ascend::gdn_scatter_state_batch_invariant);
+#endif
 
     ops.def(
         "recurrent_kda(Tensor query, Tensor key, Tensor value, Tensor gate, Tensor beta, "
