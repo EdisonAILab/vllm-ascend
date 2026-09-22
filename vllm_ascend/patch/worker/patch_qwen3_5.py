@@ -34,7 +34,7 @@ from vllm.model_executor.models.qwen3_next import Qwen3NextAttention
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.gdn import AscendGatedDeltaNetAttention
-from vllm_ascend.utils import is_310p
+from vllm_ascend.utils import is_310p, is_950
 
 
 def _ascend_all_gather_hidden_and_residual(
@@ -66,26 +66,32 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
     def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor, output: torch.Tensor = None):
         qkv, _ = self.qkv_proj(hidden_states)
         if "qwen3_5" in self.config.model_type:
-            cos_sin = self.rotary_emb.cos_sin_cache[positions]
-            if cos_sin.device != qkv.device:
-                cos_sin = cos_sin.to(qkv.device)
-            if cos_sin.dtype != qkv.dtype:
-                cos_sin = cos_sin.to(qkv.dtype)
+            if is_950():
+                # The Triton split/QK-norm/MRoPE kernel is unsupported on
+                # Ascend 950. The upstream helper performs the same operations
+                # as graph-capturable PyTorch primitives.
+                q, k, v, gate = self._project_qkv_gate(qkv, positions)
+            else:
+                cos_sin = self.rotary_emb.cos_sin_cache[positions]
+                if cos_sin.device != qkv.device:
+                    cos_sin = cos_sin.to(qkv.device)
+                if cos_sin.dtype != qkv.dtype:
+                    cos_sin = cos_sin.to(qkv.dtype)
 
-            q, k, v, gate = torch.ops.vllm.triton_split_qkv_rmsnorm_mrope(
-                qkv=qkv,
-                q_weight=1.0 + self.q_norm.weight,
-                k_weight=1.0 + self.k_norm.weight,
-                cos_sin=cos_sin,
-                num_q_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_dim,
-                eps=self.config.rms_norm_eps,
-                mrope_section=self.rotary_emb.mrope_section,
-                is_interleaved=self.rotary_emb.mrope_interleaved,
-                rope_dim=self.rotary_emb.rotary_dim,
-                has_gate=self.attn_output_gate,
-            )
+                q, k, v, gate = torch.ops.vllm.triton_split_qkv_rmsnorm_mrope(
+                    qkv=qkv,
+                    q_weight=1.0 + self.q_norm.weight,
+                    k_weight=1.0 + self.k_norm.weight,
+                    cos_sin=cos_sin,
+                    num_q_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_dim,
+                    eps=self.config.rms_norm_eps,
+                    mrope_section=self.rotary_emb.mrope_section,
+                    is_interleaved=self.rotary_emb.mrope_interleaved,
+                    rope_dim=self.rotary_emb.rotary_dim,
+                    has_gate=self.attn_output_gate,
+                )
         else:
             if self.attn_output_gate:
                 q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)

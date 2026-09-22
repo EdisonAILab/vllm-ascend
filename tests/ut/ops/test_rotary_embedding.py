@@ -22,6 +22,7 @@ import torch
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, YaRNScalingRotaryEmbedding
 
 from vllm_ascend.ops.rotary_embedding import (
+    AscendMRotaryEmbedding,
     AscendRotaryEmbedding,
     AscendYaRNRotaryEmbedding,
     get_identity_cos_and_sin_mla,
@@ -35,6 +36,53 @@ BASE = 10000.0
 DTYPE = torch.bfloat16
 SEQ_LEN = 4
 NUM_HEADS = 2
+
+
+@patch("vllm_ascend.ops.rotary_embedding.HAS_TRITON", True)
+@patch("vllm_ascend.ops.rotary_embedding.is_950", return_value=True)
+@patch.object(AscendMRotaryEmbedding, "forward_triton")
+@patch.object(AscendMRotaryEmbedding, "forward_native")
+def test_mrope_forward_oot_uses_native_path_on_a5(
+    mock_native,
+    mock_triton,
+    mock_is_950,
+):
+    embedding = AscendMRotaryEmbedding.__new__(AscendMRotaryEmbedding)
+    positions = torch.zeros((3, 2), dtype=torch.long)
+    query = torch.randn(2, 16)
+    key = torch.randn(2, 16)
+    mock_native.return_value = (query, key)
+
+    actual = embedding.forward_oot(positions, query, key)
+
+    assert actual == (query, key)
+    mock_is_950.assert_called_once_with()
+    mock_native.assert_called_once_with(positions, query, key)
+    mock_triton.assert_not_called()
+
+
+@patch("vllm_ascend.ops.rotary_embedding.HAS_TRITON", True)
+@patch("vllm_ascend.ops.rotary_embedding.is_950", return_value=False)
+@patch.object(AscendMRotaryEmbedding, "forward_triton")
+@patch.object(AscendMRotaryEmbedding, "forward_native")
+def test_mrope_forward_oot_keeps_triton_path_on_other_devices(
+    mock_native,
+    mock_triton,
+    mock_is_950,
+):
+    embedding = AscendMRotaryEmbedding.__new__(AscendMRotaryEmbedding)
+    embedding.mrope_interleaved = True
+    positions = torch.zeros((3, 2), dtype=torch.long)
+    query = torch.randn(2, 16)
+    key = torch.randn(2, 16)
+    mock_triton.return_value = (query, key)
+
+    actual = embedding.forward_oot(positions, query, key)
+
+    assert actual == (query, key)
+    mock_is_950.assert_called_once_with()
+    mock_triton.assert_called_once_with(positions, query, key)
+    mock_native.assert_not_called()
 
 
 def test_kimi_k3_identity_mla_rope_does_not_index_position_cache(monkeypatch):

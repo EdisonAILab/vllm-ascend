@@ -22,7 +22,7 @@ from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm, RMSNormG
 
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.triton.fused_norm_gate import layer_norm_fwd_npu
-from vllm_ascend.utils import enable_custom_op
+from vllm_ascend.utils import enable_custom_op, is_950
 
 
 _TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
@@ -209,6 +209,11 @@ class AscendRMSNormGated(RMSNormGated):
 
     def forward_oot(self, x, z=None):
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
+        if is_950():
+            # The FLA Triton gated-normalization kernels are unsupported on
+            # Ascend 950. Keep the operation graph-capturable by tracing the
+            # equivalent PyTorch decomposition on this device generation.
+            return self.forward_native(x, z)
         return LayerNormFn.apply(
             x,
             self.weight,

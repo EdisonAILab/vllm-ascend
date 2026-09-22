@@ -5,6 +5,7 @@ import torch
 from vllm.config import set_current_vllm_config
 from vllm.model_executor.layers.layernorm import RMSNorm
 
+from vllm_ascend.ops.layernorm import AscendRMSNormGated
 from vllm_ascend.utils import enable_custom_op
 from vllm_ascend.utils import is_310p as is_310p_hw
 
@@ -82,3 +83,24 @@ def test_RMSNorm_forward_310p(mock_add_rmsnorm, mock_rmsnorm, residual, dummy_te
         expected_out_x = dummy_tensor + 1
         mock_rmsnorm.assert_called_once()
         assert torch.allclose(out_x, expected_out_x)
+
+
+def test_rms_norm_gated_uses_native_decomposition_on_a5(default_vllm_config):
+    layer = AscendRMSNormGated(
+        hidden_size=8,
+        eps=1e-5,
+        norm_before_gate=True,
+        activation="silu",
+    )
+    x = torch.randn(4, 8)
+    gate = torch.randn_like(x)
+    expected = torch.randn_like(x)
+
+    with (
+        patch("vllm_ascend.ops.layernorm.is_950", return_value=True),
+        patch.object(layer, "forward_native", return_value=expected) as forward_native,
+    ):
+        actual = layer.forward_oot(x, gate)
+
+    assert actual is expected
+    forward_native.assert_called_once_with(x, gate)

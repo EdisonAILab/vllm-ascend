@@ -593,6 +593,9 @@ class AscendMRotaryEmbedding(MRotaryEmbedding):
         query: torch.Tensor,
         key: torch.Tensor,
     ):
+        if is_950():
+            return self.forward_native(positions, query, key)
+
         if HAS_TRITON and positions.ndim == 2 and self.mrope_interleaved:
             # todo: need cann update in 8.5.0
             return self.forward_triton(positions, query, key)
