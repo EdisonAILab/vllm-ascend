@@ -33,8 +33,15 @@ from transformers import BatchFeature
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions, ImageDummyOptions
-from vllm.distributed import divide, get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    divide,
+    get_tp_group,
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.inputs import MultiModalDataDict
+from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.model_executor.layers.activation import SiluAndMul, get_act_fn
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
@@ -118,7 +125,7 @@ from vllm_ascend.ops.kimi_kda import uses_kimi_k3_global_inputs_embeds
 from vllm_ascend.ops.kimi_kda_state import kimi_kda_state_shape
 from vllm_ascend.transformers_utils.configs.kimi_k3 import KimiK3Config, KimiK3TextConfig, KimiK3VisionConfig
 from vllm_ascend.transformers_utils.processors.kimi_k3 import KimiK3Processor
-from vllm_ascend.utils import vllm_version_is
+from vllm_ascend.utils import parse_layer_idx, vllm_version_is
 
 apply_attn_res: (
     Callable[
@@ -136,6 +143,102 @@ if HAS_TRITON:
 _KIMI_MLAPO_KV_LORA_RANK = 512
 _KIMI_MLA_KERNEL_ROPE_DIM = 64
 _PARITY_TAP_COUNTS: dict[str, int] = {}
+_KIMI_DENSE_MLP_REGISTRY: dict[str, nn.Module] = {}
+
+
+def _kimi_reference_dense_mlp_impl(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    """Run the dense Kimi MLP outside the compiled parent graph."""
+    module = _KIMI_DENSE_MLP_REGISTRY.get(layer_name)
+    if module is None:
+        raise RuntimeError(f"Kimi dense MLP {layer_name!r} is not registered")
+    return module._forward_reference(hidden_states)  # type: ignore[attr-defined]
+
+
+def _kimi_reference_dense_mlp_fake(
+    hidden_states: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    del layer_name
+    return torch.empty_like(hidden_states)
+
+
+if not hasattr(torch.ops.vllm, "kimi_reference_dense_mlp"):
+    direct_register_custom_op(
+        op_name="kimi_reference_dense_mlp",
+        op_func=_kimi_reference_dense_mlp_impl,
+        fake_impl=_kimi_reference_dense_mlp_fake,
+        mutates_args=[],
+        dispatch_key="PrivateUse1",
+    )
+
+
+def _kimi_reference_dense_mlp_with_output_impl(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Write dense-MLP output into graph-owned stable storage."""
+    module = _KIMI_DENSE_MLP_REGISTRY.get(layer_name)
+    if module is None:
+        raise RuntimeError(f"Kimi dense MLP {layer_name!r} is not registered")
+    result = module._forward_reference(hidden_states)  # type: ignore[attr-defined]
+    output.copy_(result)
+
+
+def _kimi_reference_dense_mlp_with_output_fake(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    del hidden_states, output, layer_name
+    return
+
+
+if not hasattr(torch.ops.vllm, "kimi_reference_dense_mlp_with_output"):
+    direct_register_custom_op(
+        op_name="kimi_reference_dense_mlp_with_output",
+        op_func=_kimi_reference_dense_mlp_with_output_impl,
+        fake_impl=_kimi_reference_dense_mlp_with_output_fake,
+        mutates_args=["output"],
+        dispatch_key="PrivateUse1",
+    )
+
+
+def _kimi_reference_dense_mlp_export_impl(
+    hidden_states: torch.Tensor,
+    export_buffer: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    """Run the dense MLP with an explicit replay-visible diagnostic output."""
+    module = _KIMI_DENSE_MLP_REGISTRY.get(layer_name)
+    if module is None:
+        raise RuntimeError(f"Kimi dense MLP {layer_name!r} is not registered")
+    return module._forward_reference(  # type: ignore[attr-defined]
+        hidden_states,
+        export_buffer=export_buffer,
+    )
+
+
+def _kimi_reference_dense_mlp_export_fake(
+    hidden_states: torch.Tensor,
+    export_buffer: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    del export_buffer, layer_name
+    return torch.empty_like(hidden_states)
+
+
+if not hasattr(torch.ops.vllm, "kimi_reference_dense_mlp_export"):
+    direct_register_custom_op(
+        op_name="kimi_reference_dense_mlp_export",
+        op_func=_kimi_reference_dense_mlp_export_impl,
+        fake_impl=_kimi_reference_dense_mlp_export_fake,
+        mutates_args=["export_buffer"],
+        dispatch_key="PrivateUse1",
+    )
 
 
 def _kimi_reference_rowwise_attention_residual_impl(
@@ -224,10 +327,16 @@ def _parity_tap(name: str, tensor: torch.Tensor) -> None:
         return
     filename = f"{name}.pt"
     if os.environ.get("KIMI_PARITY_TAP_APPEND") == "1":
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        try:
+            rank = get_tensor_model_parallel_rank()
+        except (AssertionError, RuntimeError):
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         output_dir = os.path.join(output_dir, f"rank_{rank:02d}")
         count = _PARITY_TAP_COUNTS.get(name, 0)
         _PARITY_TAP_COUNTS[name] = count + 1
+        target_index = os.environ.get("KIMI_PARITY_TAP_DECODE_INDEX")
+        if target_index is not None and count != int(target_index):
+            return
         filename = f"{name}_{count:03d}.pt"
     os.makedirs(output_dir, exist_ok=True)
     torch.save(tensor.detach().cpu().contiguous(), os.path.join(output_dir, filename))
@@ -236,9 +345,8 @@ def _parity_tap(name: str, tensor: torch.Tensor) -> None:
 def _routed_latent_quant_config(
     quant_config: QuantizationConfig | None,
 ) -> QuantizationConfig | None:
-    """Quantize latent MoE projections when their checkpoint weights are packed."""
-    if quant_config is not None and quant_config.get_name() in {"ascend", "compressed-tensors"}:
-        return quant_config
+    """Keep latent MoE down/up projections BF16 like the official checkpoint."""
+    del quant_config
     return None
 
 
@@ -250,16 +358,27 @@ def _kimi_hf_sigmoid_topk(
     renormalize: bool,
     e_score_correction_bias: torch.Tensor,
     routed_scaling_factor: float,
+    parity_tap_prefix: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Match the training-side Kimi K3 router arithmetic exactly."""
     del hidden_states
+    if parity_tap_prefix is not None:
+        _parity_tap(f"{parity_tap_prefix}_router_logits", gating_output)
     scores = gating_output.float().sigmoid()
+    if parity_tap_prefix is not None:
+        _parity_tap(f"{parity_tap_prefix}_router_scores", scores)
     scores_for_choice = scores + e_score_correction_bias.float().unsqueeze(0)
     topk_ids = torch.topk(scores_for_choice, k=topk, dim=-1, sorted=False).indices
     topk_weights = scores.gather(1, topk_ids)
     if renormalize:
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
     topk_weights = topk_weights * routed_scaling_factor
+    if parity_tap_prefix is not None:
+        _parity_tap(f"{parity_tap_prefix}_router_topk_ids", topk_ids)
+        _parity_tap(
+            f"{parity_tap_prefix}_router_topk_weights",
+            topk_weights,
+        )
     return topk_weights, topk_ids
 
 
@@ -299,6 +418,107 @@ def _canonical_nd(tensor: torch.Tensor) -> torch.Tensor:
 def _linear_output(module: nn.Module, inputs: torch.Tensor) -> torch.Tensor:
     output = module(inputs)
     return output[0] if isinstance(output, tuple) else output
+
+
+_KIMI_FIXED_ORDER_MLA_TP_REDUCTION = (
+    os.getenv(
+        "VLLM_ASCEND_KIMI_REFERENCE_FIXED_ORDER_TP_REDUCTION",
+        "0",
+    )
+    == "1"
+)
+
+
+def _kimi_fixed_order_mla_tp_reduce_impl(
+    tensor: torch.Tensor,
+    group_name: str,
+) -> None:
+    """Keep prefill HCCL math and reduce singleton MLA in rank order."""
+    from vllm.distributed.parallel_state import _groups
+
+    if group_name not in _groups:
+        raise ValueError(f"tensor-parallel group {group_name!r} is unavailable")
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"tensor-parallel group {group_name!r} is destroyed")
+
+    # This custom op is a PIECEWISE graph boundary, so the branch sees the
+    # real runtime row count rather than an AOT profiling shape. Training's
+    # prefill bytes already match HCCL; only singleton decode needs the
+    # explicit Megatron rank-0 reduction order.
+    if tensor.shape[0] != 1:
+        reduced = group.all_reduce(tensor)
+        if reduced is not tensor:
+            tensor.copy_(reduced)
+        return
+
+    gathered = group._all_gather_out_place(
+        tensor.contiguous().unsqueeze(0),
+        0,
+    )
+    contributions = gathered.unbind(0)
+    tensor.copy_(contributions[0])
+    for rank in range(1, group.world_size):
+        tensor.add_(contributions[rank])
+
+
+def _kimi_fixed_order_mla_tp_reduce_fake(
+    tensor: torch.Tensor,
+    group_name: str,
+) -> None:
+    return
+
+
+if _KIMI_FIXED_ORDER_MLA_TP_REDUCTION and not hasattr(
+    torch.ops.vllm,
+    "kimi_fixed_order_mla_tp_reduce_",
+):
+    direct_register_custom_op(
+        op_name="kimi_fixed_order_mla_tp_reduce_",
+        op_func=_kimi_fixed_order_mla_tp_reduce_impl,
+        fake_impl=_kimi_fixed_order_mla_tp_reduce_fake,
+        mutates_args=["tensor"],
+        dispatch_key="PrivateUse1",
+    )
+
+
+def _install_fixed_order_row_parallel(
+    module: RowParallelLinear,
+    tap_name: str,
+) -> None:
+    """Use rank-ordered BF16 adds for singleton MLA decode only.
+
+    This is the Kimi-local equivalent of HsiaoTsan/vllm#1.  It remains
+    opt-in so the normal vLLM reduction path is unchanged.
+    """
+
+    if not module.input_is_parallel:
+        raise ValueError("fixed-order Kimi row parallel requires sharded input")
+    if module.bias is not None:
+        raise ValueError("fixed-order Kimi row parallel requires bias=False")
+
+    def fixed_order_forward(self, input_, **kwargs):
+        kwargs.pop("is_prefill", None)
+        if kwargs:
+            raise TypeError(
+                "unsupported fixed-order row-parallel arguments: "
+                f"{sorted(kwargs)}"
+            )
+        _parity_tap(f"{tap_name}_input", input_)
+        output_parallel = self.quant_method.apply(self, input_, None)
+        _parity_tap(tap_name, output_parallel)
+        if self.reduce_results and self.tp_size > 1:
+            group = get_tp_group()
+            torch.ops.vllm.kimi_fixed_order_mla_tp_reduce_(
+                output_parallel,
+                group_name=group.unique_name,
+            )
+        output = output_parallel
+        if not self.return_bias:
+            return output
+        return output, None
+
+    module.forward = MethodType(fixed_order_forward, module)
 
 
 class KimiK3VisionRotaryEmbedding(nn.Module):
@@ -819,8 +1039,62 @@ class KimiK3MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.prefix = prefix
+        self.reference_dense_mlp_graph_boundary = (
+            os.environ.get(
+                "VLLM_ASCEND_KIMI_REFERENCE_DENSE_MLP_GRAPH_BOUNDARY",
+                "0",
+            )
+            == "1"
+            and "block_sparse_moe" not in prefix
+            and parse_layer_idx(prefix) == 0
+        )
+        configured_dense_mlp_capacity = int(
+            os.environ.get(
+                "VLLM_ASCEND_KIMI_REFERENCE_DENSE_MLP_CAPACITY",
+                "0",
+            )
+        )
+        if configured_dense_mlp_capacity < 0:
+            raise ValueError("Kimi dense MLP reference capacity must be non-negative")
+        self.reference_dense_mlp_capacity = (
+            configured_dense_mlp_capacity
+            if self.reference_dense_mlp_graph_boundary
+            else 0
+        )
+        self.reference_dense_mlp_situ = (
+            os.environ.get("VLLM_ASCEND_KIMI_REFERENCE_DENSE_MLP_SITU", "0")
+            == "1"
+            and self.reference_dense_mlp_graph_boundary
+        )
+        self.parity_graph_dense_mlp_export = (
+            os.environ.get("KIMI_PARITY_GRAPH_DENSE_MLP_EXPORT", "0") == "1"
+            and self.reference_dense_mlp_graph_boundary
+        )
+        self.parity_graph_dense_mlp_export_to_logits = (
+            os.environ.get(
+                "KIMI_PARITY_GRAPH_DENSE_MLP_EXPORT_TO_LOGITS", "1"
+            )
+            == "1"
+        )
+        if self.parity_graph_dense_mlp_export:
+            local_intermediate_size = divide(
+                intermediate_size,
+                get_tensor_model_parallel_world_size(),
+            )
+            self.parity_dense_gate_up_width = 2 * local_intermediate_size
+            self.parity_dense_activation_width = local_intermediate_size
+            self.parity_dense_output_width = hidden_size
+        if self.reference_dense_mlp_graph_boundary:
+            _KIMI_DENSE_MLP_REGISTRY[prefix] = self
+        requested_tap_layer = int(os.environ.get("KIMI_PARITY_TAP_MOE_LAYER", "2"))
         self.parity_tap_prefix = (
-            "02_moe_shared" if "layers.1.block_sparse_moe" in prefix and "shared_experts" in prefix else None
+            f"{requested_tap_layer:02d}_moe_shared"
+            if (
+                f"layers.{requested_tap_layer - 1}.block_sparse_moe" in prefix
+                and "shared_experts" in prefix
+            )
+            else None
         )
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -848,18 +1122,109 @@ class KimiK3MLP(nn.Module):
             raise ValueError(f"Unsupported Kimi K3 activation: {config.hidden_act}")
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.reference_dense_mlp_graph_boundary:
+            if self.parity_graph_dense_mlp_export:
+                return torch.ops.vllm.kimi_reference_dense_mlp_export(
+                    hidden_states,
+                    self.parity_dense_mlp_export_buffer,
+                    layer_name=self.prefix,
+                )
+            row_count = hidden_states.numel() // hidden_states.shape[-1]
+            output = self.reference_dense_mlp_output_buffer[:row_count].view_as(
+                hidden_states
+            )
+            torch.ops.vllm.kimi_reference_dense_mlp_with_output(
+                hidden_states,
+                output,
+                layer_name=self.prefix,
+            )
+            return output
+        return self._forward_native(hidden_states)
+
+    def _forward_native(
+        self,
+        hidden_states: torch.Tensor,
+        export_buffer: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.parity_tap_prefix is not None:
             _parity_tap(f"{self.parity_tap_prefix}_input", hidden_states)
         gate_up, _ = self.gate_up_proj(hidden_states)
+        if self.parity_graph_dense_mlp_export:
+            assert export_buffer is not None
+            export_buffer[
+                :, : self.parity_dense_gate_up_width
+            ].copy_(gate_up.reshape(-1, gate_up.shape[-1])[:1])
         if self.parity_tap_prefix is not None:
             _parity_tap(f"{self.parity_tap_prefix}_gate_up", gate_up)
-        hidden_states = self.act_fn(gate_up)
+        if self.reference_dense_mlp_situ:
+            gate, up = gate_up.float().chunk(2, dim=-1)
+            gate = self.act_fn.beta * torch.tanh(
+                gate / self.act_fn.beta
+            ) * torch.sigmoid(gate)
+            if self.act_fn.linear_beta is not None:
+                up = self.act_fn.linear_beta * torch.tanh(
+                    up / self.act_fn.linear_beta
+                )
+            hidden_states = (gate * up).to(gate_up.dtype)
+        else:
+            hidden_states = self.act_fn(gate_up)
+        if self.parity_graph_dense_mlp_export:
+            assert export_buffer is not None
+            activation_start = self.parity_dense_gate_up_width
+            activation_stop = (
+                activation_start + self.parity_dense_activation_width
+            )
+            export_buffer[
+                :, activation_start:activation_stop
+            ].copy_(hidden_states.reshape(-1, hidden_states.shape[-1])[:1])
         if self.parity_tap_prefix is not None:
             _parity_tap(f"{self.parity_tap_prefix}_activation", hidden_states)
         hidden_states, _ = self.down_proj(hidden_states)
+        if self.parity_graph_dense_mlp_export:
+            assert export_buffer is not None
+            output_start = (
+                self.parity_dense_gate_up_width
+                + self.parity_dense_activation_width
+            )
+            export_buffer[:, output_start:].copy_(
+                hidden_states.reshape(-1, hidden_states.shape[-1])[:1]
+            )
+            torch.npu.current_stream().synchronize()
+            # The HCCL reduction inside RowParallelLinear is asynchronous on
+            # this graph stack.  Materialize the tensor returned by the
+            # custom-op boundary so downstream graph consumers depend on the
+            # completed reduction rather than only on the side-channel copy.
+            hidden_states = hidden_states.clone()
         if self.parity_tap_prefix is not None:
             _parity_tap(f"{self.parity_tap_prefix}_output", hidden_states)
         return hidden_states
+
+    def _forward_reference(
+        self,
+        hidden_states: torch.Tensor,
+        export_buffer: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run dense MLP chunks with the training reference's fixed capacity."""
+        capacity = self.reference_dense_mlp_capacity
+        if capacity == 0:
+            return self._forward_native(hidden_states, export_buffer)
+
+        shape = hidden_states.shape
+        rows = hidden_states.reshape(-1, shape[-1])
+        outputs = []
+        for start in range(0, rows.shape[0], capacity):
+            chunk = rows[start : start + capacity]
+            valid_rows = chunk.shape[0]
+            if valid_rows < capacity:
+                chunk = torch.cat(
+                    (
+                        chunk,
+                        chunk.new_zeros((capacity - valid_rows, chunk.shape[-1])),
+                    ),
+                    dim=0,
+                )
+            outputs.append(self._forward_native(chunk, export_buffer)[:valid_rows])
+        return torch.cat(outputs, dim=0).reshape(*shape[:-1], -1)
 
 
 class _KimiRoutedOutputTransform(nn.Module):
@@ -931,7 +1296,12 @@ class KimiK3MoE(nn.Module):
         self.hidden_size = config.hidden_size
         self.moe_hidden_size = config.routed_expert_hidden_size
         self.num_shared_experts = config.num_shared_experts
-        self.parity_tap_prefix = "02_moe" if "layers.1.block_sparse_moe" in prefix else None
+        requested_tap_layer = int(os.environ.get("KIMI_PARITY_TAP_MOE_LAYER", "2"))
+        self.parity_tap_prefix = (
+            f"{requested_tap_layer:02d}_moe"
+            if f"layers.{requested_tap_layer - 1}.block_sparse_moe" in prefix
+            else None
+        )
         latent_quant_config = _routed_latent_quant_config(quant_config)
         # Routing always uses the original full-width hidden state.
         self.gate = ReplicatedLinear(
@@ -987,7 +1357,7 @@ class KimiK3MoE(nn.Module):
 
             def routed_down_hook(_module, _args, output) -> None:
                 value = output[0] if isinstance(output, tuple) else output
-                _parity_tap("02_moe_routed_down_output", value)
+                _parity_tap(f"{self.parity_tap_prefix}_routed_down_output", value)
 
             self.routed_expert_down_proj.register_forward_hook(routed_down_hook)
 
@@ -997,7 +1367,8 @@ class KimiK3MoE(nn.Module):
                 config,
                 hidden_size=self.hidden_size,
                 intermediate_size=config.moe_intermediate_size * self.num_shared_experts,
-                quant_config=quant_config,
+                # Official Kimi K3 stores shared-expert weights as BF16.
+                quant_config=None,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
@@ -1024,6 +1395,7 @@ class KimiK3MoE(nn.Module):
                 _kimi_hf_sigmoid_topk,
                 e_score_correction_bias=self.gate.e_score_correction_bias,
                 routed_scaling_factor=config.routed_scaling_factor,
+                parity_tap_prefix=self.parity_tap_prefix,
             ),
             # The custom router applies this factor itself.
             routed_scaling_factor=1.0,
@@ -1041,7 +1413,7 @@ class KimiK3MoE(nn.Module):
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
         if self.parity_tap_prefix is not None:
-            _parity_tap("02_moe_input", hidden_states)
+            _parity_tap(f"{self.parity_tap_prefix}_input", hidden_states)
         use_reference_router_fp32 = kimi_runtime_flag(
             "VLLM_ASCEND_KIMI_REFERENCE_ROUTER_FP32",
             reduced_default=True,
@@ -1054,7 +1426,7 @@ class KimiK3MoE(nn.Module):
             # true, but keeps the common MoERunner interface tensor-only.
             output = self.experts(hidden_states=hidden_states, router_logits=hidden_states)
             if self.parity_tap_prefix is not None:
-                _parity_tap("02_moe_output", output)
+                _parity_tap(f"{self.parity_tap_prefix}_output", output)
             return output.view(num_tokens, hidden_size)
         if use_reference_router_fp32:
             router_weight_fp32 = self._reference_router_weight_fp32
@@ -1071,10 +1443,10 @@ class KimiK3MoE(nn.Module):
         else:
             router_logits, _ = self.gate(hidden_states)
         if self.parity_tap_prefix is not None:
-            _parity_tap("02_moe_router_logits", router_logits)
+            _parity_tap(f"{self.parity_tap_prefix}_router_logits", router_logits)
         output = self.experts(hidden_states=hidden_states, router_logits=router_logits)
         if self.parity_tap_prefix is not None:
-            _parity_tap("02_moe_output", output)
+            _parity_tap(f"{self.parity_tap_prefix}_output", output)
         return output.view(num_tokens, hidden_size)
 
 
@@ -1093,36 +1465,25 @@ class _KimiReferenceRMSNorm(nn.Module):
         return self.weight * normalized.to(input_dtype)
 
 
-class _KimiFixedCapacityRMSNorm(_KimiReferenceRMSNorm):
-    """Kimi RMSNorm evaluated in fixed-capacity token tiles."""
+class _KimiPairwiseRMSNorm(_KimiReferenceRMSNorm):
+    """RMSNorm with an explicit, device-stable FP32 reduction tree."""
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         input_dtype = hidden_states.dtype
-        shape = hidden_states.shape
-        rows = hidden_states.reshape(-1, shape[-1])
-        outputs = []
-        for chunk in rows.split(32, dim=0):
-            row_count = chunk.shape[0]
-            if row_count < 32:
-                chunk = torch.cat(
-                    (
-                        chunk,
-                        torch.zeros(
-                            (32 - row_count, shape[-1]),
-                            dtype=chunk.dtype,
-                            device=chunk.device,
-                        ),
-                    ),
-                    dim=0,
+        normalized = hidden_states.float()
+        squares = normalized.square()
+        while squares.shape[-1] > 1:
+            if squares.shape[-1] % 2:
+                squares = torch.cat(
+                    (squares, torch.zeros_like(squares[..., :1])),
+                    dim=-1,
                 )
-            normalized = chunk.float()
-            normalized = normalized * torch.rsqrt(
-                normalized.square().mean(dim=-1, keepdim=True)
-                + self.variance_epsilon
-            )
-            outputs.append(normalized[:row_count].to(input_dtype))
-        normalized = torch.cat(outputs, dim=0).reshape(shape)
-        return self.weight * normalized
+            squares = squares[..., 0::2] + squares[..., 1::2]
+        variance = squares / hidden_states.shape[-1]
+        normalized = normalized * torch.rsqrt(
+            variance + self.variance_epsilon
+        )
+        return self.weight * normalized.to(input_dtype)
 
 
 class _KimiDecomposedRMSNorm(_KimiReferenceRMSNorm):
@@ -1185,6 +1546,11 @@ def _kimi_mla_rms_norm_type() -> type[nn.Module]:
     is therefore the reduced W4A8 default.  Explicit overrides still win.
     """
     if kimi_runtime_flag(
+        "VLLM_ASCEND_KIMI_PAIRWISE_MLA_RMS_NORM",
+        reduced_default=False,
+    ):
+        return _KimiPairwiseRMSNorm
+    if kimi_runtime_flag(
         "VLLM_ASCEND_KIMI_REFERENCE_MLA_RMS_NORM",
         reduced_default=True,
     ):
@@ -1199,11 +1565,6 @@ def _kimi_mla_rms_norm_type() -> type[nn.Module]:
 
 def _kimi_routed_rms_norm_type() -> type[nn.Module]:
     """Select the reduced routed-expert norm on the Megatron contract."""
-    if kimi_runtime_flag(
-        "VLLM_ASCEND_KIMI_FIXED_CAPACITY_ROUTED_RMS_NORM",
-        reduced_default=False,
-    ):
-        return _KimiFixedCapacityRMSNorm
     if kimi_runtime_flag(
         "VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM",
         reduced_default=True,
@@ -1261,6 +1622,181 @@ def _reference_mla_preprocess_decode(
     )
 
 
+def _kimi_mla_decode_kv_b_proj(impl, k_latent: torch.Tensor) -> torch.Tensor:
+    """Optionally reproduce Megatron's accepted long-sequence KV-B schedule."""
+    if (
+        os.environ.get("VLLM_ASCEND_KIMI_FIXED_CAPACITY_MLA_LINEAR") != "1"
+        and os.environ.get("VLLM_ASCEND_KIMI_FIXED_CAPACITY_MLA_KV_B") != "1"
+    ):
+        return impl.kv_b_proj(k_latent)[0]
+    capacity = int(
+        os.environ.get(
+            "VLLM_ASCEND_KIMI_FIXED_CAPACITY_MLA_KV_B_ROWS",
+            os.environ.get(
+                "VLLM_ASCEND_KIMI_FIXED_CAPACITY_MLA_LINEAR_ROWS",
+                "255",
+            ),
+        )
+    )
+    if capacity < 1:
+        raise ValueError("Kimi fixed-capacity MLA KV-B rows must be positive")
+    outputs = []
+    for start in range(0, k_latent.shape[0], capacity):
+        chunk = k_latent[start : start + capacity]
+        row_count = chunk.shape[0]
+        if row_count < capacity:
+            chunk = torch.cat(
+                (
+                    chunk,
+                    torch.zeros(
+                        (capacity - row_count, *chunk.shape[1:]),
+                        dtype=chunk.dtype,
+                        device=chunk.device,
+                    ),
+                ),
+                dim=0,
+            )
+        outputs.append(impl.kv_b_proj(chunk)[0][:row_count].clone())
+    return torch.cat(outputs, dim=0)
+
+
+def _kimi_mla_is_decode_call(attention_prefix: str) -> bool:
+    metadata_by_layer = get_forward_context().attn_metadata
+    if not isinstance(metadata_by_layer, dict):
+        return False
+    metadata = metadata_by_layer.get(attention_prefix)
+    return bool(
+        metadata is not None
+        and getattr(metadata, "decode", None) is not None
+        and int(getattr(metadata, "num_prefill_tokens", 0)) == 0
+    )
+
+
+def _install_kimi_mla_decode_fixed_capacity_linear(
+    module: nn.Module,
+    _attention_prefix: str,
+) -> None:
+    """Run MLA linears with the accepted Megatron fixed-M schedule.
+
+    The Megatron reference applies the 255-row partition to the complete
+    prompt-plus-forced-token forward, including a zero-padded final chunk.
+    Apply the same contract to both vLLM prefill and decode calls.  A decode
+    metadata predicate is insufficient here: it leaves prefill on a different
+    GEMM shape and proved to be a numerical no-op in the full-model gate.
+    """
+    original_forward = module.forward
+
+    def fixed_capacity_forward(_module, input_: torch.Tensor, *args, **kwargs):
+        capacity = int(
+            os.environ.get("VLLM_ASCEND_KIMI_FIXED_CAPACITY_MLA_LINEAR_ROWS", "255")
+        )
+        if capacity < 1:
+            raise ValueError("Kimi fixed-capacity MLA linear rows must be positive")
+        outputs = []
+        output_tail = None
+        for start in range(0, input_.shape[0], capacity):
+            chunk = input_[start : start + capacity]
+            row_count = chunk.shape[0]
+            if row_count < capacity:
+                chunk = torch.cat(
+                    (
+                        chunk,
+                        torch.zeros(
+                            (capacity - row_count, *chunk.shape[1:]),
+                            dtype=chunk.dtype,
+                            device=chunk.device,
+                        ),
+                    ),
+                    dim=0,
+                )
+            result = original_forward(chunk, *args, **kwargs)
+            if isinstance(result, tuple):
+                output, *tail = result
+                if output_tail is None:
+                    output_tail = tail
+            else:
+                output = result
+            outputs.append(output[:row_count].clone())
+        output = torch.cat(outputs, dim=0)
+        if output_tail is not None:
+            return (output, *output_tail)
+        return output
+
+    module.forward = MethodType(fixed_capacity_forward, module)
+
+
+def _install_kimi_mla_positioned_o_proj(
+    module: nn.Module,
+    attention_prefix: str,
+) -> None:
+    """Replay singleton MLA o_proj at its training-chunk row offset.
+
+    Megatron evaluates the full teacher-forced sequence in 255-row chunks.
+    Ascend's BF16 GEMM/HCCL result can depend on a row's position inside that
+    fixed-capacity launch even though rows are mathematically independent.
+    Decode therefore places its one live row at the same global-position
+    modulo 255 before calling the unmodified row-parallel projection.
+    """
+
+    original_forward = module.forward
+
+    def positioned_forward(_module, input_: torch.Tensor, *args, **kwargs):
+        capacity = int(
+            os.environ.get(
+                "VLLM_ASCEND_KIMI_POSITIONED_CAPACITY_MLA_O_PROJ_ROWS",
+                "255",
+            )
+        )
+        if capacity < 1:
+            raise ValueError(
+                "Kimi positioned-capacity MLA o_proj rows must be positive"
+            )
+        if input_.shape[0] != 1:
+            return original_forward(input_, *args, **kwargs)
+
+        slot = getattr(_module, "_kimi_positioned_slot", None)
+        if slot is None:
+            metadata_by_layer = get_forward_context().attn_metadata
+            if not isinstance(metadata_by_layer, dict):
+                raise RuntimeError("Kimi MLA decode metadata is unavailable")
+            metadata = metadata_by_layer.get(attention_prefix)
+            decode_meta = getattr(metadata, "decode", None)
+            if decode_meta is None:
+                raise RuntimeError("Kimi MLA decode metadata has no decode view")
+            sequence_lengths = getattr(decode_meta, "seq_lens_device", None)
+            if sequence_lengths is None:
+                raise RuntimeError(
+                    "Kimi positioned-capacity MLA o_proj requires device sequence lengths"
+                )
+            slot = sequence_lengths[0].to(torch.long) - 1
+        slot = slot.to(device=input_.device, dtype=torch.long).remainder(capacity)
+        row_ids = torch.arange(
+            capacity,
+            dtype=torch.long,
+            device=input_.device,
+        )
+        mask = (row_ids == slot).reshape(
+            capacity,
+            *((1,) * (input_.ndim - 1)),
+        )
+        padded = torch.where(
+            mask,
+            input_.expand(capacity, *input_.shape[1:]),
+            torch.zeros(
+                (capacity, *input_.shape[1:]),
+                dtype=input_.dtype,
+                device=input_.device,
+            ),
+        )
+        result = original_forward(padded, *args, **kwargs)
+        if isinstance(result, tuple):
+            output, *tail = result
+            return (output.index_select(0, slot.reshape(1)), *tail)
+        return result.index_select(0, slot.reshape(1))
+
+    module.forward = MethodType(positioned_forward, module)
+
+
 def _reference_mla_forward_decode(
     impl,
     q_nope: torch.Tensor,
@@ -1289,6 +1825,9 @@ def _reference_mla_forward_decode(
     )
     outputs = []
     for request_index, sequence_length in enumerate(decode_meta.seq_lens_list):
+        tap_layer = getattr(impl, "kimi_parity_layer", None)
+        tap_decode = tap_layer is not None
+        tap_prefix = f"{tap_layer:02d}_mla" if tap_decode else ""
         positions = torch.arange(
             int(sequence_length),
             device=q_nope.device,
@@ -1307,7 +1846,7 @@ def _reference_mla_forward_decode(
             0,
             block_offsets,
         ]
-        key_value = impl.kv_b_proj(k_latent)[0].view(
+        key_value = _kimi_mla_decode_kv_b_proj(impl, k_latent).view(
             -1,
             impl.num_heads,
             impl.qk_nope_head_dim + impl.v_head_dim,
@@ -1316,6 +1855,13 @@ def _reference_mla_forward_decode(
             [impl.qk_nope_head_dim, impl.v_head_dim],
             dim=-1,
         )
+        if tap_decode:
+            _parity_tap(f"{tap_prefix}_decode_physical_blocks", physical_blocks.unsqueeze(0))
+            _parity_tap(f"{tap_prefix}_decode_k_latent", k_latent.unsqueeze(0))
+            _parity_tap(f"{tap_prefix}_decode_k_pe", k_pe.unsqueeze(0))
+            _parity_tap(f"{tap_prefix}_decode_key_value", key_value.unsqueeze(0))
+            _parity_tap(f"{tap_prefix}_decode_q_nope", q_nope[request_index].unsqueeze(0))
+            _parity_tap(f"{tap_prefix}_decode_q_pe", q_pe[request_index].unsqueeze(0))
         k_pe = k_pe.unsqueeze(1).expand(-1, impl.num_heads, -1)
         scores = torch.einsum(
             "hd,shd->hs",
@@ -1329,14 +1875,24 @@ def _reference_mla_forward_decode(
                 k_pe.float(),
             )
         )
+        if tap_decode:
+            _parity_tap(f"{tap_prefix}_decode_scores", scores.unsqueeze(0))
         probabilities = torch.softmax(scores * impl.scale, dim=-1)
+        if tap_decode:
+            _parity_tap(
+                f"{tap_prefix}_decode_probabilities",
+                probabilities.unsqueeze(0),
+            )
         output = torch.einsum(
             "hs,shd->hd",
             probabilities,
             value.float(),
         ).to(q_nope.dtype)
-        if getattr(impl, "kimi_parity_layer", None) == 4:
-            _parity_tap("04_mla_core_output", output.unsqueeze(0))
+        if tap_decode:
+            _parity_tap(
+                f"{tap_layer:02d}_mla_core_output",
+                output.unsqueeze(0),
+            )
         outputs.append(output)
     return torch.stack(outputs).reshape(-1, impl.num_heads * impl.v_head_dim)
 
@@ -1395,7 +1951,7 @@ def _decomposed_mla_forward_decode(
             0,
             block_offsets,
         ]
-        key_value = impl.kv_b_proj(k_latent)[0].view(
+        key_value = _kimi_mla_decode_kv_b_proj(impl, k_latent).view(
             -1,
             impl.num_heads,
             impl.qk_nope_head_dim + impl.v_head_dim,
@@ -1404,14 +1960,16 @@ def _decomposed_mla_forward_decode(
             [impl.qk_nope_head_dim, impl.v_head_dim],
             dim=-1,
         )
-        tap_decode = getattr(impl, "kimi_parity_layer", None) == 4
+        tap_layer = getattr(impl, "kimi_parity_layer", None)
+        tap_decode = tap_layer is not None
+        tap_prefix = f"{tap_layer:02d}_mla" if tap_decode else ""
         if tap_decode:
-            _parity_tap("04_mla_decode_physical_blocks", physical_blocks.unsqueeze(0))
-            _parity_tap("04_mla_decode_k_latent", k_latent.unsqueeze(0))
-            _parity_tap("04_mla_decode_k_pe", k_pe.unsqueeze(0))
-            _parity_tap("04_mla_decode_key_value", key_value.unsqueeze(0))
-            _parity_tap("04_mla_decode_q_nope", q_nope[request_index].unsqueeze(0))
-            _parity_tap("04_mla_decode_q_pe", q_pe[request_index].unsqueeze(0))
+            _parity_tap(f"{tap_prefix}_decode_physical_blocks", physical_blocks.unsqueeze(0))
+            _parity_tap(f"{tap_prefix}_decode_k_latent", k_latent.unsqueeze(0))
+            _parity_tap(f"{tap_prefix}_decode_k_pe", k_pe.unsqueeze(0))
+            _parity_tap(f"{tap_prefix}_decode_key_value", key_value.unsqueeze(0))
+            _parity_tap(f"{tap_prefix}_decode_q_nope", q_nope[request_index].unsqueeze(0))
+            _parity_tap(f"{tap_prefix}_decode_q_pe", q_pe[request_index].unsqueeze(0))
         k_pe = k_pe.unsqueeze(1).expand(-1, impl.num_heads, -1)
         scores = torch.einsum(
             "hd,shd->hs",
@@ -1426,10 +1984,10 @@ def _decomposed_mla_forward_decode(
             )
         )
         if tap_decode:
-            _parity_tap("04_mla_decode_scores", scores.unsqueeze(0))
+            _parity_tap(f"{tap_prefix}_decode_scores", scores.unsqueeze(0))
         sequence_length = decode_meta.seq_lens_device[request_index]
         if tap_decode:
-            _parity_tap("04_mla_decode_sequence_length", sequence_length.reshape(1))
+            _parity_tap(f"{tap_prefix}_decode_sequence_length", sequence_length.reshape(1))
         output = torch.zeros(
             (impl.num_heads, impl.v_head_dim),
             dtype=q_nope.dtype,
@@ -1451,7 +2009,7 @@ def _decomposed_mla_forward_decode(
                 output,
             )
         if tap_decode:
-            _parity_tap("04_mla_decode_output", output.unsqueeze(0))
+            _parity_tap(f"{tap_prefix}_decode_output", output.unsqueeze(0))
         outputs.append(output)
     return torch.stack(outputs).reshape(-1, impl.num_heads * impl.v_head_dim)
 
@@ -1679,6 +2237,113 @@ class _KimiQkvAProjLinear(DeepSeekV2FusedQkvAProjLinear):
     ) -> None:
         super().__init__(input_size, output_size, quant_config, prefix)
         self.kimi_q_lora_rank = output_size[0]
+        self.kimi_attention_prefix = f"{prefix.rsplit('.', 1)[0]}.attn"
+
+    def _is_decode_call(self) -> bool:
+        return _kimi_mla_is_decode_call(self.kimi_attention_prefix)
+
+    def _separate_projection(
+        self,
+        input_: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        positioned_capacity_enabled = (
+            os.environ.get(
+                "VLLM_ASCEND_KIMI_POSITIONED_CAPACITY_MLA_QKV_A"
+            )
+            == "1"
+        )
+        fixed_capacity_enabled = (
+            os.environ.get("VLLM_ASCEND_KIMI_FIXED_CAPACITY_MLA_LINEAR") == "1"
+            or os.environ.get("VLLM_ASCEND_KIMI_FIXED_CAPACITY_MLA_QKV_A") == "1"
+        )
+        generic_fixed_capacity = (
+            os.environ.get("VLLM_ASCEND_KIMI_FIXED_CAPACITY_MLA_LINEAR") == "1"
+        )
+        if positioned_capacity_enabled and self._is_decode_call():
+            if input_.shape[0] != 1:
+                raise ValueError(
+                    "Kimi positioned-capacity MLA QKV-A currently requires "
+                    "singleton decode"
+                )
+            capacity = int(
+                os.environ.get(
+                    "VLLM_ASCEND_KIMI_POSITIONED_CAPACITY_MLA_QKV_A_ROWS",
+                    "255",
+                )
+            )
+            if capacity < 1:
+                raise ValueError(
+                    "Kimi positioned-capacity MLA QKV-A rows must be positive"
+                )
+            metadata_by_layer = get_forward_context().attn_metadata
+            if not isinstance(metadata_by_layer, dict):
+                raise RuntimeError("Kimi MLA decode metadata is unavailable")
+            metadata = metadata_by_layer.get(self.kimi_attention_prefix)
+            decode_meta = getattr(metadata, "decode", None)
+            if decode_meta is None:
+                raise RuntimeError("Kimi MLA decode metadata has no decode view")
+            sequence_lengths = getattr(decode_meta, "seq_lens_device", None)
+            if sequence_lengths is None:
+                raise RuntimeError(
+                    "Kimi positioned-capacity MLA QKV-A requires device "
+                    "sequence lengths"
+                )
+            slot = (sequence_lengths[0].to(torch.long) - 1).remainder(
+                capacity
+            )
+            row_ids = torch.arange(
+                capacity,
+                dtype=torch.long,
+                device=input_.device,
+            )
+            mask = (row_ids == slot).reshape(
+                capacity,
+                *((1,) * (input_.ndim - 1)),
+            )
+            padded = torch.where(
+                mask,
+                input_.expand(capacity, *input_.shape[1:]),
+                torch.zeros(
+                    (capacity, *input_.shape[1:]),
+                    dtype=input_.dtype,
+                    device=input_.device,
+                ),
+            )
+            return F.linear(padded, weight).index_select(0, slot.reshape(1))
+        if not fixed_capacity_enabled or (
+            not generic_fixed_capacity and not self._is_decode_call()
+        ):
+            return F.linear(input_, weight)
+        capacity = int(
+            os.environ.get(
+                "VLLM_ASCEND_KIMI_FIXED_CAPACITY_MLA_QKV_A_ROWS",
+                os.environ.get(
+                    "VLLM_ASCEND_KIMI_FIXED_CAPACITY_MLA_LINEAR_ROWS",
+                    "255",
+                ),
+            )
+        )
+        if capacity < 1:
+            raise ValueError("Kimi fixed-capacity MLA QKV-A rows must be positive")
+        outputs = []
+        for start in range(0, input_.shape[0], capacity):
+            chunk = input_[start : start + capacity]
+            row_count = chunk.shape[0]
+            if row_count < capacity:
+                chunk = torch.cat(
+                    (
+                        chunk,
+                        torch.zeros(
+                            (capacity - row_count, *chunk.shape[1:]),
+                            dtype=chunk.dtype,
+                            device=chunk.device,
+                        ),
+                    ),
+                    dim=0,
+                )
+            outputs.append(F.linear(chunk, weight)[:row_count].clone())
+        return torch.cat(outputs, dim=0)
 
     def forward(self, input_: torch.Tensor):
         if (
@@ -1686,8 +2351,14 @@ class _KimiQkvAProjLinear(DeepSeekV2FusedQkvAProjLinear):
             or not hasattr(self, "weight")
         ):
             return super().forward(input_)
-        q_output = F.linear(input_, self.weight[: self.kimi_q_lora_rank])
-        kv_output = F.linear(input_, self.weight[self.kimi_q_lora_rank :])
+        q_output = self._separate_projection(
+            input_,
+            self.weight[: self.kimi_q_lora_rank],
+        )
+        kv_output = self._separate_projection(
+            input_,
+            self.weight[self.kimi_q_lora_rank :],
+        )
         return torch.cat((q_output, kv_output), dim=-1), None
 
 
@@ -1786,6 +2457,25 @@ class KimiK3MLAAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
+        if os.environ.get("VLLM_ASCEND_KIMI_FIXED_CAPACITY_MLA_LINEAR") == "1":
+            for module in (self.q_b_proj, self.g_proj, self.o_proj):
+                _install_kimi_mla_decode_fixed_capacity_linear(module, prefix)
+        if os.environ.get(
+            "VLLM_ASCEND_KIMI_REFERENCE_FIXED_ORDER_TP_REDUCTION"
+        ) == "1":
+            layer_number = parse_layer_idx(prefix) + 1
+            _install_fixed_order_row_parallel(
+                self.o_proj,
+                f"{layer_number:02d}_mla_o_proj_local",
+            )
+        if os.environ.get(
+            "VLLM_ASCEND_KIMI_POSITIONED_CAPACITY_MLA_O_PROJ"
+        ) == "1":
+            # When both diagnostics are enabled, wrap the fixed-order helper
+            # with the positioned-capacity adapter.  Its local-output tap then
+            # observes the true 255-row GEMM, while the helper deliberately
+            # falls back to normal HCCL for that non-singleton tensor.
+            _install_kimi_mla_positioned_o_proj(self.o_proj, prefix)
 
         mla_modules = MLAModules(
             kv_a_layernorm=self.kv_a_layernorm,
@@ -1844,8 +2534,11 @@ class KimiK3MLAAttention(nn.Module):
             # prefill reductions while the reference path retains its rowwise
             # oracle implementation.
             mla_impl.enable_mlapo = False
-            if "layers.3.self_attn" in prefix:
-                mla_impl.kimi_parity_layer = 4
+            parity_tap_layer = int(
+                os.environ.get("KIMI_PARITY_TAP_MLA_LAYER", "4")
+            )
+            if f"layers.{parity_tap_layer - 1}.self_attn" in prefix:
+                mla_impl.kimi_parity_layer = parity_tap_layer
             mla_impl.mla_preprocess_decode = MethodType(
                 _reference_mla_preprocess_decode,
                 mla_impl,
@@ -1868,9 +2561,13 @@ class KimiK3MLAAttention(nn.Module):
                 mla_impl,
             )
 
-        tap_layer = next(
-            (layer for layer in (4, 8) if f"layers.{layer - 1}.self_attn" in prefix),
-            None,
+        requested_tap_layer = int(
+            os.environ.get("KIMI_PARITY_TAP_MLA_LAYER", "4")
+        )
+        tap_layer = (
+            requested_tap_layer
+            if f"layers.{requested_tap_layer - 1}.self_attn" in prefix
+            else None
         )
         if tap_layer is not None and os.environ.get("KIMI_PARITY_TAP_DIR"):
 
@@ -1880,6 +2577,16 @@ class KimiK3MLAAttention(nn.Module):
                     _parity_tap(f"{tap_layer:02d}_mla_{name}", value)
 
                 return hook
+
+            def capture_input(name: str):
+                def hook(_module, args) -> None:
+                    _parity_tap(f"{tap_layer:02d}_mla_{name}", args[0])
+
+                return hook
+
+            self.fused_qkv_a_proj.register_forward_pre_hook(
+                capture_input("projection_input")
+            )
 
             for module, name in (
                 (self.fused_qkv_a_proj, "qkv_a_fused"),
@@ -1898,6 +2605,9 @@ class KimiK3MLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         output: torch.Tensor,
     ) -> None:
+        self.o_proj._kimi_positioned_slot = (
+            positions.reshape(-1)[-1] if positions.numel() == 1 else None
+        )
         output[:] = self.mla_attn(positions, hidden_states)
 
 
@@ -2089,15 +2799,23 @@ class KimiK3DecoderLayer(nn.Module):
             quant_config=None,
             prefix=f"{prefix}.mlp_res_proj",
         )
+        graph_boundary_layer = int(
+            os.environ.get("KIMI_PARITY_GRAPH_BOUNDARY_LAYER", "0")
+        )
+        self.parity_graph_boundary_taps = graph_boundary_layer == self.layer_idx + 1
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         block_residual: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
         _parity_tap(f"{self.layer_idx + 1:02d}_layer_input", hidden_states)
         _parity_tap(f"{self.layer_idx + 1:02d}_block_residual_input", block_residual)
+        if self.parity_graph_boundary_taps:
+            parity_layer_input = hidden_states
         prefix_sum: torch.Tensor | None = hidden_states
         if block_residual.shape[1] > 0:
             hidden_states = _apply_attention_residual(
@@ -2114,6 +2832,8 @@ class KimiK3DecoderLayer(nn.Module):
 
         hidden_states = self.input_layernorm(hidden_states)
         _parity_tap(f"{self.layer_idx + 1:02d}_attention_input", hidden_states)
+        if self.parity_graph_boundary_taps:
+            parity_attention_input = hidden_states
         if self.is_vl_first_layer and _EXTRA_CTX.flash_comm_v1_enabled:
             tp_size = get_tensor_model_parallel_world_size()
             num_local_tokens = hidden_states.shape[0] // tp_size
@@ -2126,6 +2846,8 @@ class KimiK3DecoderLayer(nn.Module):
             attention_output = torch.empty_like(hidden_states)
         self.self_attn(positions=positions, hidden_states=hidden_states, output=attention_output)
         _parity_tap(f"{self.layer_idx + 1:02d}_attention_output", attention_output)
+        if self.parity_graph_boundary_taps:
+            parity_attention_output = attention_output
 
         # The multimodal first layer transitions from full inputs_embeds to a
         # FlashComm token shard.  The token axis is dim 0 for both tensors, so
@@ -2145,14 +2867,31 @@ class KimiK3DecoderLayer(nn.Module):
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         _parity_tap(f"{self.layer_idx + 1:02d}_mlp_input", hidden_states)
+        if self.parity_graph_boundary_taps:
+            parity_mlp_input = hidden_states
         if hasattr(self, "block_sparse_moe"):
             hidden_states = self.block_sparse_moe(hidden_states)
         else:
             hidden_states = self.mlp(hidden_states)
         _parity_tap(f"{self.layer_idx + 1:02d}_mlp_output", hidden_states)
+        if self.parity_graph_boundary_taps:
+            parity_mlp_output = hidden_states
         layer_output = prefix_sum + hidden_states
         _parity_tap(f"{self.layer_idx + 1:02d}_layer_output", layer_output)
         _parity_tap(f"{self.layer_idx + 1:02d}_block_residual_output", block_residual)
+        if self.parity_graph_boundary_taps:
+            parity_boundaries = torch.stack(
+                (
+                    parity_layer_input,
+                    parity_attention_input,
+                    parity_attention_output,
+                    parity_mlp_input,
+                    parity_mlp_output,
+                    layer_output,
+                ),
+                dim=1,
+            )
+            return layer_output, block_residual, parity_boundaries
         return layer_output, block_residual
 
 
@@ -2191,6 +2930,94 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
             get_layer,
             prefix=f"{prefix}.layers",
         )
+        dense_mlp = self.layers[0].mlp
+        if getattr(dense_mlp, "reference_dense_mlp_graph_boundary", False):
+            dense_mlp.register_buffer(
+                "reference_dense_mlp_output_buffer",
+                torch.empty(
+                    (
+                        vllm_config.scheduler_config.max_num_batched_tokens,
+                        config.hidden_size,
+                    ),
+                    dtype=vllm_config.model_config.dtype,
+                    device=current_platform.current_device(),
+                ),
+                persistent=False,
+            )
+        if getattr(dense_mlp, "parity_graph_dense_mlp_export", False):
+            dense_export_width = (
+                dense_mlp.parity_dense_gate_up_width
+                + dense_mlp.parity_dense_activation_width
+                + dense_mlp.parity_dense_output_width
+            )
+            dense_mlp.register_buffer(
+                "parity_dense_mlp_export_buffer",
+                torch.empty(
+                    (1, dense_export_width),
+                    dtype=vllm_config.model_config.dtype,
+                ),
+                persistent=False,
+            )
+        self.parity_graph_layer_taps = (
+            os.environ.get("KIMI_PARITY_GRAPH_LAYER_TAPS") == "1"
+        )
+        self.parity_graph_layer_export_start = int(
+            os.environ.get("KIMI_PARITY_GRAPH_LAYER_EXPORT_START", "1")
+        )
+        self.parity_graph_layer_export_count = int(
+            os.environ.get("KIMI_PARITY_GRAPH_LAYER_EXPORT_COUNT", "0")
+        )
+        self.parity_graph_layer_export_width = int(
+            os.environ.get(
+                "KIMI_PARITY_GRAPH_LAYER_EXPORT_WIDTH", str(config.hidden_size)
+            )
+        )
+        self.parity_graph_boundary_layer = int(
+            os.environ.get("KIMI_PARITY_GRAPH_BOUNDARY_LAYER", "0")
+        )
+        if not 0 <= self.parity_graph_boundary_layer <= config.num_hidden_layers:
+            raise ValueError("KIMI_PARITY_GRAPH_BOUNDARY_LAYER is out of range")
+        if self.parity_graph_boundary_layer > 0:
+            # Keep the replay-visible mutation on the parent module.  A
+            # nonpersistent buffer owned and mutated only by a compiled child
+            # module can retain its graph-capture value instead of the replay
+            # value on this stack.
+            self.register_buffer(
+                "parity_graph_boundary_buffer",
+                torch.empty(
+                    (1, 6, config.hidden_size),
+                    dtype=vllm_config.model_config.dtype,
+                ),
+                persistent=False,
+            )
+        if self.parity_graph_layer_taps:
+            if not 1 <= self.parity_graph_layer_export_start <= config.num_hidden_layers:
+                raise ValueError("KIMI_PARITY_GRAPH_LAYER_EXPORT_START is out of range")
+            if self.parity_graph_layer_export_count < 0:
+                raise ValueError("KIMI_PARITY_GRAPH_LAYER_EXPORT_COUNT must be non-negative")
+            if (
+                self.parity_graph_layer_export_start
+                + self.parity_graph_layer_export_count
+                - 1
+                > config.num_hidden_layers
+            ):
+                raise ValueError("Kimi parity graph layer export exceeds layer count")
+            if not 1 <= self.parity_graph_layer_export_width <= config.hidden_size:
+                raise ValueError("KIMI_PARITY_GRAPH_LAYER_EXPORT_WIDTH is out of range")
+            # Python file I/O inside ``forward`` is consumed during
+            # torch.compile/CUDAGraph capture and is not replayed.  Instead,
+            # make the graph copy each replicated layer output into a small,
+            # nonpersistent device buffer.  ``compute_logits`` saves this
+            # buffer after graph replay, without a graph break or a value
+            # transformation on the model path.
+            self.register_buffer(
+                "parity_graph_layer_output_buffer",
+                torch.empty(
+                    (1, config.num_hidden_layers, config.hidden_size),
+                    dtype=vllm_config.model_config.dtype,
+                ),
+                persistent=False,
+            )
         if get_pp_group().is_last_rank:
             self.output_attn_res_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
             self.output_attn_res_proj = ReplicatedLinear(
@@ -2258,7 +3085,14 @@ class KimiK3TextModel(nn.Module, EagleModelMixin):
                             layer.self_attention_res_norm,
                         )
                     )
-            hidden_states, block_residual = layer(positions, hidden_states, block_residual)
+            layer_result = layer(positions, hidden_states, block_residual)
+            if getattr(layer, "parity_graph_boundary_taps", False):
+                hidden_states, block_residual, parity_boundaries = layer_result
+                self.parity_graph_boundary_buffer.copy_(parity_boundaries[:1])
+            else:
+                hidden_states, block_residual = layer_result
+            if getattr(self, "parity_graph_layer_taps", False):
+                self.parity_graph_layer_output_buffer[0, layer_idx].copy_(hidden_states[0])
             if not self.dspark_aux_capture_materialized and (layer_idx + 1) in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states)
 
@@ -2416,6 +3250,38 @@ class AscendKimiK3ForCausalLM(nn.Module, HasInnerState, SupportsPP, MixtureOfExp
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         logits = self.logits_processor(self.lm_head, hidden_states)
+        dense_mlp = self.model.layers[0].mlp
+        if (
+            getattr(dense_mlp, "parity_graph_dense_mlp_export", False)
+            and dense_mlp.parity_graph_dense_mlp_export_to_logits
+        ):
+            exported = dense_mlp.parity_dense_mlp_export_buffer
+            if exported.shape[-1] > logits.shape[-1]:
+                raise ValueError(
+                    "Kimi dense MLP graph export is larger than the vocabulary"
+                )
+            logits[:, : exported.shape[-1]].copy_(exported)
+        elif self.model.parity_graph_boundary_layer > 0:
+            exported = self.model.parity_graph_boundary_buffer.flatten(1)
+            if exported.shape[-1] > logits.shape[-1]:
+                raise ValueError(
+                    "Kimi parity graph boundary export is larger than the vocabulary"
+                )
+            logits[:, : exported.shape[-1]].copy_(exported)
+        elif (
+            self.model.parity_graph_layer_taps
+            and self.model.parity_graph_layer_export_count > 0
+        ):
+            start = self.model.parity_graph_layer_export_start - 1
+            stop = start + self.model.parity_graph_layer_export_count
+            exported = self.model.parity_graph_layer_output_buffer[
+                :, start:stop, : self.model.parity_graph_layer_export_width
+            ].flatten(1)
+            if exported.shape[-1] > logits.shape[-1]:
+                raise ValueError(
+                    "Kimi parity graph layer export is larger than the vocabulary"
+                )
+            logits[:, : exported.shape[-1]].copy_(exported)
         _parity_tap("11_logits", logits)
         return logits
 

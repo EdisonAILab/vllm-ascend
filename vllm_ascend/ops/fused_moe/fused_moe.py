@@ -578,7 +578,33 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         return shared_gate_up
 
     def _shared_experts_part2(self, hidden_states: torch.Tensor, shared_gate_up: torch.Tensor):
-        shared_act = self._shared_experts.act_fn(shared_gate_up)  # type: ignore
+        shared_act_fn = self._shared_experts.act_fn  # type: ignore
+        if (
+            os.environ.get(
+                "VLLM_ASCEND_KIMI_REFERENCE_SHARED_SITU",
+                "0",
+            )
+            == "1"
+            and isinstance(shared_act_fn, AscendSituAndMul)
+        ):
+            # Megatron evaluates shared-expert SiTU with explicit FP32
+            # intermediates before the BF16 down projection. The native
+            # Ascend SiTU op can cross a BF16 rounding midpoint for singleton
+            # decode rows, so preserve the training-side operation order in
+            # this opt-in correctness path.
+            gate, up = shared_gate_up.to(torch.float32).chunk(2, dim=-1)
+            gate = (
+                shared_act_fn.beta
+                * torch.tanh(gate / shared_act_fn.beta)
+                * torch.sigmoid(gate)
+            )
+            if shared_act_fn.linear_beta is not None:
+                up = shared_act_fn.linear_beta * torch.tanh(
+                    up / shared_act_fn.linear_beta
+                )
+            shared_act = (gate * up).to(shared_gate_up.dtype)
+        else:
+            shared_act = shared_act_fn(shared_gate_up)
         shared_out, _ = self._shared_experts.down_proj(shared_act)  # type: ignore
 
         # Qwen3-Next specific gating mechanism
@@ -677,7 +703,29 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # MoE), in which case the early-reduce path reduces shared here to
         # match the pre-transform routed reduce.
         if shared_output is not None and self._allgather_requires_early_routed_reduce:
-            shared_output = tensor_model_parallel_all_reduce(shared_output)
+            if (
+                os.environ.get(
+                    "VLLM_ASCEND_KIMI_REFERENCE_SHARED_TP_FIXED_ORDER",
+                    "0",
+                )
+                == "1"
+                and get_tp_group().world_size > 1
+            ):
+                # Decode normally reduces a one-row BF16 shared-expert
+                # partial, whereas Megatron reduces a larger sequence-parallel
+                # buffer. HCCL may select different reduction trees for those
+                # shapes. Gather rank partials and accumulate in rank order so
+                # the arithmetic contract is independent of that selection.
+                tp_group = get_tp_group()
+                gathered = tp_group.all_gather(shared_output, dim=0).reshape(
+                    tp_group.world_size,
+                    *shared_output.shape,
+                )
+                shared_output = gathered[0].clone()
+                for source_rank in range(1, tp_group.world_size):
+                    shared_output.add_(gathered[source_rank])
+            else:
+                shared_output = tensor_model_parallel_all_reduce(shared_output)
         return shared_output
 
     def _maybe_reduce_final_output(

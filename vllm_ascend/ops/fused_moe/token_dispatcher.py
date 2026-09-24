@@ -28,6 +28,7 @@ import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
 from vllm.distributed.parallel_state import get_ep_group, get_tp_group
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import get_dispatch_v2_tokens_capacity, get_mc2_tokens_capacity
@@ -59,6 +60,91 @@ EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
 EXPERT_TOKEN_NUMS_TYPE_COUNT = 1
 
 _TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
+_KIMI_FIXED_ORDER_MOE_TP_REDUCTION = (
+    os.getenv(
+        "VLLM_ASCEND_KIMI_REFERENCE_TP_MOE_FIXED_ORDER",
+        "0",
+    )
+    == "1"
+)
+
+
+def _kimi_fixed_order_moe_tp_reduce_impl(
+    hidden_states: torch.Tensor,
+    group_name: str,
+    world_size: int,
+    destination_rank: int,
+) -> torch.Tensor:
+    """Reduce expert-TP contributions in an explicit rank order."""
+    from vllm.distributed.parallel_state import _groups
+
+    if group_name not in _groups:
+        raise ValueError(f"tensor-parallel group {group_name!r} is unavailable")
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"tensor-parallel group {group_name!r} is destroyed")
+    if group.world_size != world_size:
+        raise ValueError(
+            "Kimi fixed-order MoE reduction world-size mismatch: "
+            f"group={group.world_size}, requested={world_size}"
+        )
+    if not 0 <= destination_rank < world_size:
+        raise ValueError(
+            f"Kimi fixed-order MoE destination rank {destination_rank} "
+            f"is outside [0, {world_size})"
+        )
+    if hidden_states.shape[0] % world_size:
+        raise ValueError(
+            "Kimi fixed-order MoE input rows must be divisible by TP size: "
+            f"rows={hidden_states.shape[0]}, tp={world_size}"
+        )
+
+    assignments_per_source_rank = hidden_states.shape[0] // world_size
+    local_chunk = hidden_states.reshape(
+        world_size,
+        assignments_per_source_rank,
+        *hidden_states.shape[1:],
+    )[destination_rank].contiguous()
+    gathered = group._all_gather_out_place(
+        local_chunk.unsqueeze(0),
+        0,
+    )
+    contributions = gathered.reshape(
+        world_size,
+        assignments_per_source_rank,
+        *hidden_states.shape[1:],
+    )
+    rank_order = list(range(world_size))
+    reduced = contributions[rank_order[0]].float().contiguous()
+    for rank in rank_order[1:]:
+        reduced.add_(contributions[rank].float())
+    return reduced
+
+
+def _kimi_fixed_order_moe_tp_reduce_fake(
+    hidden_states: torch.Tensor,
+    group_name: str,
+    world_size: int,
+    destination_rank: int,
+) -> torch.Tensor:
+    del group_name, destination_rank
+    return torch.empty(
+        (hidden_states.shape[0] // world_size, *hidden_states.shape[1:]),
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+
+
+if _KIMI_FIXED_ORDER_MOE_TP_REDUCTION and not hasattr(
+    torch.ops.vllm,
+    "kimi_fixed_order_moe_tp_reduce",
+):
+    direct_register_custom_op(
+        op_name="kimi_fixed_order_moe_tp_reduce",
+        op_func=_kimi_fixed_order_moe_tp_reduce_impl,
+        fake_impl=_kimi_fixed_order_moe_tp_reduce_fake,
+        dispatch_key="PrivateUse1",
+    )
 
 
 def _get_expert_token_nums_type(token_dispatch_input: MoETokenDispatchInput) -> int:
@@ -363,6 +449,10 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         self._assignment_reduce_enabled = False
         self._kimi_tp_moe_replication_enabled = False
         self._kimi_tp_moe_restore_order = None
+        self._kimi_tp_moe_local_restore_order = None
+        self._kimi_tp_moe_rank_major_token_indices = None
+        self._kimi_tp_moe_precombine_enabled = False
+        self._kimi_tp_moe_fixed_order_enabled = False
         self._reduce_scatter_enabled = False
         self._assignment_reduce_call_index = 0
         self._assignment_reduce_tap_done = False
@@ -412,6 +502,26 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
         self._kimi_tp_moe_replication_enabled = (
             kimi_tp_moe_reduction and get_tp_group().world_size > 1
         )
+        self._kimi_tp_moe_precombine_enabled = (
+            self._kimi_tp_moe_replication_enabled
+            and os.environ.get(
+                "VLLM_ASCEND_KIMI_REFERENCE_TP_MOE_PRECOMBINE_REDUCTION",
+                "0",
+            )
+            == "1"
+        )
+        self._kimi_tp_moe_fixed_order_enabled = (
+            self._kimi_tp_moe_replication_enabled
+            and _KIMI_FIXED_ORDER_MOE_TP_REDUCTION
+        )
+        if (
+            self._kimi_tp_moe_fixed_order_enabled
+            and self._kimi_tp_moe_precombine_enabled
+        ):
+            raise ValueError(
+                "Kimi TP MoE fixed-order and precombine reductions are "
+                "mutually exclusive"
+            )
         self._reduce_scatter_enabled = (
             is_situ_w4a8_mxfp
             and os.environ.get(
@@ -436,6 +546,21 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
                 self.top_k
             )
             self._training_parity_sorted_token_indices = token_indices.index_select(0, assignment_order)
+            # assignment_order maps expert-sorted positions to the original
+            # token-major top-k positions.  Megatron's token-unpermute reduces
+            # each token in that original top-k order; keep the inverse so the
+            # reference path can reproduce the same BF16 accumulation order.
+            local_restore_order = torch.empty_like(assignment_order)
+            local_restore_order.scatter_(
+                0,
+                assignment_order,
+                torch.arange(
+                    assignment_order.numel(),
+                    dtype=assignment_order.dtype,
+                    device=assignment_order.device,
+                ),
+            )
+            self._kimi_tp_moe_local_restore_order = local_restore_order
         apply_router_weight_on_input = token_dispatch_input.routing.apply_router_weight_on_input
         if apply_router_weight_on_input:
             assert topk_weights.dim() == 2, "`topk_weights` should be in shape (num_tokens, topk)"
@@ -485,6 +610,20 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             sorted_expert_ids = flat_experts.index_select(0, assignment_order)
             rank_major_hidden_states = tp_group.all_gather(sorted_hidden_states, dim=0)
             rank_major_expert_ids = tp_group.all_gather(sorted_expert_ids, dim=0)
+            if self._kimi_tp_moe_precombine_enabled:
+                rank_major_token_indices = tp_group.all_gather(
+                    self._training_parity_sorted_token_indices, dim=0
+                )
+                source_rank_offsets = torch.arange(
+                    tp_size,
+                    dtype=rank_major_token_indices.dtype,
+                    device=rank_major_token_indices.device,
+                ).repeat_interleave(num_assignments)
+                self._kimi_tp_moe_rank_major_token_indices = (
+                    rank_major_token_indices + source_rank_offsets * num_tokens
+                )
+            else:
+                self._kimi_tp_moe_rank_major_token_indices = None
             expanded_rows = torch.argsort(rank_major_expert_ids.float(), stable=True)
 
             # Megatron gathers BF16 assignments before expert activation
@@ -609,6 +748,36 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             return final_hidden_states
         if self._assignment_reduce_enabled:
             tp_group = get_tp_group()
+            logical_tokens = int(combine_metadata.restore_shape[:-1].numel())
+            output_dtype = hidden_states.dtype
+            fp32_assignment_combine = (
+                self._kimi_tp_moe_replication_enabled
+                and os.environ.get(
+                    "VLLM_ASCEND_KIMI_REFERENCE_TP_MOE_FP32_COMBINE",
+                    "0",
+                )
+                == "1"
+            )
+            native_topk_combine = (
+                self._kimi_tp_moe_replication_enabled
+                and os.environ.get(
+                    "VLLM_ASCEND_KIMI_REFERENCE_TP_MOE_NATIVE_TOPK_COMBINE",
+                    "0",
+                )
+                == "1"
+            )
+            precombine_reduction = self._kimi_tp_moe_precombine_enabled
+            if precombine_reduction and fp32_assignment_combine:
+                raise ValueError(
+                    "Kimi TP MoE precombine and FP32 postcombine are mutually exclusive"
+                )
+            if self._kimi_tp_moe_fixed_order_enabled and (
+                fp32_assignment_combine or native_topk_combine
+            ):
+                raise ValueError(
+                    "Kimi TP MoE fixed-order reduction cannot be combined "
+                    "with diagnostic combine modes"
+                )
             if tp_group.world_size <= 0 or tp_group.world_size & (
                 tp_group.world_size - 1
             ):
@@ -653,23 +822,69 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
                                 f"rank_{rank:02d}_reduce_scatter_input.pt",
                             ),
                         )
-                    output_dtype = hidden_states.dtype
-                    # Megatron's TP MoE reduce-scatter accumulates the BF16
-                    # expert shards in FP32 and casts once at the output.  A
-                    # native BF16 collective rounds after intermediate sums.
-                    reduce_scatter_input = hidden_states.float().contiguous()
-                    reduced = torch.empty(
-                        (hidden_states.shape[0] // tp_group.world_size,)
-                        + hidden_states.shape[1:],
-                        dtype=reduce_scatter_input.dtype,
-                        device=hidden_states.device,
+                    if precombine_reduction:
+                        rank_major_token_indices = (
+                            self._kimi_tp_moe_rank_major_token_indices
+                        )
+                        if rank_major_token_indices is None:
+                            raise RuntimeError(
+                                "missing Kimi TP MoE rank-major token indices"
+                            )
+                        # Megatron AllGather MoE first unpermutes (and thereby
+                        # combines top-k assignments) independently on every
+                        # expert-TP rank, then reduce-scatters those token rows.
+                        # The legacy vLLM parity path did these operations in
+                        # the opposite order; the two are not BF16-associative.
+                        rank_major_combined = torch.zeros(
+                            (tp_group.world_size * logical_tokens, hidden_states.shape[-1]),
+                            dtype=hidden_states.dtype,
+                            device=hidden_states.device,
+                        )
+                        was_enabled = torch.are_deterministic_algorithms_enabled()
+                        torch.use_deterministic_algorithms(True)
+                        try:
+                            rank_major_combined.index_add_(
+                                0, rank_major_token_indices, hidden_states
+                            )
+                        finally:
+                            torch.use_deterministic_algorithms(was_enabled)
+                        # Megatron's AllGather dispatcher unpermutes the BF16
+                        # expert output first, then sends that BF16 tensor
+                        # directly through reduce-scatter.  Keeping FP32 here
+                        # changes the HCCL reduction's rounding boundary.
+                        reduce_scatter_input = rank_major_combined.contiguous()
+                    else:
+                        reduce_scatter_input = hidden_states.float().contiguous()
+                    if self._kimi_tp_moe_fixed_order_enabled:
+                        reduced = torch.ops.vllm.kimi_fixed_order_moe_tp_reduce(
+                            hidden_states,
+                            tp_group.unique_name,
+                            tp_group.world_size,
+                            tp_group.rank_in_group,
+                        )
+                    else:
+                        reduced = torch.empty(
+                            (
+                                reduce_scatter_input.shape[0]
+                                // tp_group.world_size,
+                            )
+                            + reduce_scatter_input.shape[1:],
+                            dtype=reduce_scatter_input.dtype,
+                            device=hidden_states.device,
+                        )
+                        torch.distributed.reduce_scatter_tensor(
+                            reduced,
+                            reduce_scatter_input,
+                            group=tp_group.device_group,
+                        )
+                    reduced_bf16 = reduced.to(output_dtype)
+                    # Megatron retains FP32 assignment rows through top-k
+                    # token combination and casts the combined token once.
+                    # Casting each assignment here adds a second BF16
+                    # reduction and changes cancellation-heavy coordinates.
+                    hidden_states = (
+                        reduced if fp32_assignment_combine else reduced_bf16
                     )
-                    torch.distributed.reduce_scatter_tensor(
-                        reduced,
-                        reduce_scatter_input,
-                        group=tp_group.device_group,
-                    )
-                    hidden_states = reduced.to(output_dtype)
                 else:
                     hidden_states = tp_group.all_reduce(hidden_states)
                 if should_tap:
@@ -679,19 +894,34 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
                     )
             if bias is not None:
                 raise ValueError("training parity MoE combine does not support bias")
-            sorted_token_indices = self._training_parity_sorted_token_indices
             num_tokens = combine_metadata.restore_shape[:-1].numel()
-            final_hidden_states = torch.zeros(
-                (num_tokens, hidden_states.shape[-1]),
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-            was_enabled = torch.are_deterministic_algorithms_enabled()
-            torch.use_deterministic_algorithms(True)
-            try:
-                final_hidden_states.index_add_(0, sorted_token_indices, hidden_states)
-            finally:
-                torch.use_deterministic_algorithms(was_enabled)
+            if precombine_reduction:
+                final_hidden_states = hidden_states
+            else:
+                sorted_token_indices = self._training_parity_sorted_token_indices
+                if native_topk_combine:
+                    local_restore_order = self._kimi_tp_moe_local_restore_order
+                    if local_restore_order is None:
+                        raise RuntimeError("missing Kimi TP MoE local restore order")
+                    hidden_states = hidden_states.index_select(0, local_restore_order)
+                    sorted_token_indices = sorted_token_indices.index_select(
+                        0, local_restore_order
+                    )
+                final_hidden_states = torch.zeros(
+                    (num_tokens, hidden_states.shape[-1]),
+                    dtype=hidden_states.dtype,
+                    device=hidden_states.device,
+                )
+                was_enabled = torch.are_deterministic_algorithms_enabled()
+                torch.use_deterministic_algorithms(True)
+                try:
+                    final_hidden_states.index_add_(
+                        0, sorted_token_indices, hidden_states
+                    )
+                finally:
+                    torch.use_deterministic_algorithms(was_enabled)
+                if fp32_assignment_combine:
+                    final_hidden_states = final_hidden_states.to(output_dtype)
             if tp_group.world_size > 1 and not self._kimi_tp_moe_replication_enabled:
                 # MoERunner still performs its standard late TP all-reduce.
                 # Every rank now has the already-reduced result, so scale by

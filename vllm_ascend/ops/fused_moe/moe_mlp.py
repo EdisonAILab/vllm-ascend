@@ -47,6 +47,9 @@ from vllm_ascend.utils import (
 ASCEND_DEVICE_TYPE = get_ascend_device_type()
 SITU_MX_DST_TYPE_E4M3FN = 36
 _TRAINING_PARITY = os.getenv("VLLM_ASCEND_TRAINING_PARITY", "0") == "1"
+_KIMI_REFERENCE_EXPLICIT_WEIGHTED_SITU = (
+    os.getenv("VLLM_ASCEND_KIMI_REFERENCE_EXPLICIT_WEIGHTED_SITU", "0") == "1"
+)
 
 
 def _custom_gmm_swiglu_enabled(fusion, dynamic_eplb, activation=None):
@@ -235,14 +238,39 @@ def _w4a8_situ_apply_mlp(
 
     weighted_situ = use_mxfp_quant and topk_scales is not None
     if use_mxfp_quant:
-        hidden_states, situ_out_scale = torch.ops._C_ascend.situ_mx_quant(
-            x=gate_up_out,
-            topk_weight=topk_scales if weighted_situ else None,
-            beta=activation.beta,
-            linear_beta=activation.linear_beta or 0.0,
-            activate_left=True,
-            dst_type=SITU_MX_DST_TYPE_E4M3FN,
-        )
+        if weighted_situ and _KIMI_REFERENCE_EXPLICIT_WEIGHTED_SITU:
+            # Preserve Megatron's observable low-precision boundaries:
+            # SiTU -> BF16 -> BF16 routing weight -> dynamic MXFP8.
+            # The native SiTU op can cross a BF16 rounding midpoint inside the
+            # grouped-MoE stream even when a standalone replay of identical
+            # input bytes is exact.  Keep this correctness path decomposed so
+            # its FP32 division and operation order are explicit.
+            gate, up = gate_up_out.to(torch.float32).chunk(2, dim=-1)
+            gate = (
+                activation.beta
+                * torch.tanh(gate / activation.beta)
+                * torch.sigmoid(gate)
+            )
+            if activation.linear_beta is not None:
+                up = activation.linear_beta * torch.tanh(
+                    up / activation.linear_beta
+                )
+            hidden_states = (gate * up).to(gate_up_out.dtype)
+            hidden_states = hidden_states * topk_scales.to(hidden_states.dtype)
+            hidden_states, situ_out_scale = torch_npu.npu_dynamic_mx_quant(
+                hidden_states,
+                axis=-1,
+                dst_type=torch.float8_e4m3fn,
+            )
+        else:
+            hidden_states, situ_out_scale = torch.ops._C_ascend.situ_mx_quant(
+                x=gate_up_out,
+                topk_weight=topk_scales if weighted_situ else None,
+                beta=activation.beta,
+                linear_beta=activation.linear_beta or 0.0,
+                activate_left=True,
+                dst_type=SITU_MX_DST_TYPE_E4M3FN,
+            )
     else:
         hidden_states, situ_out_scale = torch.ops._C_ascend.dequant_situ_quant(
             x=gate_up_out,

@@ -81,6 +81,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_KIMI_UNFUSED_SHORT_CONV_ACTIVATION": lambda: bool(
         int(os.getenv("VLLM_ASCEND_KIMI_UNFUSED_SHORT_CONV_ACTIVATION", "0"))
     ),
+    # Pad the first dense Kimi MLP to this row capacity inside the opt-in
+    # graph-boundary reference path. Zero disables padding. Non-sensitive.
+    "VLLM_ASCEND_KIMI_REFERENCE_DENSE_MLP_CAPACITY": lambda: int(
+        os.getenv("VLLM_ASCEND_KIMI_REFERENCE_DENSE_MLP_CAPACITY", "0")
+    ),
+    # Use the training-side FP32 SiTU formula only in the first dense Kimi
+    # MLP graph-boundary reference path. Disabled by default. Non-sensitive.
+    "VLLM_ASCEND_KIMI_REFERENCE_DENSE_MLP_SITU": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_DENSE_MLP_SITU", "0"))
+    ),
     "VLLM_ASCEND_KIMI_REFERENCE_KDA_CORE": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_KDA_CORE", "0"))),
     "VLLM_ASCEND_KIMI_NATIVE_KDA_CORE": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_NATIVE_KDA_CORE", "0"))),
     "VLLM_ASCEND_KIMI_NATIVE_STATE_OPS": lambda: bool(int(os.getenv("VLLM_ASCEND_KIMI_NATIVE_STATE_OPS", "0"))),
@@ -105,6 +115,21 @@ env_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM": lambda: bool(
         int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM", "0"))
+    ),
+    # Match Megatron's explicit FP32 shared-expert SiTU operation order.
+    # Disabled by default; used only by the Kimi parity reference profile.
+    "VLLM_ASCEND_KIMI_REFERENCE_SHARED_SITU": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_KIMI_REFERENCE_SHARED_SITU", "0"))
+    ),
+    # Replace shape-dependent HCCL shared-expert reduction trees with an
+    # explicit rank-ascending sum. Disabled by default and non-sensitive.
+    "VLLM_ASCEND_KIMI_REFERENCE_SHARED_TP_FIXED_ORDER": lambda: bool(
+        int(
+            os.getenv(
+                "VLLM_ASCEND_KIMI_REFERENCE_SHARED_TP_FIXED_ORDER",
+                "0",
+            )
+        )
     ),
     "VLLM_ASCEND_KIMI_FIXED_CAPACITY_ROUTED_RMS_NORM": lambda: bool(
         int(os.getenv("VLLM_ASCEND_KIMI_FIXED_CAPACITY_ROUTED_RMS_NORM", "0"))

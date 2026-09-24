@@ -115,6 +115,90 @@ class TestNPUPlatform(TestBase):
             ["vllm::unified_attention_with_output"],
         )
 
+    def test_kimi_kda_fixed_order_reduce_is_piecewise_split(self):
+        config = MagicMock(splitting_ops=["vllm::unified_attention_with_output"])
+
+        with patch.dict(
+            os.environ,
+            {
+                "VLLM_ASCEND_KIMI_REFERENCE_FIXED_ORDER_KDA_TP_REDUCTION": "1",
+            },
+            clear=True,
+        ):
+            _configure_fixed_order_all_reduce_split(config)
+            _configure_fixed_order_all_reduce_split(config)
+
+        self.assertEqual(
+            config.splitting_ops,
+            [
+                "vllm::unified_attention_with_output",
+                "vllm::kimi_fixed_order_kda_tp_reduce_",
+            ],
+        )
+
+    def test_kimi_moe_fixed_order_reduce_is_piecewise_split(self):
+        config = MagicMock(splitting_ops=["vllm::unified_attention_with_output"])
+
+        with patch.dict(
+            os.environ,
+            {
+                "VLLM_ASCEND_KIMI_REFERENCE_TP_MOE_FIXED_ORDER": "1",
+            },
+            clear=True,
+        ):
+            _configure_fixed_order_all_reduce_split(config)
+            _configure_fixed_order_all_reduce_split(config)
+
+        self.assertEqual(
+            config.splitting_ops,
+            [
+                "vllm::unified_attention_with_output",
+                "vllm::kimi_fixed_order_moe_tp_reduce",
+            ],
+        )
+
+    def test_kimi_dense_mlp_reference_is_piecewise_split(self):
+        config = MagicMock(splitting_ops=["vllm::unified_attention_with_output"])
+
+        with patch.dict(
+            os.environ,
+            {
+                "VLLM_ASCEND_KIMI_REFERENCE_DENSE_MLP_GRAPH_BOUNDARY": "1",
+            },
+            clear=True,
+        ):
+            _configure_fixed_order_all_reduce_split(config)
+            _configure_fixed_order_all_reduce_split(config)
+
+        self.assertEqual(
+            config.splitting_ops,
+            [
+                "vllm::unified_attention_with_output",
+                "vllm::kimi_reference_dense_mlp_with_output",
+            ],
+        )
+
+    def test_kimi_dense_mlp_export_is_piecewise_split(self):
+        config = MagicMock(splitting_ops=[])
+
+        with patch.dict(
+            os.environ,
+            {
+                "VLLM_ASCEND_KIMI_REFERENCE_DENSE_MLP_GRAPH_BOUNDARY": "1",
+                "KIMI_PARITY_GRAPH_DENSE_MLP_EXPORT": "1",
+            },
+            clear=True,
+        ):
+            _configure_fixed_order_all_reduce_split(config)
+
+        self.assertEqual(
+            config.splitting_ops,
+            [
+                "vllm::kimi_reference_dense_mlp_with_output",
+                "vllm::kimi_reference_dense_mlp_export",
+            ],
+        )
+
     @patch("vllm_ascend.utils.adapt_patch")
     @patch("vllm_ascend.quantization.modelslim_config.AscendModelSlimConfig")
     def test_pre_register_and_update_with_parser(self, mock_quant_config, mock_adapt_patch):

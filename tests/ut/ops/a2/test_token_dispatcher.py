@@ -39,11 +39,56 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (  # isort: skip
     TokenDispatcherWithAll2AllV,
     TokenDispatcherWithAllGather,
     TokenDispatcherWithMC2,
+    _kimi_fixed_order_moe_tp_reduce_impl,
 )
 from vllm_ascend.ops.fused_moe.moe_stage_params import MoEMxfpParams
 from vllm_ascend.quantization.quant_type import QuantType
 
 MXFP4_TEST_DTYPE = getattr(torch, "float4_e2m1fn_x2", torch.float16)
+
+
+def test_kimi_moe_fixed_order_reduce_uses_ascending_compute_rank_order():
+    world_size = 4
+    per_compute_rank = []
+    for value in (1.0e8, 1.0, -1.0e8, 2.0):
+        per_compute_rank.append(
+            torch.full((world_size, 1), value, dtype=torch.bfloat16)
+        )
+
+    class FakeTPGroup:
+        world_size = 4
+
+        @staticmethod
+        def _all_gather_out_place(tensor, dim):
+            assert tensor.shape == (1, 1, 1)
+            assert dim == 0
+            return torch.cat(
+                [value[3:4].unsqueeze(0) for value in per_compute_rank],
+                dim=0,
+            )
+
+    with patch.dict(
+        "vllm.distributed.parallel_state._groups",
+        {"tp": lambda: FakeTPGroup()},
+        clear=True,
+    ):
+        actual = _kimi_fixed_order_moe_tp_reduce_impl(
+            per_compute_rank[0],
+            "tp",
+            world_size,
+            3,
+        )
+
+    contributions = [value[3:4].float() for value in per_compute_rank]
+    expected = contributions[0].clone()
+    for rank in (1, 2, 3):
+        expected.add_(contributions[rank])
+    descending = contributions[3].clone()
+    for rank in (2, 1, 0):
+        descending.add_(contributions[rank])
+
+    assert torch.equal(actual, expected)
+    assert not torch.equal(actual, descending)
 
 
 def build_token_dispatch_input_fixture(

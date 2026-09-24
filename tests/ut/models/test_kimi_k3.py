@@ -22,7 +22,6 @@ from vllm_ascend.models.kimi_k3 import (
     _configure_kimi_mlapo_shape,
     _decomposed_mla_forward_decode,
     _decomposed_mla_forward_prefill,
-    _KimiFixedCapacityRMSNorm,
     _KimiReferenceRMSNorm,
     _KimiDecomposedRMSNorm,
     _kimi_mla_rms_norm_type,
@@ -105,27 +104,16 @@ def test_kimi_k3_loads_qkv_checkpoint_shards_into_fused_linear():
     assert loaded == {"layers.0.self_attn.fused_qkv.weight"}
 
 
-@pytest.mark.parametrize(
-    ("quant_name", "uses_quantized_latent_projections"),
-    [
-        ("ascend", True),
-        ("compressed-tensors", True),
-        ("other", False),
-    ],
-)
-def test_kimi_k3_quantizes_packed_latent_projections(
+@pytest.mark.parametrize("quant_name", ["ascend", "compressed-tensors", "other"])
+def test_kimi_k3_keeps_official_latent_projections_unquantized(
     quant_name: str,
-    uses_quantized_latent_projections: bool,
 ):
     quant_config = MagicMock()
     quant_config.get_name.return_value = quant_name
 
     actual = _routed_latent_quant_config(quant_config)
 
-    if uses_quantized_latent_projections:
-        assert actual is quant_config
-    else:
-        assert actual is None
+    assert actual is None
 
 
 def test_kimi_k3_unquantized_model_keeps_latent_projections_unquantized():
@@ -177,26 +165,6 @@ def test_kimi_k3_reference_rms_norm_casts_before_weight():
     assert torch.equal(norm(hidden_states), expected)
 
 
-def test_kimi_k3_fixed_capacity_rms_norm_tiles_and_pads_to_32_rows():
-    generator = torch.Generator().manual_seed(20260918)
-    hidden_states = torch.randn(33, 5, generator=generator, dtype=torch.bfloat16)
-    norm = _KimiFixedCapacityRMSNorm(5, eps=1e-6).to(dtype=torch.bfloat16)
-    reference = _KimiReferenceRMSNorm(5, eps=1e-6).to(dtype=torch.bfloat16)
-    norm.weight.data.copy_(
-        torch.tensor([0.5, 1.5, -0.75, 2.0, 0.25], dtype=torch.bfloat16)
-    )
-    reference.weight.data.copy_(norm.weight.data)
-
-    padded_tail = torch.cat(
-        (hidden_states[32:], torch.zeros(31, 5, dtype=torch.bfloat16)), dim=0
-    )
-    expected = torch.cat(
-        (reference(hidden_states[:32]), reference(padded_tail)[:1]), dim=0
-    )
-
-    assert torch.equal(norm(hidden_states), expected)
-
-
 def test_kimi_k3_reduced_mla_rms_norm_defaults_to_megatron_contract():
     defaults = {}
 
@@ -207,7 +175,10 @@ def test_kimi_k3_reduced_mla_rms_norm_defaults_to_megatron_contract():
     with patch.object(kimi_k3, "kimi_runtime_flag", side_effect=reduced_defaults):
         assert _kimi_mla_rms_norm_type() is _KimiReferenceRMSNorm
 
-    assert defaults == {"VLLM_ASCEND_KIMI_REFERENCE_MLA_RMS_NORM": True}
+    assert defaults == {
+        "VLLM_ASCEND_KIMI_PAIRWISE_MLA_RMS_NORM": False,
+        "VLLM_ASCEND_KIMI_REFERENCE_MLA_RMS_NORM": True,
+    }
 
 
 def test_kimi_k3_explicit_decomposed_mla_rms_norm_override_is_retained():
@@ -234,10 +205,7 @@ def test_kimi_k3_reduced_routed_rms_norm_defaults_to_megatron_contract():
     with patch.object(kimi_k3, "kimi_runtime_flag", side_effect=reduced_defaults):
         assert _kimi_routed_rms_norm_type() is _KimiReferenceRMSNorm
 
-    assert defaults == {
-        "VLLM_ASCEND_KIMI_FIXED_CAPACITY_ROUTED_RMS_NORM": False,
-        "VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM": True,
-    }
+    assert defaults == {"VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM": True}
 
 
 def test_kimi_k3_explicit_decomposed_routed_rms_norm_override_is_retained():
@@ -252,20 +220,6 @@ def test_kimi_k3_explicit_decomposed_routed_rms_norm_override_is_retained():
         side_effect=lambda name, *, reduced_default: values.get(name, reduced_default),
     ):
         assert _kimi_routed_rms_norm_type() is _KimiDecomposedRMSNorm
-
-
-def test_kimi_k3_fixed_capacity_routed_rms_norm_override_wins():
-    values = {
-        "VLLM_ASCEND_KIMI_FIXED_CAPACITY_ROUTED_RMS_NORM": True,
-        "VLLM_ASCEND_KIMI_REFERENCE_ROUTED_RMS_NORM": True,
-    }
-
-    with patch.object(
-        kimi_k3,
-        "kimi_runtime_flag",
-        side_effect=lambda name, *, reduced_default: values.get(name, reduced_default),
-    ):
-        assert _kimi_routed_rms_norm_type() is _KimiFixedCapacityRMSNorm
 
 
 def test_kimi_k3_decomposed_mla_prefill_matches_rowwise_reference():

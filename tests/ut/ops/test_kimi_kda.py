@@ -33,10 +33,72 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm_ascend.ops.kimi_kda import (
     _PACKED_CONV_WEIGHT_NAME,
     AscendKimiGatedDeltaNetAttention,
+    _kimi_fixed_order_kda_tp_reduce_impl,
     _load_a_log,
     _select_decode_conv_state,
     _zero_padded_spec_output,
 )
+
+
+class _FakeTPGroup:
+    def __init__(self, contributions: list[torch.Tensor]):
+        self.contributions = contributions
+        self.world_size = len(contributions)
+        self.all_reduce_calls = 0
+        self.all_gather_calls = 0
+
+    def all_reduce(self, tensor: torch.Tensor) -> torch.Tensor:
+        self.all_reduce_calls += 1
+        return tensor + 7
+
+    def _all_gather_out_place(
+        self,
+        tensor: torch.Tensor,
+        dim: int,
+    ) -> torch.Tensor:
+        self.all_gather_calls += 1
+        assert dim == 0
+        return torch.cat([value.unsqueeze(0) for value in self.contributions], dim=0)
+
+
+def test_kda_tp_reduce_preserves_native_collective_for_prefill():
+    group = _FakeTPGroup([])
+    tensor = torch.ones(2, 4, dtype=torch.bfloat16)
+
+    with patch.dict(
+        "vllm.distributed.parallel_state._groups",
+        {"tp": lambda: group},
+        clear=True,
+    ):
+        _kimi_fixed_order_kda_tp_reduce_impl(tensor, "tp")
+
+    assert group.all_reduce_calls == 1
+    assert group.all_gather_calls == 0
+    assert torch.equal(tensor, torch.full_like(tensor, 8))
+
+
+def test_kda_tp_reduce_adds_singleton_contributions_in_rank_order():
+    contributions = [
+        torch.tensor([[1.0, 8.0]], dtype=torch.bfloat16),
+        torch.tensor([[2.0, 16.0]], dtype=torch.bfloat16),
+        torch.tensor([[4.0, 32.0]], dtype=torch.bfloat16),
+    ]
+    group = _FakeTPGroup(contributions)
+    tensor = torch.zeros_like(contributions[0])
+
+    with patch.dict(
+        "vllm.distributed.parallel_state._groups",
+        {"tp": lambda: group},
+        clear=True,
+    ):
+        _kimi_fixed_order_kda_tp_reduce_impl(tensor, "tp")
+
+    expected = contributions[0].clone()
+    expected.add_(contributions[1])
+    expected.add_(contributions[2])
+    assert group.all_reduce_calls == 0
+    assert group.all_gather_calls == 1
+    assert torch.equal(tensor, expected)
 
 
 class _NoopQuantMethod(QuantizeMethodBase):

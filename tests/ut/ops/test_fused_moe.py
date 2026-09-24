@@ -412,6 +412,84 @@ def test_shared_experts_part2_applies_optional_gate(with_gate):
     torch.testing.assert_close(output, expected)
 
 
+def test_shared_experts_reference_situ_uses_megatron_fp32_order(monkeypatch):
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    nn.Module.__init__(runner)
+    activation = AscendSituAndMul(beta=4.0, linear_beta=25.0)
+    monkeypatch.setattr(
+        activation,
+        "forward",
+        MagicMock(side_effect=AssertionError("native SiTU must not run")),
+    )
+    runner._shared_experts = SimpleNamespace(
+        act_fn=activation,
+        down_proj=lambda value: (value, None),
+        expert_gate=None,
+    )
+    shared_gate_up = torch.tensor(
+        [[1.5, -2.0, 0.75, -1.25]],
+        dtype=torch.bfloat16,
+    )
+    monkeypatch.setenv("VLLM_ASCEND_KIMI_REFERENCE_SHARED_SITU", "1")
+
+    output = runner._shared_experts_part2(
+        torch.zeros((1, 2), dtype=torch.bfloat16),
+        shared_gate_up,
+    )
+
+    gate, up = shared_gate_up.float().chunk(2, dim=-1)
+    gate = 4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)
+    up = 25.0 * torch.tanh(up / 25.0)
+    expected = (gate * up).to(torch.bfloat16)
+    assert torch.equal(output, expected)
+
+
+def test_shared_expert_fixed_order_reduction_is_rank_ascending(monkeypatch):
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    runner.routed_output_transform = object()
+    shared_output = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
+    contributions = torch.tensor(
+        [
+            [1.0, 2.0],
+            [0.5, -0.25],
+            [-0.125, 0.75],
+        ],
+        dtype=torch.bfloat16,
+    )
+    tp_group = SimpleNamespace(
+        world_size=3,
+        all_gather=MagicMock(return_value=contributions),
+    )
+    native_reduce = MagicMock()
+    monkeypatch.setenv(
+        "VLLM_ASCEND_KIMI_REFERENCE_SHARED_TP_FIXED_ORDER",
+        "1",
+    )
+    monkeypatch.setattr(fused_moe_module, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(
+        fused_moe_module,
+        "tensor_model_parallel_all_reduce",
+        native_reduce,
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "_EXTRA_CTX",
+        SimpleNamespace(
+            flash_comm_v1_enabled=False,
+            moe_comm_type=MoECommType.ALLGATHER,
+        ),
+    )
+
+    output = runner._maybe_reduce_shared_expert_output(shared_output)
+
+    expected = contributions[0].clone()
+    expected.add_(contributions[1])
+    expected.add_(contributions[2])
+    assert torch.equal(output, expected.reshape_as(shared_output))
+    tp_group.all_gather.assert_called_once_with(shared_output, dim=0)
+    native_reduce.assert_not_called()
+
+
 def test_unquantized_shared_situ_uses_split_bf16_path(monkeypatch):
     runner = AscendMoERunner.__new__(AscendMoERunner)
     nn.Module.__init__(runner)

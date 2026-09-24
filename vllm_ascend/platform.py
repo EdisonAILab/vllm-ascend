@@ -76,17 +76,44 @@ MAX_CAPTURE_SIZES_FOR_950 = 4
 
 
 def _configure_fixed_order_all_reduce_split(compilation_config) -> None:
-    """Keep deterministic TP reductions outside PIECEWISE ACL graphs."""
-    if os.environ.get("VLLM_TP_FIXED_ORDER_ALLREDUCE") != "1":
-        return
-
-    op_name = "vllm::fixed_order_all_reduce_"
-    if op_name not in compilation_config.splitting_ops:
-        compilation_config.splitting_ops.append(op_name)
-        logger.info(
-            "Fixed-order TP reduction: executing %s outside PIECEWISE ACL graphs.",
-            op_name,
+    """Keep parity-sensitive custom ops outside PIECEWISE ACL graphs."""
+    requested_ops = []
+    if os.environ.get("VLLM_TP_FIXED_ORDER_ALLREDUCE") == "1":
+        requested_ops.append("vllm::fixed_order_all_reduce_")
+    if (
+        os.environ.get(
+            "VLLM_ASCEND_KIMI_REFERENCE_FIXED_ORDER_KDA_TP_REDUCTION",
+            "0",
         )
+        == "1"
+    ):
+        requested_ops.append("vllm::kimi_fixed_order_kda_tp_reduce_")
+    if (
+        os.environ.get(
+            "VLLM_ASCEND_KIMI_REFERENCE_TP_MOE_FIXED_ORDER",
+            "0",
+        )
+        == "1"
+    ):
+        requested_ops.append("vllm::kimi_fixed_order_moe_tp_reduce")
+    if (
+        os.environ.get(
+            "VLLM_ASCEND_KIMI_REFERENCE_DENSE_MLP_GRAPH_BOUNDARY",
+            "0",
+        )
+        == "1"
+    ):
+        requested_ops.append("vllm::kimi_reference_dense_mlp_with_output")
+        if os.environ.get("KIMI_PARITY_GRAPH_DENSE_MLP_EXPORT", "0") == "1":
+            requested_ops.append("vllm::kimi_reference_dense_mlp_export")
+
+    for op_name in requested_ops:
+        if op_name not in compilation_config.splitting_ops:
+            compilation_config.splitting_ops.append(op_name)
+            logger.info(
+                "Parity custom op: executing %s outside PIECEWISE ACL graphs.",
+                op_name,
+            )
 
 
 def config_deprecated_logging():

@@ -22,6 +22,8 @@ surface while routing prefill through the Kimi AscendC kernels and decode
 through the recurrent KDA AscendC kernel.
 """
 
+import hashlib
+import json
 import os
 from collections.abc import Callable
 from functools import partial, wraps
@@ -34,6 +36,7 @@ from torch.nn import functional as F
 from vllm.distributed import (
     get_pcp_group,
     get_tensor_model_parallel_rank,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import get_forward_context
@@ -52,6 +55,7 @@ from vllm.model_executor.model_loader.reload.meta import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.utils import replace_parameter
 from vllm.triton_utils import HAS_TRITON
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -91,7 +95,65 @@ _FUSED_QKV_NAME = "fused_qkv"
 _USE_PARTITION_INVARIANT_KDA = os.getenv("KIMI_VLLM_USE_PARTITION_INVARIANT_KDA", "0") == "1"
 _USE_TRAINING_CAUSAL_CONV1D = os.getenv("KIMI_VLLM_USE_TRAINING_CAUSAL_CONV1D", "0") == "1"
 _KDA_OPROJ_FP32_REDUCE = os.getenv("KIMI_KDA_OPROJ_FP32_REDUCE", "0") == "1"
+_KDA_FIXED_ORDER_TP_REDUCTION = (
+    os.getenv(
+        "VLLM_ASCEND_KIMI_REFERENCE_FIXED_ORDER_KDA_TP_REDUCTION",
+        "0",
+    )
+    == "1"
+)
 _PARITY_TAP_COUNTS: dict[str, int] = {}
+_PARITY_STATE_HASH_COUNTS: dict[str, int] = {}
+
+
+def _kimi_fixed_order_kda_tp_reduce_impl(
+    tensor: torch.Tensor,
+    group_name: str,
+) -> None:
+    """Reduce KDA TP contributions in rank order outside ACL graphs."""
+    from vllm.distributed.parallel_state import _groups
+
+    if group_name not in _groups:
+        raise ValueError(f"tensor-parallel group {group_name!r} is unavailable")
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"tensor-parallel group {group_name!r} is destroyed")
+
+    # This custom op is an unconditional graph boundary.  Decide from the
+    # real runtime tensor rather than from the non-singleton shape used by
+    # AOT profile/compile.  Prefill must retain its accepted HCCL arithmetic;
+    # singleton decode needs the fixed rank order.
+    if tensor.shape[0] != 1:
+        reduced = group.all_reduce(tensor)
+        if reduced is not tensor:
+            tensor.copy_(reduced)
+        return
+
+    gathered = group._all_gather_out_place(tensor.contiguous().unsqueeze(0), 0)
+    contributions = gathered.unbind(0)
+    tensor.copy_(contributions[0])
+    for rank in range(1, group.world_size):
+        tensor.add_(contributions[rank])
+
+
+def _kimi_fixed_order_kda_tp_reduce_fake(
+    tensor: torch.Tensor,
+    group_name: str,
+) -> None:
+    return
+
+
+if _KDA_FIXED_ORDER_TP_REDUCTION and not hasattr(
+    torch.ops.vllm,
+    "kimi_fixed_order_kda_tp_reduce_",
+):
+    direct_register_custom_op(
+        op_name="kimi_fixed_order_kda_tp_reduce_",
+        op_func=_kimi_fixed_order_kda_tp_reduce_impl,
+        fake_impl=_kimi_fixed_order_kda_tp_reduce_fake,
+        mutates_args=["tensor"],
+        dispatch_key="PrivateUse1",
+    )
 
 
 def _kimi_use_fused_kda_qkv(quant_config: object | None) -> bool:
@@ -119,15 +181,50 @@ def _parity_tap(name: str, tensor: torch.Tensor) -> None:
         "_conv_cache_indices",
         "_conv_state_before",
         "_conv_weights",
+        "_recurrent_state_before",
+        "_recurrent_state_after",
+        "_decay_factor",
+        "_state_after_decay",
+        "_predicted_value",
+        "_residual",
+        "_weighted_key",
+        "_delta",
     )
-    if expected_tokens not in tensor.shape and not name.endswith(static_taps):
-        return
+    if not name.endswith(static_taps):
+        batch_first_taps = (
+            "_beta_sigmoid",
+            "_raw_gate",
+            "_q_after_conv",
+            "_k_after_conv",
+            "_v_after_conv",
+            "_q_normalized",
+            "_k_normalized",
+            "_decay_gate",
+            "_reference_core_output",
+            "_core_output",
+            "_norm_gate_output",
+        )
+        token_axis = 1 if name.endswith(batch_first_taps) else 0
+        if tensor.ndim <= token_axis or tensor.shape[token_axis] != expected_tokens:
+            return
     filename = f"{name}.pt"
     if os.environ.get("KIMI_PARITY_TAP_APPEND") == "1":
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        try:
+            rank = get_tensor_model_parallel_rank()
+        except (AssertionError, RuntimeError):
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+        if os.environ.get("KIMI_PARITY_TAP_RANK_ZERO_ONLY") == "1" and rank != 0:
+            return
         output_dir = os.path.join(output_dir, f"rank_{rank:02d}")
         count = _PARITY_TAP_COUNTS.get(name, 0)
         _PARITY_TAP_COUNTS[name] = count + 1
+        target_index = os.environ.get("KIMI_PARITY_TAP_DECODE_INDEX")
+        if target_index is not None and count != int(target_index):
+            return
         filename = f"{name}_{count:03d}.pt"
     os.makedirs(output_dir, exist_ok=True)
     torch.save(tensor.detach().cpu().contiguous(), os.path.join(output_dir, filename))
@@ -322,9 +419,19 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         # Resolve diagnostic routing once during construction. Calling
         # ``parse_layer_idx`` from ``forward`` introduces an untraceable regex
         # operation even when parity taps are disabled for graph execution.
-        self._parity_tap_layer_zero = bool(
-            os.environ.get("KIMI_PARITY_TAP_DIR") and parse_layer_idx(prefix) == 0
+        tap_layer = int(os.environ.get("KIMI_PARITY_TAP_KDA_LAYER", "1"))
+        self._parity_tap_layer = (
+            tap_layer
+            if os.environ.get("KIMI_PARITY_TAP_DIR")
+            and parse_layer_idx(prefix) == tap_layer - 1
+            else None
         )
+        if self._parity_tap_layer is not None:
+            print(
+                f"KIMI_PARITY_KDA_TAP_ENABLED layer={self._parity_tap_layer} "
+                f"prefix={prefix}",
+                flush=True,
+            )
         # The checkpoint stores three fp32 convolution weights as [C, 1, W],
         # while the AscendC kernel consumes one activation-dtype [W, 3 * C]
         # tensor. Keep the derived kernel-format weight on q_conv1d so it uses
@@ -346,8 +453,44 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         return AscendGDNAttentionBackend
 
     def _tap(self, suffix: str, tensor: torch.Tensor) -> None:
-        if self._parity_tap_layer_zero:
-            _parity_tap(f"01_kda_{suffix}", tensor)
+        tap_layer = getattr(self, "_parity_tap_layer", None)
+        if tap_layer is not None:
+            _parity_tap(f"{tap_layer:02d}_kda_{suffix}", tensor)
+
+    def _hash_recurrent_state(self, tensor: torch.Tensor) -> None:
+        if (
+            getattr(self, "_parity_tap_layer", None) is None
+            or os.environ.get("KIMI_PARITY_HASH_KDA_STATE") != "1"
+            or get_tensor_model_parallel_rank() != 0
+        ):
+            return
+        output_dir = os.environ.get("KIMI_PARITY_TAP_DIR")
+        if not output_dir:
+            return
+        name = f"{self._parity_tap_layer:02d}_kda_state_sha256"
+        index = _PARITY_STATE_HASH_COUNTS.get(name, 0)
+        _PARITY_STATE_HASH_COUNTS[name] = index + 1
+        raw = (
+            tensor.detach()
+            .cpu()
+            .contiguous()
+            .view(torch.uint8)
+            .numpy()
+            .tobytes()
+        )
+        rank_dir = os.path.join(output_dir, "rank_00")
+        os.makedirs(rank_dir, exist_ok=True)
+        with open(os.path.join(rank_dir, f"{name}.jsonl"), "a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "decode_index": index,
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            )
 
     def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         return kimi_kda_state_shape(
@@ -432,6 +575,33 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         output[:] = projected
 
     def _project_kda_output(self, core_attn_out: torch.Tensor) -> torch.Tensor:
+        if _KDA_FIXED_ORDER_TP_REDUCTION:
+            # HCCL may select a different BF16 reduction tree for Megatron's
+            # multi-row training projection and vLLM's singleton decode.  The
+            # opaque op preserves native HCCL for prefill and uses fixed rank
+            # order for decode.  Keeping that runtime shape decision inside
+            # the custom op prevents AOT profile-shape specialization.
+            projection = self.o_proj
+            if not projection.input_is_parallel:
+                raise RuntimeError(
+                    "fixed-order KDA o_proj requires parallel input"
+                )
+            if projection.bias is not None:
+                raise RuntimeError("fixed-order KDA o_proj expects bias=False")
+
+            output_parallel = projection.quant_method.apply(
+                projection,
+                core_attn_out,
+                None,
+            )
+            if projection.reduce_results and projection.tp_size > 1:
+                group = get_tp_group()
+                torch.ops.vllm.kimi_fixed_order_kda_tp_reduce_(
+                    output_parallel,
+                    group_name=group.unique_name,
+                )
+            return output_parallel
+
         if not _KDA_OPROJ_FP32_REDUCE:
             return self.o_proj(core_attn_out)[0]
 
@@ -782,8 +952,15 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         q_float *= torch.rsqrt(q_float.square().sum(-1, keepdim=True) + 1e-6)
         k_float *= torch.rsqrt(k_float.square().sum(-1, keepdim=True) + 1e-6)
         gate = self._recurrent_gate(raw_gate).float()
+        self._tap("q_normalized_fp32", q_float)
+        self._tap("k_normalized_fp32", k_float)
+        self._tap("decay_gate_fp32", gate)
+        self._tap("beta_fp32", beta.float())
         output = torch.zeros_like(v)
         scale = self.head_dim**-0.5
+        out_of_place_state_update = (
+            os.environ.get("VLLM_ASCEND_KIMI_OUT_OF_PLACE_KDA_STATE") == "1"
+        )
         flat_state_indices = state_indices.reshape(-1)
         for sequence_idx in range(flat_state_indices.shape[0]):
             sequence_length = cu_seqlens[sequence_idx + 1] - cu_seqlens[sequence_idx]
@@ -798,19 +975,50 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
 
             selected_state = recurrent_state.index_select(0, safe_state_idx)[0]
             state_kv = selected_state.float().transpose(-1, -2)
+            if (
+                os.environ.get("VLLM_ASCEND_KIMI_CONTIGUOUS_KDA_DECODE_STATE")
+                == "1"
+            ):
+                # Megatron's recurrent oracle keeps [H,K,V] contiguous.  The
+                # cache is stored as contiguous [H,V,K], so the transpose is
+                # otherwise a strided view whose einsum reduction begins to
+                # diverge at full width after repeated decode updates.
+                state_kv = state_kv.contiguous()
+            self._tap("recurrent_state_before", state_kv)
             q_row = q_float[0, sequence_idx]
             k_row = k_float[0, sequence_idx]
             v_row = v[0, sequence_idx].float()
             gate_row = gate[0, sequence_idx]
             beta_row = beta[0, sequence_idx].float()
 
-            state_kv *= gate_row.exp().unsqueeze(-1)
-            residual = v_row - torch.einsum("hk,hkv->hv", k_row, state_kv)
-            state_kv += torch.einsum(
+            decay_factor = gate_row.exp().unsqueeze(-1)
+            if out_of_place_state_update:
+                state_after_decay = state_kv * decay_factor
+            else:
+                state_kv *= decay_factor
+                state_after_decay = state_kv
+            predicted_value = torch.einsum(
+                "hk,hkv->hv", k_row, state_after_decay
+            )
+            residual = v_row - predicted_value
+            weighted_key = beta_row.unsqueeze(-1) * k_row
+            delta = torch.einsum(
                 "hk,hv->hkv",
-                beta_row.unsqueeze(-1) * k_row,
+                weighted_key,
                 residual,
             )
+            self._tap("decay_factor", decay_factor)
+            self._tap("state_after_decay", state_after_decay)
+            self._tap("predicted_value", predicted_value)
+            self._tap("residual", residual)
+            self._tap("weighted_key", weighted_key)
+            self._tap("delta", delta)
+            if out_of_place_state_update:
+                state_kv = state_after_decay + delta
+            else:
+                state_kv += delta
+            self._hash_recurrent_state(state_kv)
+            self._tap("recurrent_state_after", state_kv)
             output_row = torch.einsum("hk,hkv->hv", q_row * scale, state_kv).to(output.dtype)
             output[0, sequence_idx].copy_(
                 torch.where(
@@ -865,19 +1073,33 @@ class AscendKimiGatedDeltaNetAttention(KimiGatedDeltaNetAttention):
         boundaries = cu_seqlens.detach().cpu().tolist() if isinstance(cu_seqlens, torch.Tensor) else list(cu_seqlens)
         output = torch.empty_like(v)
         scale = self.head_dim**-0.5
+        out_of_place_state_update = (
+            os.environ.get("VLLM_ASCEND_KIMI_OUT_OF_PLACE_KDA_STATE") == "1"
+        )
         for sequence_idx, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
             state_idx = int(state_indices[sequence_idx].item())
             state_kv = recurrent_state[state_idx].float().transpose(-1, -2)
             if has_initial_state is not None and not bool(has_initial_state[sequence_idx].item()):
                 state_kv.zero_()
             for token_idx in range(start, end):
-                state_kv *= gate[0, token_idx].exp().unsqueeze(-1)
-                residual = v[0, token_idx].float() - torch.einsum("hk,hkv->hv", k_float[0, token_idx], state_kv)
-                state_kv += torch.einsum(
+                decay_factor = gate[0, token_idx].exp().unsqueeze(-1)
+                if out_of_place_state_update:
+                    state_after_decay = state_kv * decay_factor
+                else:
+                    state_kv *= decay_factor
+                    state_after_decay = state_kv
+                residual = v[0, token_idx].float() - torch.einsum(
+                    "hk,hkv->hv", k_float[0, token_idx], state_after_decay
+                )
+                delta = torch.einsum(
                     "hk,hv->hkv",
                     beta[0, token_idx].float().unsqueeze(-1) * k_float[0, token_idx],
                     residual,
                 )
+                if out_of_place_state_update:
+                    state_kv = state_after_decay + delta
+                else:
+                    state_kv += delta
                 output[0, token_idx] = torch.einsum("hk,hkv->hv", q_float[0, token_idx] * scale, state_kv).to(
                     output.dtype
                 )
